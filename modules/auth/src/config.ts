@@ -4,13 +4,13 @@
  * opening sign-in to anyone — and enabling a sign-in provider or changing
  * who it lets in — needs the app owner's confirmation.
  *
- * `providers` (NSO-348): `emailCode` (the e-mail code, on by default) plus
+ * `providers`: `emailCode` (the e-mail code, on by default) plus
  * one entry per `auth.provider` contribution of the server — `{ enabled,
  * relinkByEmail?, …the provider's own config }`. The schema is COMPOSED at start from the
  * contributions (`composeAuthConfig`, the module's `compose`); the static
  * `authConfigSchema` is the one of a server without providers.
  */
-import { jsonEqual, z, type AuthProvider, type ComposedModuleParts, type ConfirmItem } from '@drobek/modules';
+import { jsonEqual, z, type AuthProvider, type ComposedModuleParts, type ConfigFieldMeta, type ConfirmItem } from '@drobek/modules';
 
 const DOMAIN_RE = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 
@@ -95,7 +95,7 @@ function providerEntrySchema(p: AuthProvider): z.ZodType {
       const r = p.configSchema.safeParse(rest);
       if (!r.success) for (const issue of r.error.issues) ctx.addIssue({ code: 'custom', path: issue.path, message: issue.message });
     })
-    .meta({ title: p.label });
+    .meta({ title: p.label, 'x-drobek-order': ['enabled'] } satisfies ConfigFieldMeta);
 }
 
 function hasSignInMethod(config: Pick<AuthConfig, 'providers'>): boolean {
@@ -151,7 +151,7 @@ function shown(value: unknown): string {
 }
 
 /**
- * The changes that wait for the owner (§5.0): opening sign-in to anyone,
+ * The changes that wait for the owner: opening sign-in to anyone,
  * enabling a sign-in provider, changing a provider's identity fields (e.g.
  * `issuer`, `clientId` — they decide whose accounts get in) while it is
  * enabled, and turning on `relinkByEmail`. Turning a method OFF never waits.

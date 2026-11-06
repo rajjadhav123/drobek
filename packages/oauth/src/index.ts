@@ -1,8 +1,7 @@
 /**
- * @drobek/oauth — the MCP OAuth 2.1 Authorization Server (U5; user-bound
- * grants, CIMD, RFC 9207 `iss` and API keys since M0-04) + the Resource
- * Server helpers, as a workspace LIBRARY (PHY-71/PHY-53,
- * same integration model as @drobek/auth): the heavy server logic lives here;
+ * @drobek/oauth — the MCP OAuth 2.1 Authorization Server (user-bound
+ * grants, CIMD, RFC 9207 `iss`, API keys) + the Resource Server helpers, as a
+ * workspace LIBRARY (same integration model as @drobek/auth): the heavy server logic lives here;
  * apps/web registers thin route files re-exporting `@drobek/oauth/routes/*`.
  *
  * This barrel exports ONLY pure/Node server logic — NO react-router route
@@ -99,6 +98,7 @@ export {
   type OAuthConnection,
   type RevokedConnection,
 } from './connections.server.js';
+export { pruneExpiredOAuth, type OAuthPruneResult } from './prune.server.js';
 export {
   issueAuthCode,
   consumeAuthCode,
@@ -115,6 +115,8 @@ export {
   type IssuedTokens,
   type RotateResult,
   type RotateOptions,
+  type RefreshOutcome,
+  type RefreshTrace,
   type IssueOptions,
   type AccessTokenClaims,
   type ValidateOptions,
@@ -125,6 +127,7 @@ export {
   defaultOAuthStore,
   type OAuthStore,
   type AuthCodeRow,
+  type AccessTokenRecord,
   type AccessTokenRow,
   type RefreshTokenRow,
   type RefreshTokenRecord,

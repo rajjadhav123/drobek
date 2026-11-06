@@ -1,5 +1,5 @@
 /**
- * M0-04/M0-05: user-bound grants on a real (PGlite) database —
+ * User-bound grants on a real (PGlite) database —
  *  - the RS Bearer path: audience check for OAuth tokens, `drk_` API keys,
  *    revoked key → invalid, super-admin by email;
  *  - the MCP server this package builds authorizes every tool call per app
@@ -7,8 +7,7 @@
  *    not_found for a foreign / missing app, viewer cannot write, super-admin
  *    override.
  */
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 import type { Request } from 'express';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { noopLogger } from '@drobek/core';
@@ -60,6 +59,7 @@ function ctxFor(userId: string, email: string, superAdmin = false): AuthContext 
   return {
     kind: 'oauth',
     credentialId: 't',
+    oauthClientId: null,
     userId,
     email,
     superAdmin,

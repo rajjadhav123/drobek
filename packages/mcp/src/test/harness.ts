@@ -7,14 +7,15 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { AssetDisk, memoryUploadTokenStore } from '@drobek/apps';
+import { InMemoryTransport, McpServer } from '@modelcontextprotocol/server';
+import { Client } from '@modelcontextprotocol/client';
+import { AssetDisk, memoryScreenshotRequestStore, memoryUploadTokenStore } from '@drobek/apps';
 import { Compiler, type CompileLimits } from '@drobek/compile';
 import type { DnsResolver } from '@drobek/domains';
 import { noopLogger } from '@drobek/core';
+import { memoryTrafficRedis, queryTraffic, type TrafficRedis } from '@drobek/insights';
 import { loadModuleRuntime, memoryRateLimiter, type ModuleRuntime } from '@drobek/modules';
+import { browserErrorStore, memoryBrowserErrorsRedis } from '@drobek/serving';
 import type { AppChangedEvent, ToolDeps, ToolPrincipal } from '../context.js';
 import { insightsLogStore } from '../context.js';
 import { memoryLeaseStore } from '../lease.js';
@@ -88,12 +89,18 @@ function zoneResolver(zone: TestZone): DnsResolver {
 
 export interface TestDeps extends ToolDeps {
   events: AppChangedEvent[];
+  /** The in-memory Redis behind get_analytics' live counters (recordPageView into it). */
+  trafficRedis: TrafficRedis;
   clock: TestClock;
-  /** NSO-358: the in-memory upload tokens and the upload-URL budget left (set it to test rate_limited). */
+  /** The in-memory upload tokens and the upload-URL budget left (set it to test rate_limited). */
   uploadTokens: ReturnType<typeof memoryUploadTokenStore>;
   uploadBudget: { left: number };
-  /** NSO-366: what verify_domain's lookups answer. */
+  /** What verify_domain's lookups answer. */
   zone: TestZone;
+  /** The end-user session epoch per app (sign_out_end_users raises it). */
+  sessionEpochs: Map<string, number>;
+  /** invite_member's invites by token, the e-mails it sent, and whether the next send fails. */
+  invited: { tokens: Map<string, { workspaceId: string; role: string; email: string | null }>; sent: { email: string; workspaceName: string; role: string; acceptUrl: string }[]; failNext: boolean };
 }
 
 export function testDeps(limits: Partial<CompileLimits> = {}): TestDeps {
@@ -103,6 +110,11 @@ export function testDeps(limits: Partial<CompileLimits> = {}): TestDeps {
   const uploadTokens = memoryUploadTokenStore(clock.now);
   const uploadBudget = { left: 1000 };
   const zone: TestZone = { txt: {}, cname: {}, fail: new Set() };
+  const sessionEpochs = new Map<string, number>();
+  const invited: TestDeps['invited'] = { tokens: new Map(), sent: [], failNext: false };
+  const trafficRedis = memoryTrafficRedis();
+  const browserErrorsRedis = memoryBrowserErrorsRedis();
+  let inviteSeq = 0;
   return {
     leases: memoryLeaseStore(clock.now),
     notifyAppChanged: async (e) => {
@@ -116,40 +128,139 @@ export function testDeps(limits: Partial<CompileLimits> = {}): TestDeps {
     modules: testModules,
     // Postgres (PGlite) only — no Redis for the daily serving counters.
     logs: insightsLogStore({ flushSignals: false }),
+    browserErrors: browserErrorStore({ redis: () => browserErrorsRedis }),
+    traffic: (appId, days, topLimit) => queryTraffic(appId, days, { topLimit, redis: () => trafficRedis }),
     assets: {
       tokens: uploadTokens,
       uploadAllowed: async () => uploadBudget.left-- > 0,
       disk: new AssetDisk(mkdtempSync(join(tmpdir(), 'drobek-mcp-assets-'))),
     },
     dns: () => zoneResolver(zone),
+    revokeEndUserSessions: async (appId) => {
+      const epoch = (sessionEpochs.get(appId) ?? 0) + 1;
+      sessionEpochs.set(appId, epoch);
+      return epoch;
+    },
+    invites: {
+      create: async (a) => {
+        const token = (++inviteSeq).toString(16).padStart(64, '0');
+        invited.tokens.set(token, { workspaceId: a.workspaceId, role: a.role, email: a.email ?? null });
+        return { token, id: token.slice(-16) };
+      },
+      withdraw: async (token) => {
+        invited.tokens.delete(token);
+      },
+      send: async (m) => {
+        if (invited.failNext) {
+          invited.failNext = false;
+          throw new Error('smtp down');
+        }
+        invited.sent.push(m);
+      },
+    },
+    screenshots: memoryScreenshotRequestStore(clock.now),
+    invited,
+    trafficRedis,
     events,
     clock,
     uploadTokens,
     uploadBudget,
     zone,
+    sessionEpochs,
   };
+}
+
+/** The attributes of an envelope's opening marker. */
+function envelopeAttrs(raw: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  for (const m of raw.matchAll(/(\w+)=("(?:[^"\\]|\\.)*")/g)) attrs[m[1]] = JSON.parse(m[2]) as string;
+  return attrs;
+}
+
+/**
+ * read_file's answer: every `<untrusted-app-file>` block in order (one file →
+ * that file's shape; several, or a trailing report → `{ version, files,
+ * omitted?, missing?, note? }`).
+ */
+function decodeFiles(text: string): Record<string, unknown> {
+  const files: Record<string, unknown>[] = [];
+  let pos = 0;
+  for (;;) {
+    const open = /^<untrusted-app-file (.*)>$/m.exec(text.slice(pos));
+    if (!open) break;
+    const attrs = envelopeAttrs(open[1]);
+    const start = pos + open.index + open[0].length + 1;
+    const closing = `\n</untrusted-app-file nonce="${attrs.nonce}">`;
+    const end = text.indexOf(closing, start - 1);
+    const body = text.slice(start, end);
+    pos = end + closing.length;
+    const binary = /^\(binary file, (\d+) bytes — no text content\)$/.exec(body);
+    const base = {
+      path: attrs.path,
+      version: Number(attrs.version),
+      untrusted: true,
+      ...(attrs.total_lines !== undefined ? { total_lines: Number(attrs.total_lines) } : {}),
+      ...(attrs.lines !== undefined ? { lines: attrs.lines } : {}),
+    };
+    files.push(binary ? { ...base, binary: true, size: Number(binary[1]) } : { ...base, content: body });
+  }
+  const after = text.slice(pos).replace(/^\n+/, '');
+  const report = after ? (JSON.parse(after) as Record<string, unknown>) : null;
+  if (files.length === 1 && !report) return files[0];
+  return { version: files[0]?.version, untrusted: true, files, ...report };
 }
 
 /**
  * The payload of an untrusted envelope (read_file, query_data, get_logs answer
- * no structuredContent — NSO-324): the attributes of the opening marker plus
+ * no structuredContent): the attributes of the opening marker plus
  * the body, rebuilt into the tool's result shape so tests can assert on it.
  * null when `text` is not an envelope.
  */
 function decodeUntrusted(text: string): Record<string, unknown> | null {
-  const open = /^<untrusted-app-(file|data|logs) (.*)>$/m.exec(text);
+  const list = /^<untrusted-(form-submissions|end-users|uploads|activity|feedback) (.*)>$/m.exec(text);
+  if (list) {
+    const nonce = /nonce="([0-9a-f]+)"/.exec(list[2])?.[1];
+    const start = list.index + list[0].length + 1;
+    const closing = `\n</untrusted-${list[1]} nonce="${nonce}">`;
+    const end = text.indexOf(closing, start - 1);
+    const after = text.slice(end + closing.length).replace(/^\n+/, '');
+    return { ...(JSON.parse(text.slice(start, end)) as Record<string, unknown>), ...(after ? { note: after } : {}) };
+  }
+  const analytics = /^<untrusted-app-analytics (.*)>$/m.exec(text);
+  if (analytics) {
+    const attrs = envelopeAttrs(analytics[1]);
+    const start = analytics.index + analytics[0].length + 1;
+    const closing = `\n</untrusted-app-analytics nonce="${attrs.nonce}">`;
+    const end = text.indexOf(closing, start - 1);
+    const after = text.slice(end + closing.length).replace(/^\n+/, '');
+    return {
+      app_id: attrs.app_id,
+      days: Number(attrs.days),
+      enabled: attrs.enabled === 'true',
+      untrusted: true,
+      ...(JSON.parse(text.slice(start, end)) as Record<string, unknown>),
+      ...(after ? { note: after } : {}),
+    };
+  }
+  const open = /^<untrusted-app-(file|data|logs|search) (.*)>$/m.exec(text);
   if (!open) return null;
-  const attrs: Record<string, string> = {};
-  for (const m of open[2].matchAll(/(\w+)=("(?:[^"\\]|\\.)*")/g)) attrs[m[1]] = JSON.parse(m[2]) as string;
+  if (open[1] === 'file') return decodeFiles(text);
+  const attrs = envelopeAttrs(open[2]);
   const start = open.index + open[0].length + 1;
   const closing = `\n</untrusted-app-${open[1]} nonce="${attrs.nonce}">`;
   const end = text.indexOf(closing, start - 1);
   const body = text.slice(start, end);
   const after = text.slice(end + closing.length).replace(/^\n+/, '');
-  if (open[1] === 'file') {
-    const binary = /^\(binary file, (\d+) bytes — no text content\)$/.exec(body);
-    const base = { path: attrs.path, version: Number(attrs.version), untrusted: true };
-    return binary ? { ...base, binary: true, size: Number(binary[1]) } : { ...base, content: body };
+  if (open[1] === 'search') {
+    return {
+      app_id: attrs.app_id,
+      version: Number(attrs.version),
+      matches: JSON.parse(body) as unknown,
+      total: Number(attrs.total),
+      files_searched: Number(attrs.files_searched),
+      untrusted: true,
+      ...(after ? (JSON.parse(after) as Record<string, unknown>) : {}),
+    };
   }
   if (open[1] === 'data') {
     return {
@@ -161,7 +272,23 @@ function decodeUntrusted(text: string): Record<string, unknown> | null {
       untrusted: true,
     };
   }
-  return { app_id: attrs.app_id, kind: attrs.kind, since: attrs.since, entries: JSON.parse(body) as unknown, untrusted: true, ...(after ? { note: after } : {}) };
+  const render = attrs.latest_version
+    ? {
+        version: Number(attrs.latest_version),
+        beacon: attrs.beacon !== 'off',
+        page_loads: Number(attrs.page_loads ?? 0),
+        errors: Number(attrs.page_errors ?? 0),
+      }
+    : null;
+  return {
+    app_id: attrs.app_id,
+    kind: attrs.kind,
+    since: attrs.since,
+    entries: JSON.parse(body) as unknown,
+    untrusted: true,
+    ...(render ? { render } : {}),
+    ...(after ? { note: after } : {}),
+  };
 }
 
 export interface ToolCall {

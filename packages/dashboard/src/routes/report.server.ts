@@ -1,5 +1,5 @@
 /**
- * GET/POST /report?host= — server half (M4-02, NSO-293): the public abuse
+ * GET/POST /report?host= — server half: the public abuse
  * report form on the DASHBOARD origin (every app host points here through
  * `/.well-known/drobek-report`). No login.
  *
@@ -8,8 +8,8 @@
  * chars, optional reporter e-mail → 400 with the field); the rate limit
  * (ABUSE_REPORTS_PER_IP_HOUR valid reports per client IP per hour, default 5
  * → 429; skipped without a resolved client IP); then the report is stored (`abuse_reports`, audit `abuse.report`
- * when the host belongs to an app) and the super-admins are e-mailed (at most
- * once per app per hour).
+ * when the host belongs to an app) and, when it does, the super-admins are
+ * e-mailed (at most once per app per hour).
  */
 import { data, type ActionFunctionArgs, type HeadersArgs, type LoaderFunctionArgs } from 'react-router';
 import {
@@ -37,7 +37,7 @@ export const REPORT_RATE_BUCKET = 'abuse-report-ip';
 
 /**
  * Without a `headers` export React Router drops the headers an action puts on
- * `data()` — the 429 must reach the wire with its `Retry-After` (M4-02).
+ * `data()` — the 429 must reach the wire with its `Retry-After`.
  */
 export function headers({ actionHeaders }: HeadersArgs) {
   return actionHeaders;
@@ -79,8 +79,8 @@ export async function action({ request }: ActionFunctionArgs) {
   if (!v.ok) return data<ActionResult>({ ok: false, field: v.field, error: v.message }, { status: 400 });
 
   const ip = getClientIp(request);
-  // No resolved client IP → no per-IP bucket, never a shared `unknown` one
-  // (NSO-328); the super-admin mail stays capped at one per app per hour.
+  // No resolved client IP → no per-IP bucket, never a shared `unknown` one;
+  // the super-admin mail stays capped at one per app per hour.
   const ipKey = perIpLimitKey(ip, REPORT_RATE_BUCKET);
   const limit = ipKey === null ? { ok: true } : await rateLimitRedis(REPORT_RATE_BUCKET, ipKey, reportsPerIpHour(), HOUR_MS);
   if (!limit.ok) {

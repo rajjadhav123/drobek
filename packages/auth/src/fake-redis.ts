@@ -1,7 +1,8 @@
 /**
  * Unit-test helper: minimal in-memory Redis covering exactly the subset the
- * auth stack uses (GET/MGET/SET EX|PX|NX/GETEX/GETDEL/DEL/TTL/EXPIRE/PEXPIRE/
- * INCR/EXISTS) — also the end-user sessions of the platform `auth` module (M1-02).
+ * auth stack uses (GET/MGET/SET EX|PX|NX/GETEX/GETDEL/DEL/TTL/PTTL/EXPIRE/
+ * PEXPIRE/INCR/EXISTS/SCAN and a MULTI of GET/SET/INCR/PTTL) — also the
+ * end-user sessions of the platform `auth` module.
  * Set `failing = true` to make every op throw (fail-closed tests).
  * Not a *.test.ts file — vitest never collects it as a suite.
  */
@@ -9,6 +10,14 @@
 interface Entry {
   value: string;
   expiresAt: number | null;
+}
+
+interface FakeMulti {
+  get(key: string): FakeMulti;
+  set(key: string, value: string | number, ...args: (string | number)[]): FakeMulti;
+  incr(key: string): FakeMulti;
+  pttl(key: string): FakeMulti;
+  exec(): Promise<[Error | null, unknown][]>;
 }
 
 export class FakeRedis {
@@ -99,6 +108,35 @@ export class FakeRedis {
     return Math.ceil((e.expiresAt - Date.now()) / 1000);
   }
 
+  async pttl(key: string): Promise<number> {
+    this.throwIfFailing();
+    const e = this.live(key);
+    if (!e) return -2;
+    if (e.expiresAt === null) return -1;
+    return e.expiresAt - Date.now();
+  }
+
+  /**
+   * MULTI over GET/SET/INCR/PTTL: the queued commands run back to back when
+   * `exec` is called (nothing interleaves), each reply an `[err, result]`.
+   */
+  multi(): FakeMulti {
+    const queued: (() => Promise<unknown>)[] = [];
+    const chain: FakeMulti = {
+      get: (key) => (queued.push(() => this.get(key)), chain),
+      set: (key, value, ...args) => (queued.push(() => this.set(key, value, ...args)), chain),
+      incr: (key) => (queued.push(() => this.incr(key)), chain),
+      pttl: (key) => (queued.push(() => this.pttl(key)), chain),
+      exec: async () => {
+        this.throwIfFailing();
+        const started = queued.map((op) => op());
+        const settled = await Promise.allSettled(started);
+        return settled.map((s) => (s.status === 'fulfilled' ? [null, s.value] : [s.reason as Error, null]));
+      },
+    };
+    return chain;
+  }
+
   async expire(key: string, sec: number): Promise<number> {
     return this.pexpire(key, sec * 1000);
   }
@@ -123,5 +161,23 @@ export class FakeRedis {
   async exists(...keys: string[]): Promise<number> {
     this.throwIfFailing();
     return keys.filter((k) => this.live(k)).length;
+  }
+
+  /** SCAN cursor MATCH pattern COUNT n — `*` globs only; the cursor is an offset into the sorted keys. */
+  async scan(cursor: string, ...args: (string | number)[]): Promise<[string, string[]]> {
+    this.throwIfFailing();
+    let pattern = '*';
+    let count = 10;
+    for (let i = 0; i < args.length; i += 1) {
+      const a = String(args[i]).toUpperCase();
+      if (a === 'MATCH') pattern = String(args[(i += 1)]);
+      else if (a === 'COUNT') count = Number(args[(i += 1)]);
+    }
+    const re = new RegExp(`^${pattern.split('*').map((p) => p.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`);
+    const keys = [...this.store.keys()].filter((k) => this.live(k)).sort();
+    const start = Number(cursor) || 0;
+    const page = keys.slice(start, start + count).filter((k) => re.test(k));
+    const next = start + count >= keys.length ? '0' : String(start + count);
+    return [next, page];
   }
 }

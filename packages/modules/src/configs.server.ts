@@ -1,5 +1,5 @@
 /**
- * `module_configs` access (M1-01): one row per (app, module) with the config
+ * `module_configs` access: one row per (app, module) with the config
  * that was SET (sparse — defaults fill the rest when read) and at most ONE
  * pending change waiting for the owner's confirmation.
  */
@@ -9,14 +9,18 @@ import type { ConfirmRole } from './contract.js';
 
 /** A change held for the owner's confirmation (confirmRequired). */
 export interface PendingChange {
-  /** The RFC 7396 merge patch the agent sent — applied on top of the config at confirm time. */
+  /**
+   * The RFC 7396 merge patch that was proposed — or, when a proposal joined a
+   * waiting one, the patch from the config in force to both applied in turn.
+   * Applied on top of the config at confirm time.
+   */
   patch: Record<string, unknown>;
   /** What needs confirming, verbatim from the module's confirmRequired. */
   changes: string[];
   proposed_at: string;
   /** The dashboard user whose agent proposed it. */
   proposed_by: string | null;
-  /** Who may confirm it (NSO-322 H3; missing on older rows = `editor`). */
+  /** Who may confirm it (missing on older rows = `editor`). */
   confirm_role?: ConfirmRole;
 }
 
@@ -29,11 +33,11 @@ export interface ConfigRow {
 type Tx = Parameters<Parameters<DB['transaction']>[0]>[0];
 type Executor = DB | Tx;
 
-function asObject(v: unknown): Record<string, unknown> {
+export function asObject(v: unknown): Record<string, unknown> {
   return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
 }
 
-function asPending(v: unknown): PendingChange | null {
+export function asPending(v: unknown): PendingChange | null {
   const o = asObject(v);
   if (!('patch' in o)) return null;
   return {

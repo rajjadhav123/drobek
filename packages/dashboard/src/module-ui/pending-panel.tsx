@@ -1,10 +1,10 @@
 /**
- * The pending change of one module (M2-02, NSO-291): who proposed it and
+ * The pending change of one module: who proposed it and
  * when, the module's own confirmRequired strings with a plain-language risk
  * note each, the readable before → after diff of the effective config, and
  * Confirm / Reject (editor+ only — a viewer sees the change, no button; the
  * action refuses a viewer with 403 anyway). A change the module marks
- * `confirmRole: 'admin'` (NSO-322 H3) is confirmed by a workspace admin only:
+ * `confirmRole: 'admin'` is confirmed by a workspace admin only:
  * an editor sees why and can still reject it.
  */
 import { Form } from 'react-router';
@@ -33,6 +33,9 @@ export function PendingPanel({ pending, canEdit, busy }: { pending: PendingPanel
       <p style={{ ...ui.small, margin: '0 0 0.6rem' }}>
         Proposed{pending.proposedBy ? ` for ${pending.proposedBy}` : ''}
         {when ? ` · ${when}` : ''}. The config in force stays until it is confirmed.
+      </p>
+      <p style={{ ...ui.small, margin: '0 0 0.6rem' }} data-testid="pending-scope">
+        Confirm applies everything listed here; Reject drops all of it. A change proposed while this one waits is added to it.
       </p>
 
       <ul style={{ margin: '0 0 0.7rem', paddingLeft: '1.1rem' }}>

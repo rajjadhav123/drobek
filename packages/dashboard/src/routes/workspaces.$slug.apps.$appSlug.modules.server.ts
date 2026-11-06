@@ -1,7 +1,8 @@
 /**
- * GET /workspaces/:slug/apps/:appSlug/modules — server half (M2-02,
- * NSO-291): the app's Modules tab — every platform module active on the
- * server with whether this app configured it, what waits for confirmation and
+ * GET /workspaces/:slug/apps/:appSlug/modules — server half:
+ * the app's Modules tab — every platform module active on the
+ * server (operator-only modules, without a skill, are left out: apps cannot
+ * use them) with whether this app configured it, what waits for confirmation and
  * which required secrets are missing. viewer+ (unknown workspace / non-member
  * → 404 by requireWorkspaceRole; an app of another workspace → 404). Secret
  * VALUES never reach this loader: the runtime reports `hasSecret` only.
@@ -12,6 +13,7 @@ import { requireWorkspaceRole } from '@drobek/tenancy';
 import { appHeaderData } from '../app-page.server.js';
 import { loadAppForView } from '../apps.server.js';
 import { loadPendingBanner } from '../pending-banner.server.js';
+import { loadSyncBanner } from '../sync-banner.server.js';
 import { canPublish } from '../view.js';
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
@@ -21,15 +23,20 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
   const runtime = await moduleRuntime();
   const states = await runtime.appModules({ id: app.id, slug: app.slug, workspaceId: access.workspace.id });
-  const modules = runtime.modules.map((m) => {
+  const modules = runtime.appFacing.map((m) => {
     const s = states[m.name];
     const secrets = s?.secrets ?? [];
-    const requiredMissing = (m.secrets ?? []).filter((d) => d.required && !secrets.find((x) => x.name === d.name)?.hasSecret).map((d) => d.name);
+    const requiredMissing = runtime
+      .secretDocs(m, s?.config)
+      .filter((d) => d.required && !secrets.find((x) => x.name === d.name)?.hasSecret)
+      .map((d) => d.name);
     return {
       name: m.name,
       version: m.version,
       useWhen: m.skill.useWhen,
-      /** NSO-346: false for an opt-in module the workspace does not have enabled. */
+      title: m.dashboard?.title ?? null,
+      description: m.dashboard?.description ?? null,
+      /** False for an opt-in module the workspace does not have enabled. */
       enabled: s?.enabled !== false,
       configured: Boolean(s?.configured),
       pending: s?.pending_confirmation ?? [],
@@ -42,10 +49,11 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   return {
     workspace: { slug: access.workspace.slug, name: access.workspace.name },
     app: { slug: app.slug },
-    /** NSO-342: the app header + tabs on every app sub-page. */
+    /** The app header + tabs on every app sub-page. */
     header: await appHeaderData({ access, app }),
     modules,
     banner: await loadPendingBanner(app, access.workspace.slug, app.slug),
+    syncBanner: await loadSyncBanner({ id: app.id, slug: app.slug, workspaceId: access.workspace.id }, access.workspace.slug),
     canEdit: canPublish(access.effectiveRole),
   };
 }

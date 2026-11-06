@@ -18,9 +18,8 @@ const CORE_TABLES = [
 ];
 
 /**
- * The upload/deploy pipeline tables dropped by 0007_app_versions (NSO-281),
- * and the pre-module Data API tables the data module imported and dropped
- * (its migration 0000, M1-03).
+ * The upload/deploy pipeline tables dropped by 0007_app_versions, and the
+ * pre-module Data API tables the data module dropped (its migration 0000).
  */
 const DROPPED_TABLES = ['deploys', 'deploy_files', 'blob_refs', 'collections', 'app_documents'];
 
@@ -68,6 +67,14 @@ test('core drizzle journal applied and core tables exist @local', async () => {
     expect(appCols).not.toContain('active_deploy_id');
     expect(appCols).not.toContain('routing_mode');
 
+    // A member can keep a version: who kept it and when.
+    const versionCols = await client.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'app_versions'`
+    );
+    const vCols = versionCols.rows.map((r: { column_name: string }) => r.column_name);
+    expect(vCols).toEqual(expect.arrayContaining(['kept_at', 'kept_by_user_id']));
+
     // The data module owns its records table (its own journal).
     const mod = await client.query(
       `SELECT count(*)::int AS n FROM drizzle.__drizzle_migrations_mod_data`
@@ -75,6 +82,45 @@ test('core drizzle journal applied and core tables exist @local', async () => {
     expect(mod.rows[0].n).toBeGreaterThanOrEqual(1);
     const records = await client.query(`SELECT to_regclass('public.mod_data_documents')::text AS t`);
     expect(records.rows[0].t).toBe('mod_data_documents');
+  } finally {
+    await client.end();
+  }
+});
+
+// Every start records, per journal, the image that brought its newest
+// migration: an older image refuses the database and names that version.
+test('the start recorded the image that knows each journal, and released the migration lock @local', async () => {
+  test.skip(TEST_ENV !== 'local', 'requires TEST_ENV=local (direct DB access)');
+
+  const url =
+    process.env.DATABASE_URL ??
+    'postgresql://drobek:drobek@localhost:5441/drobek';
+  const client = new pg.Client({ connectionString: url });
+  await client.connect();
+
+  try {
+    const recorded = await client.query(
+      `SELECT r.migrations_table, r.image_version, r.module_version,
+              r.newest_migration::text AS newest, (SELECT max(created_at)::text FROM drizzle.__drizzle_migrations_core) AS core_newest
+       FROM drizzle.__drobek_migration_images r
+       WHERE r.migrations_table IN ('__drizzle_migrations_core', '__drizzle_migrations_mod_data')
+       ORDER BY r.migrations_table`
+    );
+    expect(recorded.rows.map((r: { migrations_table: string }) => r.migrations_table)).toEqual([
+      '__drizzle_migrations_core',
+      '__drizzle_migrations_mod_data',
+    ]);
+    const [core, data] = recorded.rows as Array<{ image_version: string; module_version: string | null; newest: string; core_newest: string }>;
+    expect(core.image_version).not.toBe('');
+    expect(core.module_version).toBeNull();
+    expect(core.newest).toBe(core.core_newest);
+    expect(data.module_version).toMatch(/^\d+\.\d+\.\d+/);
+
+    const locks = await client.query(
+      `SELECT count(*)::int AS n FROM pg_locks
+       WHERE locktype = 'advisory' AND objid = (hashtext('drobek:migrations')::bigint & 4294967295)::oid`
+    );
+    expect(locks.rows[0].n).toBe(0);
   } finally {
     await client.end();
   }

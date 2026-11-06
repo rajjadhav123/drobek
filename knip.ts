@@ -1,5 +1,5 @@
 /**
- * knip (NSO-306) — unused files, exports, types and dependencies across the
+ * knip — unused files, exports, types and dependencies across the
  * pnpm workspace. Runs in `task check` (`pnpm knip`) and in the CI quality
  * job; the gate is 0 findings.
  *
@@ -32,8 +32,9 @@ const config: KnipConfig = {
     'apps/server': {
       // server/index.ts (package.json `dev`/`start`) and the routes are found
       // by the plugins; migrate.ts is `node dist/server/migrate.js`, the
-      // self-host upgrade step (`task selfhost:migrate`).
-      entry: ['server/migrate.ts'],
+      // self-host upgrade step (`task selfhost:migrate`); rekey.ts is
+      // `node dist/server/rekey.js`, the key rotation step (`task selfhost:rekey`).
+      entry: ['server/migrate.ts', 'server/rekey.ts'],
       project: ['server/**/*.ts', 'app/**/*.{ts,tsx}'],
       ignoreDependencies: [
         // The React Router SSR build bundles the linked workspace packages and
@@ -42,14 +43,16 @@ const config: KnipConfig = {
         // from apps/server — i.e. be a direct dependency, although no source
         // file of this workspace imports it.
         'nodemailer',
-        // Same reason (NSO-314): build/server/index.js imports these through
-        // @drobek/db / @drobek/core. knip used to see them in vite.config's
-        // `optimizeDeps.include`, which the explicit dev optimizer dropped.
+        // Same reason: build/server/index.js imports these through
+        // @drobek/db / @drobek/core.
         '@paralleldrive/cuid2',
         'drizzle-orm',
         'ioredis',
-        // Same reason: @drobek/modules builds the SDK with it (NSO-347).
+        // Same reason: @drobek/modules builds the SDK with it.
         'esbuild',
+        // Same reason: @drobek/apps re-encodes feedback screenshots with it
+        // (a native dependency, so it must resolve from the server too).
+        'sharp',
         // DROBEK_MODULES entries are resolved at runtime from the SERVER's
         // package.json (packages/modules registry.ts, createRequire): the
         // built-in modules and the example module are dependencies so the
@@ -71,31 +74,38 @@ const config: KnipConfig = {
     },
 
     'packages/sdk': {
-      // src/beacon-entry.ts: bundled by path by packages/modules sdk-build.ts
-      // into /__drobek/beacon.js (sdkBeaconEntry). The rest: the package's
-      // public entry points — its package.json `exports` point at dist/
-      // (publishable for external module authors, NSO-344), which knip does
-      // not map back to the sources; their exports are public API.
+      // src/beacon-entry.ts is bundled by path into /__drobek/beacon.js. The
+      // rest are public entry points: `exports` point at dist/, which knip
+      // does not map back to the sources.
       entry: ['src/beacon-entry.ts', 'src/index.ts', 'src/core.ts', 'src/beacon.ts'],
     },
 
     'packages/modules': {
-      // The package's public entry points (`.`, `./testing` and `./lock`):
-      // its package.json `exports` point at dist/ (publishable for external
-      // module authors, NSO-344), which knip does not map back to the
-      // sources; their exports are the contract external modules (and the
-      // modules.lock.json writer, NSO-345) use. src/cli/module-lock.ts is
-      // `node …/@drobek/modules/dist/cli/module-lock.js`, the installer half of
-      // `task selfhost:module:*` (scripts/selfhost-module.sh, NSO-350).
-      entry: ['src/index.ts', 'src/testing.ts', 'src/lock.ts', 'src/cli/*.ts'],
-      // NSO-345: test-fixtures/ holds an EXTERNAL module package (plain ESM)
-      // that tests copy into a temporary DROBEK_MODULES_DIR by path — never
-      // imported, its imports resolve to the server's instances at runtime.
+      // Public entry points (`.`, `./testing`, `./lock`): `exports` point at
+      // dist/, which knip does not map back to the sources. src/published.ts
+      // is the npm package's `.`, bundled by path by scripts/npm-packages.mjs.
+      // src/cli/module-lock.ts is run by path from scripts/selfhost-module.sh.
+      entry: ['src/index.ts', 'src/published.ts', 'src/testing.ts', 'src/lock.ts', 'src/cli/*.ts'],
+      // test-fixtures/ holds an external module package that tests copy into a
+      // temporary DROBEK_MODULES_DIR by path; never imported.
       ignore: ['test-fixtures/**'],
     },
 
+    'packages/compile': {
+      // src/typecheck/worker.ts: started by path as a worker thread
+      // (runner.ts, dist/typecheck/worker.js), never imported for its values.
+      entry: ['src/typecheck/worker.ts'],
+      ignoreDependencies: [
+        // The type check resolves these by path (check.ts
+        // reactTypes) and maps an app's `react` / `react-dom` imports to
+        // their declarations; nothing imports them.
+        '@types/react',
+        '@types/react-dom',
+      ],
+    },
+
     'packages/create-drobek-module': {
-      // `bin` / `exports` point at dist/ (published to npm, NSO-349).
+      // `bin` / `exports` point at dist/ (published to npm).
       entry: ['src/index.ts', 'src/cli.ts'],
       // template/ is the scaffold's OUTPUT (a module with its own
       // package.json and tests), copied with placeholders — never imported
@@ -135,19 +145,35 @@ const config: KnipConfig = {
       // + `sdk.inline.entry` (sdk/forms.tsx), as for modules/auth.
       entry: ['src/sdk.ts', 'sdk/*.tsx'],
     },
+    'modules/sync': {
+      // No browser SDK: the module only runs a scheduled job on the server.
+      entry: [],
+    },
+    'modules/oidc': {
+      // No browser SDK: the module only contributes auth's sign-in provider.
+      entry: [],
+    },
+    'modules/webhooks': {
+      // No browser SDK: apps read the stored deliveries through the data module.
+      entry: [],
+    },
 
     'examples/*': {
-      // Same contract as modules/*: the SDK entry is loaded by path. The
-      // package `exports` point at dist/ like a create-drobek-module output
-      // (NSO-349), so src/index.ts is listed as the public entry.
+      // Same contract as modules/*: the SDK entry is loaded by path; `exports`
+      // point at dist/, so src/index.ts is listed as the public entry.
       entry: ['src/index.ts', 'src/sdk.ts'],
     },
 
     'tests-e2e': {
       // Started by path, not imported: proxy-echo.mjs by docker-compose*.y*ml
-      // (`node tests-e2e/proxy-echo.mjs`), selfhost-rehearsal.mjs by
+      // (`node tests-e2e/proxy-echo.mjs`), dns-mock.mjs by
+      // docker-compose.e2e.yaml, selfhost-rehearsal.mjs by
       // scripts/selfhost-rehearsal.sh.
-      entry: ['proxy-echo.mjs', 'selfhost-rehearsal.mjs'],
+      entry: ['proxy-echo.mjs', 'dns-mock.mjs', 'selfhost-rehearsal.mjs'],
+      // fixtures/ holds an external module package the e2e stacks pack and
+      // install into DROBEK_MODULES_DIR (`task module:fixture`,
+      // scripts/e2e-image.sh); never imported.
+      ignore: ['fixtures/**'],
     },
   },
 

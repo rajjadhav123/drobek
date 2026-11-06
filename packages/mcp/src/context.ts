@@ -3,21 +3,35 @@
  * side-effect seams the tools use (lease store, change notifications, compiler,
  * clock) — injectable so unit tests run without Redis and without sleeping.
  */
-import { assetDisk, assetUploadAllowed, notifyAppChanged, redisUploadTokenStore, type AppChangedEvent } from '@drobek/apps';
+import {
+  assetDisk,
+  assetUploadAllowed,
+  notifyAppChanged,
+  redisUploadTokenStore,
+  screenshotRequestStore,
+  type AppChangedEvent,
+  type ScreenshotRequestStore,
+} from '@drobek/apps';
 import { Compiler, type CompileOptions, type SourceFiles } from '@drobek/compile';
 import { createConsoleLogger, getRedis, type Logger } from '@drobek/core';
 import {
   queryCompileLog,
+  queryRenderCounts,
   queryRequestLog,
   queryRuntimeLog,
+  queryTraffic,
   recordCompile,
   type CompileEntry,
   type RecordCompileInput,
+  type RenderCounts,
   type RequestsEntry,
   type RuntimeEntry,
+  type TrafficView,
 } from '@drobek/insights';
 import { domainsResolver, type DnsResolver } from '@drobek/domains';
-import { moduleRuntime, type ModuleRuntime } from '@drobek/modules';
+import { moduleRuntime, revokeEndUserSessions, type ModuleRuntime } from '@drobek/modules';
+import { browserErrorStore, type BrowserErrorStore } from '@drobek/serving';
+import { defaultMemberInviteDeps, type MemberInviteDeps } from '@drobek/tenancy';
 import type { AssetDeps } from './assets.js';
 import { redisLeaseStore, type LeaseStore } from './lease.js';
 
@@ -32,15 +46,18 @@ export interface ToolPrincipal {
 }
 
 /**
- * get_logs storage (M1-07): the compile history written by create_app /
- * write_files and the three read kinds. The default is @drobek/insights over
- * Postgres (+ Redis for the daily serving counters).
+ * get_logs storage: the compile history written by create_app /
+ * write_files, the three read kinds and the render signal of a version
+ * (get_app / get_logs). The default is @drobek/insights over Postgres (+ Redis
+ * for the daily serving counters).
  */
 export interface LogStore {
   recordCompile(input: RecordCompileInput): Promise<void>;
   runtime(appId: string, since: Date): Promise<RuntimeEntry[]>;
   compile(appId: string, since: Date): Promise<CompileEntry[]>;
   requests(appId: string, since: Date): Promise<RequestsEntry[]>;
+  /** What the beacon reported for one version: page loads and browser errors of its pages. */
+  render(appId: string, version: number): Promise<RenderCounts>;
 }
 
 /** The @drobek/insights LogStore. `flushSignals: false` skips Redis (tests). */
@@ -50,6 +67,7 @@ export function insightsLogStore(opts: { flushSignals?: boolean } = {}): LogStor
     runtime: (appId, since) => queryRuntimeLog(appId, since),
     compile: (appId, since) => queryCompileLog(appId, since),
     requests: (appId, since) => queryRequestLog(appId, since, { flush: opts.flushSignals !== false }),
+    render: (appId, version) => queryRenderCounts(appId, version),
   };
 }
 
@@ -63,14 +81,24 @@ export interface ToolDeps {
   now: () => number;
   env: NodeJS.ProcessEnv;
   log: Logger;
-  /** The process's platform modules + skills (M1-01): skill_info, configure_module, get_app.modules. */
+  /** The process's platform modules + skills: skill_info, configure_module, get_app.modules. */
   modules: () => Promise<ModuleRuntime>;
-  /** Compile history + get_logs reads (M1-07). */
+  /** Compile history + get_logs reads. */
   logs: LogStore;
-  /** Upload tokens, the hourly upload-URL budget and the asset disk (NSO-358). */
+  /** The preview's browser errors (get_logs `browser`, get_app `preview_errors`, write_files). */
+  browserErrors: BrowserErrorStore;
+  /** App traffic analytics (get_analytics, get_app `traffic`): the last `days` days, top lists of `topLimit` entries. */
+  traffic: (appId: string, days: number, topLimit: number) => Promise<TrafficView>;
+  /** Upload tokens, the hourly upload-URL budget and the asset disk. */
   assets: AssetDeps;
   /** The resolver verify_domain looks the custom-domain records up with (DOMAINS_DNS_SERVERS / the dev mock). */
   dns: () => DnsResolver;
+  /** Sign every end user of an app out (the app's session epoch goes up, in Redis); the new epoch. */
+  revokeEndUserSessions: (appId: string) => Promise<number>;
+  /** invite_member: the Redis invite tokens and the invite e-mail. */
+  invites: MemberInviteDeps;
+  /** request_screenshot / get_screenshot: the pending requests (Redis). */
+  screenshots: ScreenshotRequestStore;
 }
 
 let sharedCompiler: Compiler | null = null;
@@ -95,12 +123,17 @@ export function defaultDeps(overrides: Partial<ToolDeps> = {}): ToolDeps {
     log,
     modules: () => moduleRuntime(),
     logs: insightsLogStore(),
+    browserErrors: browserErrorStore(),
+    traffic: (appId, days, topLimit) => queryTraffic(appId, days, { topLimit }),
     assets: {
       tokens: redisUploadTokenStore(),
       uploadAllowed: (appId) => assetUploadAllowed(appId),
       disk: assetDisk(),
     },
     dns: () => domainsResolver(overrides.env ?? process.env),
+    revokeEndUserSessions: (appId) => revokeEndUserSessions(getRedis(), appId),
+    invites: defaultMemberInviteDeps(),
+    screenshots: screenshotRequestStore(),
     ...overrides,
   };
 }

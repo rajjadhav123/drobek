@@ -8,6 +8,7 @@ import {
   PLUGIN_MARKETPLACE_ADD_COMMAND,
   PLUGIN_REPO_URL,
 } from './plugin.js';
+import { errorDoc } from './errors-catalogue.js';
 import { SKILL_INSTALL_COMMAND } from './render.js';
 import { TOOL_NAMES } from './tools.js';
 
@@ -26,6 +27,7 @@ const REQUIRED_SECTIONS = [
   '## Create an app',
   '## Write files, read the compile result',
   '## Port a Claude artifact',
+  '## Port an app from Lovable, Bolt or v0',
   '## One writer at a time',
   '## Roll back',
   '## Publishing',
@@ -62,7 +64,7 @@ describe('skills/drobek/SKILL.md', () => {
     expect(md).toContain('https://drobek.app/llms-full.txt');
   });
 
-  it('states the loop rules: preview_url, publish only on request, single writer, no secrets (M0-10)', () => {
+  it('states the loop rules: preview_url, publish only on request, single writer, no secrets', () => {
     expect(md).toContain('`compile.ok: true` → give the user the `preview_url`');
     expect(md).toContain('Publish **only when the user explicitly asks**');
     expect(md).toContain('Never publish on your own initiative');
@@ -72,13 +74,13 @@ describe('skills/drobek/SKILL.md', () => {
     expect(md).toContain('drobek dashboard');
   });
 
-  it('lists an app in the gallery only after the user said yes (NSO-340)', () => {
+  it('lists an app in the gallery only after the user said yes', () => {
     expect(md).toContain('**only after the user explicitly said yes**');
     expect(md).toContain('user_confirmed: true');
     expect(md).toContain('Never list on your own');
   });
 
-  it('ports a Claude artifact: text via write_files, binaries via create_asset_upload at the same path, never base64 (NSO-359)', () => {
+  it('ports a Claude artifact: text via write_files, binaries via create_asset_upload at the same path, never base64', () => {
     const port = md.slice(md.indexOf('## Port a Claude artifact'), md.indexOf('## One writer at a time'));
     expect(port).toContain("skill_info('port-artifact')");
     expect(port).toContain('the server\nfetches nothing from claude.ai');
@@ -90,7 +92,33 @@ describe('skills/drobek/SKILL.md', () => {
     expect(port).toContain('`window.claude.*`');
   });
 
-  it('states the skill_info rule verbatim, in the present tense (M1-01)', () => {
+  it('ports a Lovable, Bolt or v0 export through the port-app skill: paths alias, esm.sh with one React, modules for Supabase', () => {
+    const port = md.slice(md.indexOf('## Port an app from Lovable, Bolt or v0'), md.indexOf('## One writer at a time'));
+    expect(port).toContain("skill_info('port-app')");
+    expect(port).toContain('`"paths": { "@/*": ["src/*"] }`');
+    expect(port).toContain('`?deps=react@<version>`');
+    for (const tool of ['create_app', 'write_files', 'create_asset_upload', 'publish']) expect(port, tool).toContain(`\`${tool}\``);
+    for (const m of ['`auth`', '`data`', '`files`', '`proxy`']) expect(port, m).toContain(m);
+    expect(port).toContain('server code does not port');
+  });
+
+  it('has the agent write the description, favicon and link previews itself, with the readiness codes that flag them', () => {
+    const head = md.slice(md.indexOf('## Browser tab, search results and shared links'), md.indexOf('## Port a Claude artifact'));
+    expect(head).toContain('drobek adds nothing');
+    expect(head).toContain('<meta name="description" content="…">');
+    expect(head).toContain('`favicon.svg`');
+    expect(head).toContain('`create_asset_upload`');
+    expect(head).toContain('ABSOLUTE https URLs on the production address');
+    expect(head).toContain('social\n  networks do not render SVG');
+    expect(head).toContain('`X-Robots-Tag: noindex`');
+    expect(head).toContain('drobek serves no robots.txt of its own');
+    for (const code of ['missing_title', 'missing_description', 'missing_favicon', 'og_image_not_absolute']) {
+      expect(head, code).toContain(code);
+      expect(errorDoc(code), code).toBeTruthy();
+    }
+  });
+
+  it('states the skill_info rule verbatim, in the present tense', () => {
     expect(md).toContain(SKILL_INFO_RULE);
     expect(md).not.toContain('module_info');
     for (const future of ['later', 'phase 2', 'coming soon', 'will be available']) {

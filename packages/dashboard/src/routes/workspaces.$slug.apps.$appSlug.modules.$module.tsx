@@ -1,42 +1,54 @@
 /**
- * /workspaces/:slug/apps/:appSlug/modules/:module — client half (M2-02,
- * NSO-291), the page configure_module's `confirm_url` points at: the pending
+ * /workspaces/:slug/apps/:appSlug/modules/:module — client half,
+ * the page configure_module's `confirm_url` points at: the pending
  * change (diff, risk notes, Confirm / Reject), the config form generated from
  * the module's JSON Schema, the dedicated editor the module declares
  * (`dashboard.editor`: collections / upstreams), the write-only secrets and
  * "About this module" (version, source, contract, slots, contributions, its
- * own error codes — NSO-347). Viewers see the same page without controls.
+ * own error codes) and, for the scheduled-import module, its
+ * sources with Run now / Pause / Resume. Viewers see the same page
+ * without controls.
  * Server code lives in the .server.ts; values arrive pre-shaped and
  * secret-free.
  */
 import { Link, useActionData, useLoaderData, useNavigation } from 'react-router';
 import type { action, loader } from './workspaces.$slug.apps.$appSlug.modules.$module.server.js';
 import { AppPage } from '../app-header.js';
+import { moduleHeading, moduleSummary } from '../module-catalogue.js';
 import { PendingBanner } from '../pending-banner.js';
 import { JsonSchemaForm } from '../module-ui/json-schema-form.js';
 import { ContributesTable, Disclosure, ErrorsTable, ModuleFactsList, SlotsTable } from '../module-ui/module-facts.js';
 import { PendingPanel } from '../module-ui/pending-panel.js';
 import { CollectionsEditor, UpstreamsEditor } from '../module-ui/rules-editors.js';
 import { SecretsForm } from '../module-ui/secrets-form.js';
+import { SyncSourcesPanel } from '../module-ui/sync-sources.js';
+import { WebhookEndpointsPanel } from '../module-ui/webhook-endpoints.js';
+import { SyncBanner } from '../sync-banner.js';
 import { ui } from '../module-ui/styles.js';
 
 export function meta({ data }: { data?: Awaited<ReturnType<typeof loader>> }) {
-  return [{ title: `${data?.module.name ?? 'Module'} — ${data?.app.slug ?? 'App'} — drobek` }];
+  return [{ title: `${data ? moduleHeading(data.module) : 'Module'} — ${data?.app.slug ?? 'App'} — drobek` }];
 }
 
 const DONE: Record<string, string> = {
   applied: 'Saved — the new configuration is in force.',
   pending: 'Saved as a change awaiting confirmation — it applies once confirmed.',
+  merged: 'Added to the change already awaiting confirmation — confirming applies all of it, rejecting drops all of it.',
   unchanged: 'Nothing changed.',
   confirmed: 'Confirmed — the change is in force.',
   rejected: 'Rejected — the configuration stays as it was.',
   'secret-set': 'Secret stored.',
   'secret-rotated': 'Secret rotated — the new value is in use from the next request.',
   'secret-removed': 'Secret removed.',
+  'sync-ran': 'Run finished — the fetched records are in the collection.',
+  'sync-failed': 'The run failed and changed nothing — the app keeps the previous records. Its error is under Latest runs.',
+  'sync-paused': 'Schedule paused — the source runs again when you resume it or use Run now.',
+  'sync-resumed': 'Schedule resumed — the source runs within a minute.',
 };
 
 const COLLECTION_INTENTS = new Set(['add-collection', 'save-collection', 'remove-collection']);
 const UPSTREAM_INTENTS = new Set(['save-upstream', 'unassign-upstream']);
+const SYNC_INTENTS = new Set(['sync-run', 'sync-pause', 'sync-resume']);
 
 export default function AppModuleRoute() {
   const d = useLoaderData<typeof loader>();
@@ -50,14 +62,17 @@ export default function AppModuleRoute() {
   const secretError =
     errors && (errors.intent === 'set-secret' || errors.intent === 'remove-secret') ? { target: errors.target, messages: errors.general } : null;
 
+  const heading = moduleHeading(d.module);
+  const summary = moduleSummary(d.module);
+
   if (!d.enabled) {
-    // NSO-346: an opt-in module the operator has not enabled for this workspace.
+    // An opt-in module the operator has not enabled for this workspace.
     return (
-      <AppPage header={d.header} trail={[{ label: d.module.name }]}>
-        <h2 style={ui.title}>
-          {d.module.name} <span style={{ ...ui.small, fontWeight: 400 }}>v{d.module.version}</span>
+      <AppPage header={d.header} trail={[{ label: heading }]}>
+        <h2 style={ui.title} data-testid="module-heading">
+          {heading} <span style={{ ...ui.small, fontWeight: 400 }}>v{d.module.version}</span>
         </h2>
-        <p style={ui.hint}>Use when {d.module.useWhen}</p>
+        {summary ? <p style={ui.hint}>{summary}</p> : null}
         <div style={ui.notice} role="status" data-testid="module-not-enabled">
           This module is not enabled for this workspace. It is an opt-in module: the server operator enables it per
           workspace. Until then the app cannot use it and its configuration cannot be changed.
@@ -67,11 +82,15 @@ export default function AppModuleRoute() {
   }
 
   return (
-    <AppPage header={d.header} trail={[{ label: d.module.name }]}>
-      <h2 style={ui.title}>
-        {d.module.name} <span style={{ ...ui.small, fontWeight: 400 }}>v{d.module.version}</span>
+    <AppPage header={d.header} trail={[{ label: heading }]}>
+      <h2 style={ui.title} data-testid="module-heading">
+        {heading} <span style={{ ...ui.small, fontWeight: 400 }}>v{d.module.version}</span>
       </h2>
-      <p style={ui.hint}>Use when {d.module.useWhen}</p>
+      {summary ? (
+        <p style={ui.hint} data-testid="module-summary">
+          {summary}
+        </p>
+      ) : null}
       {!d.canEdit ? (
         <p style={ui.small} data-testid="readonly-note">
           You can view this module’s configuration; changing it needs the editor role.
@@ -79,6 +98,7 @@ export default function AppModuleRoute() {
       ) : null}
 
       <PendingBanner banner={d.banner} />
+      <SyncBanner banner={d.syncBanner} showLink={d.sync === null} />
       {d.done && DONE[d.done] ? (
         <div style={ui.notice} role="status" data-testid="done-notice" data-done={d.done}>
           {DONE[d.done]}
@@ -114,6 +134,8 @@ export default function AppModuleRoute() {
             readOnly={!d.canEdit}
             busy={busy}
             states={d.states}
+            choices={d.choices}
+            limits={d.limits}
           />
         </section>
       ) : null}
@@ -141,6 +163,20 @@ export default function AppModuleRoute() {
             busy={busy}
             error={errors && UPSTREAM_INTENTS.has(errors.intent) ? errors : null}
           />
+        </section>
+      ) : null}
+
+      {d.sync ? (
+        <section id="sync" aria-label="Sources">
+          <h2 style={ui.h2}>Sources</h2>
+          <SyncSourcesPanel data={d.sync} canEdit={d.canEdit} busy={busy} error={errors && SYNC_INTENTS.has(errors.intent) ? errors : null} />
+        </section>
+      ) : null}
+
+      {d.webhooks ? (
+        <section id="webhooks" aria-label="Endpoints">
+          <h2 style={ui.h2}>Endpoints</h2>
+          <WebhookEndpointsPanel data={d.webhooks} />
         </section>
       ) : null}
 

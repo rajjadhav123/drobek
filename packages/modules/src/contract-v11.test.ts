@@ -1,5 +1,5 @@
 /**
- * Module contract 1.1 (NSO-344): the `contract` range, the short-name check,
+ * Module contract 1.1: the `contract` range, the short-name check,
  * typed slots (`slots` / `contributes` / `contributions()`), module error
  * codes (`errors`, the runtime's undeclared-code guard), `availability`,
  * `dashboard.editor`, `hooks.onAppDelete` and `DROBEK_MODULE_<NAME>_DEFAULTS`.
@@ -9,9 +9,8 @@ import { apps, workspaceModules, workspaces } from '@drobek/db';
 import { noopLogger } from '@drobek/core';
 import { z } from 'zod';
 import { MODULE_CONTRACT_VERSION, defineModule, type AnyModule, type HookApp, type ModuleServices } from './contract.js';
-import { CORE_ERROR_CODES, ModuleError } from './errors.js';
+import { CORE_ERROR_CODES, ModuleError, ModuleLoadError } from './errors.js';
 import {
-  ModuleLoadError,
   checkErrorCodes,
   checkModuleSet,
   collectContributions,
@@ -80,19 +79,19 @@ const formal = defineModule({ ...base, name: 'formal', contributes: { 'host.gree
 // ── contract range ───────────────────────────────────────────────────────────
 
 describe('contract range', () => {
-  it(`is satisfied by this server (${MODULE_CONTRACT_VERSION}) for ^1.1, ^1.0, 1.x, >=1.1.0`, () => {
-    expect(MODULE_CONTRACT_VERSION).toBe('1.1.0');
-    for (const contract of ['^1.1', '^1.0', '1.x', '>=1.1.0']) {
+  it(`is satisfied by this server (${MODULE_CONTRACT_VERSION}) for ^1.1, ^1.0, 1.x, >=1.1.0 — a 1.1 module keeps loading on 1.3`, () => {
+    expect(MODULE_CONTRACT_VERSION).toBe('1.3.0');
+    for (const contract of ['^1.1', '^1.0', '1.x', '>=1.1.0', '^1.2', '^1.3']) {
       expect(() => validateModule(defineModule({ ...base, name: 'ok', contract }))).not.toThrow();
     }
   });
 
   it('refuses the start when the range is not satisfied — naming the module, the range and the server version', () => {
-    for (const contract of ['^2.0', '~1.0', '<1.1.0', '^1.2']) {
+    for (const contract of ['^2.0', '~1.0', '<1.1.0', '^1.4']) {
       expect(() => validateModule(defineModule({ ...base, name: 'future', contract }))).toThrow(ModuleLoadError);
     }
     expect(() => validateModule(defineModule({ ...base, name: 'future', contract: '^2.0' }))).toThrow(
-      /module "future": it needs module contract \^2\.0, but this server implements 1\.1\.0/
+      /module "future": it needs module contract \^2\.0, but this server implements 1\.3\.0/
     );
     expect(() => validateModule(defineModule({ ...base, name: 'odd', contract: 'not a range' }))).toThrow(/contract must be a semver range/);
   });
@@ -102,7 +101,7 @@ describe('contract range', () => {
     const legacy = defineModule({ ...base, name: 'legacy', contract: undefined });
     const mods = await loadModules({ DROBEK_MODULES: 'legacy' }, { importer: importer({ 'drobek-module-legacy': legacy }), log });
     expect(mods.map((m) => m.name)).toEqual(['legacy']);
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(`module "legacy" declares no contract range — add contract: '^1.1'`), expect.anything());
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(`module "legacy" declares no contract range — add contract: '^1.3'`), expect.anything());
     const log2 = logger();
     await loadModules({ DROBEK_MODULES: 'host' }, { importer: importer({ 'drobek-module-host': host }), log: log2 });
     expect(log2.warn).not.toHaveBeenCalled();
@@ -280,6 +279,11 @@ describe('availability, dashboard.editor, hooks.onAppDelete', () => {
     expect(() => validateModule(defineModule({ ...base, name: 'mm', availability: 'maybe' as never }))).toThrow(/availability must be/);
     expect(() => validateModule(defineModule({ ...base, name: 'mm', dashboard: { editor: 'upstreams' } }))).not.toThrow();
     expect(() => validateModule(defineModule({ ...base, name: 'mm', dashboard: { editor: 'grid' as never } }))).toThrow(/dashboard\.editor must be one of collections, upstreams/);
+    expect(() => validateModule(defineModule({ ...base, name: 'mm', dashboard: { title: 'Scheduled imports', description: 'Works like a cron.' } }))).not.toThrow();
+    for (const title of ['', ' Padded', 'Two\nlines', 'x'.repeat(61), 42 as never]) {
+      expect(() => validateModule(defineModule({ ...base, name: 'mm', dashboard: { title } })), JSON.stringify(title)).toThrow(/dashboard\.title must be one line of 1–60 characters/);
+    }
+    expect(() => validateModule(defineModule({ ...base, name: 'mm', dashboard: { description: 'y'.repeat(201) } }))).toThrow(/dashboard\.description must be one line of 1–200 characters/);
     expect(() => validateModule(defineModule({ ...base, name: 'mm', hooks: { onAppDelete: 'x' as never } }))).toThrow(/hooks\.onAppDelete must be a function/);
   });
 });
@@ -297,7 +301,7 @@ describe('the runtime (contributions, hooks, errors, skill_info, the dashboard v
     ...base,
     name: 'watcher',
     availability: 'opt-in',
-    dashboard: { editor: 'collections' },
+    dashboard: { editor: 'collections', title: 'Watch list', description: 'Keeps an eye on the app.' },
     hooks: {
       onAppCreate: (a: HookApp, s: ModuleServices) => void seen.push({ hook: 'create', app: a, greeters: s.contributions<Greeter>('host.greeter').map((g) => g.id) }),
       onAppDelete: (a: HookApp, s: ModuleServices) => void seen.push({ hook: 'delete', app: a, greeters: s.contributions<Greeter>('host.greeter').map((g) => g.id) }),
@@ -370,7 +374,7 @@ describe('the runtime (contributions, hooks, errors, skill_info, the dashboard v
   it('hooks get the services with contributions; onAppDelete runs for every module, a failure is logged', async () => {
     seen.length = 0;
     log.error.mockClear();
-    // NSO-346: the opt-in watcher is off for the workspace — no onAppCreate, but onAppDelete still runs.
+    // The opt-in watcher is off for the workspace — no onAppCreate, but onAppDelete still runs.
     await rt.runHook('onAppCreate', app);
     await rt.runHook('onAppDelete', app);
     expect(seen).toEqual([{ hook: 'delete', app, greeters: ['formal', 'pirate'] }]);
@@ -391,12 +395,17 @@ describe('the runtime (contributions, hooks, errors, skill_info, the dashboard v
     expect(rt.errorCatalogue()).toEqual([{ module: 'host', errors: host.errors }]);
   });
 
-  it('the dashboard view carries availability and the declared editor', async () => {
-    expect(await rt.moduleView(app, 'watcher')).toMatchObject({ availability: 'opt-in', editor: 'collections' });
-    expect(await rt.moduleView(app, 'host')).toMatchObject({ availability: 'default', editor: null });
+  it('the dashboard view carries availability, the declared editor, title and description', async () => {
+    expect(await rt.moduleView(app, 'watcher')).toMatchObject({
+      availability: 'opt-in',
+      editor: 'collections',
+      title: 'Watch list',
+      description: 'Keeps an eye on the app.',
+    });
+    expect(await rt.moduleView(app, 'host')).toMatchObject({ availability: 'default', editor: null, title: null, description: null });
   });
 
-  it('moduleFacts (NSO-347): version, source, contract, requires, slots with their contributors, contributions, limits, errors', () => {
+  it('moduleFacts: version, source, contract, requires, slots with their contributors, contributions, limits, errors', () => {
     expect(rt.moduleFacts('host')).toEqual({
       name: 'host',
       version: '1.0.0',
@@ -419,9 +428,12 @@ describe('the runtime (contributions, hooks, errors, skill_info, the dashboard v
       limits: [],
       errors: host.errors,
       editor: null,
+      title: null,
+      description: null,
+      operatorOnly: false,
     });
     expect(rt.moduleFacts('pirate')).toMatchObject({ slots: [], contributes: [{ slot: 'host.greeter', host: 'host', key: 'pirate' }] });
-    expect(rt.moduleFacts('watcher')).toMatchObject({ availability: 'opt-in', editor: 'collections', contributes: [] });
+    expect(rt.moduleFacts('watcher')).toMatchObject({ availability: 'opt-in', editor: 'collections', title: 'Watch list', contributes: [] });
     expect(rt.moduleFacts('nope')).toBeNull();
     expect(rt.moduleFactsList().map((f) => f.name)).toEqual(['formal', 'failing', 'host', 'watcher', 'pirate']);
     // Never a path on disk: the facts are plain names and versions.

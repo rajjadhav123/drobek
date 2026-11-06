@@ -1,8 +1,10 @@
 /**
- * /admin/abuse — client half (M4-02, NSO-293): the super-admin moderation
- * queue. Open reports (host → app, workspace, reason, details, created) with
- * Take down / Mark resolved, the list of taken-down apps with Restore, and
- * (NSO-340, when the server runs a gallery) the gallery entries with Hide /
+ * /admin/abuse — client half: the super-admin moderation
+ * queue. A page of the open (or resolved) reports — search, the app chip, a
+ * sort and the pager — each with host → app, workspace, reason, details,
+ * when and by whom, with Take down / Mark resolved; the list of taken-down
+ * apps with Restore, and
+ * (when the server runs a gallery) the gallery entries with Hide /
  * Show again. Every app links to its dashboard overview and, when it is
  * published, to its public address, so it can be judged before acting.
  * Take down opens a confirm panel first (a GET, works without JavaScript);
@@ -11,6 +13,7 @@
  */
 import { useEffect, useRef } from 'react';
 import { Form, Link, useActionData, useLoaderData, useLocation, useNavigation } from 'react-router';
+import { AdminChips, AdminFilterBar, AdminListCount, AdminPager, type AdminChipGroup } from '@drobek/tenancy/admin-list-ui';
 import { DashboardPage, controls } from '@drobek/tenancy/layout';
 import type { action, loader } from './admin.abuse.server.js';
 
@@ -100,9 +103,26 @@ const styles = {
   effects: { margin: '0.5rem 0 0.75rem', paddingLeft: '1.2rem', fontSize: '0.92rem', overflowWrap: 'anywhere' },
 } as const;
 
-function when(iso: string): string {
-  return new Date(iso).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
-}
+const QUEUE_PATH = '/admin/abuse';
+
+const REPORT_SORTS = [
+  { value: 'newest', label: 'Newest first' },
+  { value: 'oldest', label: 'Oldest first' },
+  { value: 'host', label: 'Host' },
+] as const;
+
+const REPORT_CHIPS: readonly AdminChipGroup[] = [
+  { param: 'status', label: 'Status', options: [{ value: '', label: 'Open' }, { value: 'resolved', label: 'Resolved' }] },
+  {
+    param: 'app',
+    label: 'App',
+    allLabel: 'Any',
+    options: [
+      { value: 'present', label: 'On an app' },
+      { value: 'unknown-host', label: 'No app matches the host' },
+    ],
+  },
+];
 
 /** The app's dashboard overview + its public address (when published), for judging it first. */
 function AppLinks({ appPath, publicUrl, workspaceSlug }: { appPath: string; publicUrl: string | null; workspaceSlug: string }) {
@@ -126,7 +146,7 @@ function AppLinks({ appPath, publicUrl, workspaceSlug }: { appPath: string; publ
 }
 
 export default function AbuseQueueRoute() {
-  const { status, confirm, confirmError, reasons, reports, locked, gallery } = useLoaderData<typeof loader>();
+  const { status, list, listError, retentionDays, confirm, confirmError, reasons, reports, locked, gallery } = useLoaderData<typeof loader>();
   const result = useActionData<typeof action>();
   const busy = useNavigation().state !== 'idle';
   const { pathname, search } = useLocation();
@@ -209,11 +229,44 @@ export default function AbuseQueueRoute() {
       ) : null}
 
       <h2 style={styles.h2}>{status === 'open' ? 'Open reports' : 'Resolved reports'}</h2>
-      {reports.length === 0 ? (
+      {status === 'resolved' ? (
+        <p style={styles.hint} data-testid="abuse-retention">
+          A resolved report is deleted {retentionDays} days after it was resolved, with its details and the reporter&apos;s
+          e-mail (ABUSE_REPORTS_RETENTION_DAYS). The activity log keeps its own record of the report and of a takedown.
+        </p>
+      ) : null}
+      <AdminFilterBar
+        path={QUEUE_PATH}
+        params={list.params}
+        label="Search host, app, reporter or reason"
+        placeholder="example.com"
+        sorts={REPORT_SORTS}
+        testId="abuse-filter"
+      />
+      <AdminChips path={QUEUE_PATH} params={list.params} groups={REPORT_CHIPS} testId="abuse-chips" />
+      {listError ? (
+        <p style={styles.error} role="alert" data-testid="abuse-list-error">
+          The reports could not be loaded, so none is shown. Reload the page; if it keeps failing, the server log says why.
+        </p>
+      ) : (
+        <AdminListCount
+          total={list.total}
+          matching={list.matching}
+          filtered={list.filtered}
+          noun={status === 'open' ? ['open report', 'open reports'] : ['resolved report', 'resolved reports']}
+          testId="abuse-count"
+        />
+      )}
+      {listError ? null : list.total === 0 ? (
         <p style={styles.empty} data-testid="abuse-empty">
           {status === 'open'
             ? 'No open reports. Reports from the public form and apps the publish check flags appear here.'
             : 'No resolved reports yet. A report you mark resolved or act on moves here.'}
+        </p>
+      ) : reports.length === 0 ? (
+        <p style={styles.empty} data-testid="abuse-none">
+          No {status} report matches {list.params.q ? `“${list.params.q}”` : 'this filter'}. Try part of the host or an
+          e-mail, or choose Clear to see every {status} report.
         </p>
       ) : (
         <ul style={styles.list} data-testid="abuse-reports">
@@ -242,8 +295,21 @@ export default function AbuseQueueRoute() {
                 ) : (
                   'no app on this server matches the host'
                 )}{' '}
-                · {when(r.createdAt)} · reporter {r.reporterEmail ?? 'anonymous'}
-                {r.resolvedAt ? ` · resolved ${when(r.resolvedAt)}${r.resolvedBy ? ` by ${r.resolvedBy}` : ''}` : ''}
+                ·{' '}
+                <span title={r.created.at} data-testid="abuse-created">
+                  reported {r.created.ago}
+                </span>{' '}
+                · reporter {r.reporterEmail ?? 'anonymous'}
+                {r.resolved ? (
+                  <>
+                    {' '}
+                    ·{' '}
+                    <span title={r.resolved.at} data-testid="abuse-resolved">
+                      resolved {r.resolved.ago}
+                      {r.resolvedBy ? ` by ${r.resolvedBy}` : ''}
+                    </span>
+                  </>
+                ) : null}
               </div>
               {r.app ? <AppLinks appPath={r.app.appPath} publicUrl={r.app.publicUrl} workspaceSlug={r.app.workspaceSlug} /> : null}
               {r.details ? (
@@ -291,6 +357,9 @@ export default function AbuseQueueRoute() {
             </li>
           ))}
         </ul>
+      )}
+      {listError ? null : (
+        <AdminPager path={QUEUE_PATH} params={list.params} page={list.page} pageSize={list.pageSize} matching={list.matching} testId="abuse-pager" />
       )}
 
       <h2 style={styles.h2}>Taken-down apps</h2>

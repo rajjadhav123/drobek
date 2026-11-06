@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * doc-lint (NSO-298, part of `task check` and the CI quality job).
+ * doc-lint (part of `task check` and the CI quality job).
  *
  * Three checks, all on the files git knows about (tracked + untracked, not
  * ignored), run from the repository root:
@@ -11,6 +11,8 @@
  *    RETIRED. `CHANGELOG.md` (history) is exempt. A line that has to name a retired term on purpose (a test that
  *    asserts the term is GONE) carries the marker `doc-lint: allow` on the
  *    same line or on the line directly above it.
+ *    Vendor integrations of the hosted instance (VENDORS) live in drobek-web,
+ *    never in this repository: no file may name them.
  * 2. The README quickstart is the SELF-HOSTING quickstart, byte for byte:
  *    the text between `<!-- quickstart:start -->` and `<!-- quickstart:end -->`
  *    must exist in both files and be identical.
@@ -39,7 +41,13 @@ const RETIRED = [
   ['static bundle', /static[ -]bundles?/i],
   ['dual license', /dual[ -]licen[cs]/i],
   ['set_publish_approval', /set_publish_approval/i],
+  ['MCP_SESSION_IDLE_TTL_MS', /MCP_SESSION_IDLE_TTL_MS/],
+  ['MCP_SESSIONS_PER_USER', /MCP_SESSIONS_PER_USER/],
+  ['MCP session not found', /MCP session not found/i],
 ];
+
+/** Vendors only the hosted instance (drobek-web) integrates — [label, pattern]. */
+const VENDORS = [['Sentry', /\bsentry\b/i]];
 
 const EXEMPT_FILES = new Set(['CHANGELOG.md', SELF, 'pnpm-lock.yaml']);
 const BINARY_EXT = /\.(png|jpe?g|gif|webp|ico|pdf|woff2?|ttf|otf|zip|gz|tgz|wasm)$/i;
@@ -85,6 +93,11 @@ for (const rel of listFiles()) {
       if (!re.test(line)) continue;
       if (line.includes(ALLOW_MARKER) || (i > 0 && lines[i - 1].includes(ALLOW_MARKER))) continue;
       findings.push(`${rel}:${i + 1}: retired term "${label}" (describe the current design)`);
+    }
+    for (const [label, re] of VENDORS) {
+      if (!re.test(line)) continue;
+      if (line.includes(ALLOW_MARKER) || (i > 0 && lines[i - 1].includes(ALLOW_MARKER))) continue;
+      findings.push(`${rel}:${i + 1}: names the vendor "${label}" (vendor integrations of the hosted instance live in drobek-web)`);
     }
   });
 }

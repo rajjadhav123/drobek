@@ -19,6 +19,7 @@ import {
   createEmailLoginCode,
   generateLoginCode,
   getClientIp,
+  isValidAuthEmail,
   trustProxyConfigError,
   trustProxyMode,
   normalizeAuthEmail,
@@ -143,7 +144,7 @@ describe('consumeEmailLoginCode', () => {
     });
   });
 
-  it('caps a CONCURRENT guess flood at CODE_MAX_ATTEMPTS evaluations (PHY-76 #1)', async () => {
+  it('caps a CONCURRENT guess flood at CODE_MAX_ATTEMPTS evaluations', async () => {
     // Regression: the old GET→attempts+1→SET read-modify-write could be raced
     // past the cap by concurrent guesses. The atomic INCR-first counter must
     // let at most CODE_MAX_ATTEMPTS guesses reach a live code no matter how many
@@ -188,7 +189,16 @@ describe('normalizeAuthEmail', () => {
   });
 });
 
-describe('getClientIp (trusts the proxy, not the client — PHY-76 #4)', () => {
+describe('isValidAuthEmail', () => {
+  it('takes one @ with a dotted domain, up to 254 characters', () => {
+    expect(isValidAuthEmail('a@b.cz')).toBe(true);
+    expect(isValidAuthEmail(`${'a'.repeat(243)}@example.cz`)).toBe(true);
+    expect(isValidAuthEmail(`${'a'.repeat(244)}@example.cz`)).toBe(false);
+    for (const bad of ['', 'a@b', 'a b@c.cz', '@b.cz', 'a@@b.cz', 'nobody']) expect(isValidAuthEmail(bad)).toBe(false);
+  });
+});
+
+describe('getClientIp (trusts the proxy, not the client)', () => {
   function req(headers: Record<string, string>): Request {
     return new Request('https://drobek.app/login/verify', { headers });
   }
@@ -223,7 +233,7 @@ describe('getClientIp (trusts the proxy, not the client — PHY-76 #4)', () => {
   });
 });
 
-describe('getClientIp with TRUST_PROXY=x-real-ip (behind Caddy — M0-07)', () => {
+describe('getClientIp with TRUST_PROXY=x-real-ip (behind Caddy)', () => {
   const caddy = { TRUST_PROXY: 'x-real-ip' } as NodeJS.ProcessEnv;
   function req(headers: Record<string, string>): Request {
     return new Request('https://drobek.app/login/verify', { headers });
@@ -248,7 +258,7 @@ describe('getClientIp with TRUST_PROXY=x-real-ip (behind Caddy — M0-07)', () =
     expect(getClientIp(req({ 'x-real-ip': 'evil.example' }), caddy)).toBeUndefined();
   });
 
-  it('unset / auto keeps the PHY-76 #4 behaviour', () => {
+  it('unset / auto keeps the default behaviour', () => {
     const r = req({ 'x-forwarded-for': '1.1.1.1, 203.0.113.7' });
     expect(getClientIp(r, {})).toBe('203.0.113.7');
     expect(getClientIp(r, { TRUST_PROXY: 'auto' })).toBe('203.0.113.7');
@@ -269,7 +279,7 @@ describe('trustProxyMode / trustProxyConfigError', () => {
   });
 });
 
-describe('scoped codes (M1-02: one app\'s end users)', () => {
+describe('scoped codes (one app\'s end users)', () => {
   const SCOPE = 'eu:app_1';
 
   it('stores the code under drobek:otp:<scope>:code:… — never the dashboard key', async () => {

@@ -1,5 +1,5 @@
 /**
- * The browser SDK of THIS server (M1-01): at startup esbuild bundles the SDK
+ * The browser SDK of THIS server: at startup esbuild bundles the SDK
  * core (`@drobek/sdk` core.ts) + the `sdk.entry` of every active module into
  * ONE ES module, served on every app host at `/__drobek/sdk.js`; the
  * declarations go to `/__drobek/sdk.d.ts`. Only ACTIVE modules are in it.
@@ -10,7 +10,7 @@
  * (ETag). This is platform code read from the operator's disk — never app
  * code.
  *
- * The error beacon (M1-07) is a separate, tiny script `/__drobek/beacon.js`
+ * The error beacon is a separate, tiny script `/__drobek/beacon.js`
  * (the `@drobek/sdk` beacon entry): the compiler imports its versioned URL at
  * the top of every app entry, so every app reports its browser errors even
  * when it never imports `drobek`.
@@ -26,7 +26,7 @@ import type { AnyModule } from './contract.js';
 
 export const SDK_PATH = '/__drobek/sdk.js';
 export const SDK_TYPES_PATH = '/__drobek/sdk.d.ts';
-/** The browser error beacon script (M1-07). */
+/** The browser error beacon script. */
 export const BEACON_SCRIPT_PATH = '/__drobek/beacon.js';
 
 /** The bundled beacon script: `url` = `/__drobek/beacon.js?v=<hash>` (what the compiler imports). */
@@ -47,10 +47,12 @@ export interface SdkBundle {
   /**
    * `drobek/<module>` → the source of that module's `sdk.inline` (read at
    * start). The compiler builds these INTO an app that imports them, with the
-   * app's own import map (M1-02) — they are not part of `js`.
+   * app's own import map — they are not part of `js`.
    */
   inline: Record<string, string>;
-  /** The error beacon script every compiled app imports (M1-07). */
+  /** Module name → the declarations of `drobek/<name>` (the server's type check of app sources). */
+  inlineTypes: Record<string, string>;
+  /** The error beacon script every compiled app imports. */
   beacon: BeaconScript;
 }
 
@@ -156,7 +158,7 @@ export function sdkDeclarations(modules: AnyModule[]): string {
     '',
     ...withSdk.map((m) => moduleTypes(m) + '\n'),
     'export interface Drobek {',
-    ...withSdk.map((m) => `  /** Use when ${m.skill.useWhen.replace(/\*\//g, '* /')} — skill_info('${m.name}') */\n  readonly ${m.name}: ${m.name}.Api;`),
+    ...withSdk.map((m) => `  /** Use when ${(m.skill?.useWhen ?? '').replace(/\*\//g, '* /')} — skill_info('${m.name}') */\n  readonly ${m.name}: ${m.name}.Api;`),
     '}',
     'export declare const drobek: Drobek;',
     'export default drobek;',
@@ -172,6 +174,7 @@ export async function buildSdk(
   beaconEntry: string = sdkBeaconEntry()
 ): Promise<SdkBundle> {
   const inline: Record<string, string> = {};
+  const inlineTypes: Record<string, string> = {};
   for (const m of modules) {
     if (m.sdk && !existsSync(toPath(m.sdk.entry))) {
       throw new Error(`module "${m.name}": sdk.entry does not exist: ${toPath(m.sdk.entry)}`);
@@ -180,6 +183,7 @@ export async function buildSdk(
       const file = toPath(m.sdk.inline.entry);
       if (!existsSync(file)) throw new Error(`module "${m.name}": sdk.inline.entry does not exist: ${file}`);
       inline[inlineSpecifier(m.name)] = readFileSync(file, 'utf8');
+      inlineTypes[m.name] = m.sdk.inline.types;
     }
   }
   const result = await esbuild.build({
@@ -204,6 +208,7 @@ export async function buildSdk(
     url: `${SDK_PATH}?v=${hash}`,
     modules: modules.filter((m) => m.sdk).map((m) => m.name),
     inline,
+    inlineTypes,
     beacon: await buildBeaconScript(beaconEntry),
   };
 }

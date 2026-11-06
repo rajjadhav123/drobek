@@ -1,27 +1,51 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import {
   expect,
+  test,
   type APIRequestContext,
   type Page,
 } from '@playwright/test';
-import { BASE_URL_MCP, BASE_URL_WEB } from '../../playwright.config';
+import { BASE_URL_MCP, BASE_URL_WEB, TEST_ENV } from '../../playwright.config';
 import { loginViaEmail, resetDcrIpRateLimit, uniqueEmail } from './auth';
-import { personalWorkspaceOf } from './seed';
+import { personalWorkspaceOf, withDb } from './seed';
 
 /**
  * Shared MCP harness: full login + OAuth consent (PKCE S256) + token exchange +
  * a connected Streamable-HTTP MCP client, plus a JSON tool-call helper.
- * Tokens are USER-bound (M0-04): the consent screen has no workspace choice,
+ * Tokens are USER-bound: the consent screen has no workspace choice,
  * only the read / write / publish checkboxes.
+ * The client speaks the protocol era of the Playwright project the test runs
+ * in (`legacy` = the 2025 `initialize` handshake, `modern` = pinned to
+ * 2026-07-28; see playwright.config.ts) unless a call names one.
  * Not a spec file — Playwright's testMatch never collects it.
  */
+
+/** The protocol eras drobek serves on one endpoint. */
+export type McpEra = 'legacy' | 'modern';
+
+export const MODERN_PROTOCOL = '2026-07-28';
+
+/** The era of the running test's Playwright project (`legacy` outside the `modern` project). */
+export function mcpEra(): McpEra {
+  return test.info().project.metadata.era === 'modern' ? 'modern' : 'legacy';
+}
+
+/**
+ * The official SDK client in an era: `legacy` = the default version
+ * negotiation (2025), `modern` = pinned to 2026-07-28, `auto` = probe with
+ * `server/discover`, fall back to `initialize`.
+ */
+export function newMcpClient(name = 'drobek-e2e', era: McpEra | 'auto' = mcpEra()): Client {
+  if (era === 'legacy') return new Client({ name, version: '0.0.0' });
+  const mode = era === 'modern' ? { pin: MODERN_PROTOCOL } : 'auto';
+  return new Client({ name, version: '0.0.0' }, { versionNegotiation: { mode } });
+}
 
 /** The loopback redirect_uri the browser's cross-origin redirect is intercepted at. */
 export const REDIRECT_URI = 'http://127.0.0.1:9988/callback';
 
-/** Every scope the AS issues — tools/list then carries all 20 tools (21 for a super-admin). */
+/** Every scope the AS issues — tools/list then carries every tool (a super-admin also gets the operator's tools: set_workspace_publishing, set_workspace_module, takedown_app, restore_app, set_gallery_hidden). */
 export const FULL_SCOPE = 'read write publish';
 
 export function pkcePair(): { verifier: string; challenge: string } {
@@ -123,17 +147,57 @@ export async function exchangeCode(
   return { status: res.status(), body: (await res.json()) as TokenBody };
 }
 
-/** Connect the official SDK client with a Bearer (OAuth token or drk_ API key). */
+/**
+ * Connect the official SDK client with a Bearer (OAuth token or drk_ API key),
+ * in the test's era unless `opts.era` names one; `opts.headers` go on every request.
+ */
 export async function connectBearer(
-  bearer: string
+  bearer: string,
+  opts: { era?: McpEra | 'auto'; headers?: Record<string, string> } = {}
 ): Promise<{ client: Client; transport: StreamableHTTPClientTransport }> {
   const transport = new StreamableHTTPClientTransport(
     new URL(`${BASE_URL_MCP}/mcp`),
-    { requestInit: { headers: { Authorization: `Bearer ${bearer}` } } }
+    { requestInit: { headers: { ...opts.headers, Authorization: `Bearer ${bearer}` } } }
   );
-  const client = new Client({ name: 'drobek-e2e', version: '0.0.0' });
+  const client = newMcpClient('drobek-e2e', opts.era);
   await client.connect(transport);
   return { client, transport };
+}
+
+/**
+ * The smoke credential. Production: SMOKE_API_KEY from the deploy
+ * job's secrets. Local stack: a throwaway user + key written straight into the
+ * local DB (withDb refuses unless TEST_ENV=local). null = no credential here.
+ */
+async function smokeKey(): Promise<string | null> {
+  const fromEnv = process.env.SMOKE_API_KEY?.trim();
+  if (fromEnv) return fromEnv;
+  if (TEST_ENV !== 'local') return null;
+  const key = `drk_${randomBytes(24).toString('base64url')}`;
+  const userId = `usr${randomBytes(12).toString('hex')}`;
+  await withDb(async (c) => {
+    await c.query(`INSERT INTO users (id, email) VALUES ($1, $2)`, [userId, uniqueEmail('smoke')]);
+    await c.query(
+      `INSERT INTO api_keys (id, user_id, name, key_hash, scopes) VALUES ($1, $2, 'smoke', $3, 'read write publish')`,
+      [`key${randomBytes(8).toString('hex')}`, userId, createHash('sha256').update(key).digest('hex')]
+    );
+  });
+  return key;
+}
+
+/**
+ * The smoke key, or skip on a local target that has none; any other target
+ * (production after a deploy) MUST be given one.
+ */
+export async function requireSmokeKey(): Promise<string> {
+  const key = await smokeKey();
+  if (key) return key;
+  const web = new URL(BASE_URL_WEB);
+  test.skip(
+    web.hostname === 'localhost' || web.hostname === '127.0.0.1',
+    'no SMOKE_API_KEY (and not TEST_ENV=local)'
+  );
+  throw new Error('SMOKE_API_KEY is required for the @smoke MCP specs against a non-local target');
 }
 
 /** A raw MCP initialize POST — for the auth negatives (no SDK). */
@@ -170,8 +234,12 @@ interface ListedWorkspace {
 export interface McpClient {
   client: Client;
   transport: StreamableHTTPClientTransport;
+  /** The era the client negotiated. */
+  era: McpEra;
   /** The signed-in user's email (the token subject). */
   email: string;
+  /** The OAuth access token the client connected with (for raw `/mcp` requests). */
+  token: string;
   /** The user's PERSONAL workspace slug (from list_apps) — where specs seed apps. */
   workspace: string;
   /** Every workspace the user belongs to (from list_apps). */
@@ -180,8 +248,9 @@ export interface McpClient {
 
 /**
  * Full login (a fresh unique user, or `opts.email`) + consent(`scope`) + token +
- * connected MCP client. Leaves `page` signed in as that user. Pass
- * `signedIn: true` (with `email`) when `page` already holds that user's session.
+ * connected MCP client (the test's era unless `opts.era`). Leaves `page` signed
+ * in as that user. Pass `signedIn: true` (with `email`) when `page` already
+ * holds that user's session.
  */
 export async function mcpClient(
   page: Page,
@@ -191,6 +260,7 @@ export async function mcpClient(
     scope?: string;
     email?: string;
     signedIn?: boolean;
+    era?: McpEra;
   } = {}
 ): Promise<McpClient> {
   const scope = opts.scope ?? FULL_SCOPE;
@@ -204,7 +274,9 @@ export async function mcpClient(
   expect(tok.status, 'token exchange').toBe(200);
   expect(tok.body.access_token, 'access token issued').toBeTruthy();
 
-  const { client, transport } = await connectBearer(tok.body.access_token as string);
+  const era = opts.era ?? mcpEra();
+  const { client, transport } = await connectBearer(tok.body.access_token as string, { era });
+  expect(client.getProtocolEra(), 'the negotiated era').toBe(era);
   // list_apps (read scope) names the workspaces; a grant without read (e.g.
   // write-only) falls back to the database for the personal workspace.
   let workspaces: ListedWorkspace[];
@@ -221,7 +293,9 @@ export async function mcpClient(
   return {
     client,
     transport,
+    era,
     email,
+    token: tok.body.access_token as string,
     workspace: (personal as ListedWorkspace).slug,
     workspaces,
   };
@@ -239,26 +313,97 @@ export interface ToolCallWithText extends ToolCall {
   structured: boolean;
 }
 
+/** The attributes of an envelope's opening marker. */
+function envelopeAttrs(raw: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  for (const m of raw.matchAll(/(\w+)=("(?:[^"\\]|\\.)*")/g)) attrs[m[1]] = JSON.parse(m[2]) as string;
+  return attrs;
+}
+
 /**
- * The payload of an untrusted envelope: read_file, query_data and get_logs
- * answer ONLY the envelope text, no structuredContent (NSO-324). Rebuilt from
+ * read_file's answer: every `<untrusted-app-file>` block in order (one file →
+ * that file's shape; several, or a trailing report → `{ version, files,
+ * omitted?, missing?, note? }`).
+ */
+function decodeFiles(text: string): Record<string, unknown> {
+  const files: Record<string, unknown>[] = [];
+  let pos = 0;
+  for (;;) {
+    const open = /^<untrusted-app-file (.*)>$/m.exec(text.slice(pos));
+    if (!open) break;
+    const attrs = envelopeAttrs(open[1]);
+    const start = pos + open.index + open[0].length + 1;
+    const closing = `\n</untrusted-app-file nonce="${attrs.nonce}">`;
+    const end = text.indexOf(closing, start - 1);
+    const body = text.slice(start, end);
+    pos = end + closing.length;
+    const binary = /^\(binary file, (\d+) bytes — no text content\)$/.exec(body);
+    const base = {
+      path: attrs.path,
+      version: Number(attrs.version),
+      untrusted: true,
+      ...(attrs.total_lines !== undefined ? { total_lines: Number(attrs.total_lines) } : {}),
+      ...(attrs.lines !== undefined ? { lines: attrs.lines } : {}),
+    };
+    files.push(binary ? { ...base, binary: true, size: Number(binary[1]) } : { ...base, content: body });
+  }
+  const after = text.slice(pos).replace(/^\n+/, '');
+  const report = after ? (JSON.parse(after) as Record<string, unknown>) : null;
+  if (files.length === 1 && !report) return files[0];
+  return { version: files[0]?.version, untrusted: true, files, ...report };
+}
+
+/**
+ * The payload of an untrusted envelope: read_file, query_data, get_logs and get_analytics
+ * answer ONLY the envelope text, no structuredContent. Rebuilt from
  * the opening marker's attributes and the body into the tool's result shape;
  * null when `text` is not an envelope.
  */
 function decodeUntrusted(text: string): Record<string, unknown> | null {
-  const open = /^<untrusted-app-(file|data|logs) (.*)>$/m.exec(text);
+  const list = /^<untrusted-(form-submissions|end-users|uploads|activity|feedback) (.*)>$/m.exec(text);
+  if (list) {
+    const nonce = /nonce="([0-9a-f]+)"/.exec(list[2])?.[1];
+    const start = list.index + list[0].length + 1;
+    const closing = `\n</untrusted-${list[1]} nonce="${nonce}">`;
+    const end = text.indexOf(closing, start - 1);
+    const after = text.slice(end + closing.length).replace(/^\n+/, '');
+    return { ...(JSON.parse(text.slice(start, end)) as Record<string, unknown>), ...(after ? { note: after } : {}) };
+  }
+  const analytics = /^<untrusted-app-analytics (.*)>$/m.exec(text);
+  if (analytics) {
+    const attrs = envelopeAttrs(analytics[1]);
+    const start = analytics.index + analytics[0].length + 1;
+    const closing = `\n</untrusted-app-analytics nonce="${attrs.nonce}">`;
+    const end = text.indexOf(closing, start - 1);
+    const after = text.slice(end + closing.length).replace(/^\n+/, '');
+    return {
+      app_id: attrs.app_id,
+      days: Number(attrs.days),
+      enabled: attrs.enabled === 'true',
+      untrusted: true,
+      ...(JSON.parse(text.slice(start, end)) as Record<string, unknown>),
+      ...(after ? { note: after } : {}),
+    };
+  }
+  const open = /^<untrusted-app-(file|data|logs|search) (.*)>$/m.exec(text);
   if (!open) return null;
-  const attrs: Record<string, string> = {};
-  for (const m of open[2].matchAll(/(\w+)=("(?:[^"\\]|\\.)*")/g)) attrs[m[1]] = JSON.parse(m[2]) as string;
+  if (open[1] === 'file') return decodeFiles(text);
+  const attrs = envelopeAttrs(open[2]);
   const start = open.index + open[0].length + 1;
   const closing = `\n</untrusted-app-${open[1]} nonce="${attrs.nonce}">`;
   const end = text.indexOf(closing, start - 1);
   const body = text.slice(start, end);
   const after = text.slice(end + closing.length).replace(/^\n+/, '');
-  if (open[1] === 'file') {
-    const binary = /^\(binary file, (\d+) bytes — no text content\)$/.exec(body);
-    const base = { path: attrs.path, version: Number(attrs.version), untrusted: true };
-    return binary ? { ...base, binary: true, size: Number(binary[1]) } : { ...base, content: body };
+  if (open[1] === 'search') {
+    return {
+      app_id: attrs.app_id,
+      version: Number(attrs.version),
+      matches: JSON.parse(body) as unknown,
+      total: Number(attrs.total),
+      files_searched: Number(attrs.files_searched),
+      untrusted: true,
+      ...(after ? (JSON.parse(after) as Record<string, unknown>) : {}),
+    };
   }
   if (open[1] === 'data') {
     return {
@@ -270,7 +415,23 @@ function decodeUntrusted(text: string): Record<string, unknown> | null {
       untrusted: true,
     };
   }
-  return { app_id: attrs.app_id, kind: attrs.kind, since: attrs.since, entries: JSON.parse(body) as unknown, untrusted: true, ...(after ? { note: after } : {}) };
+  const render = attrs.latest_version
+    ? {
+        version: Number(attrs.latest_version),
+        beacon: attrs.beacon !== 'off',
+        page_loads: Number(attrs.page_loads ?? 0),
+        errors: Number(attrs.page_errors ?? 0),
+      }
+    : null;
+  return {
+    app_id: attrs.app_id,
+    kind: attrs.kind,
+    since: attrs.since,
+    entries: JSON.parse(body) as unknown,
+    untrusted: true,
+    ...(render ? { render } : {}),
+    ...(after ? { note: after } : {}),
+  };
 }
 
 /**

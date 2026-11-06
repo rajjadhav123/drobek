@@ -1,24 +1,23 @@
 /**
- * /workspaces/:slug/apps/:appSlug — the app page's Overview tab (NSO-288):
- * the shared header (production / preview URLs, compile state, the agent
- * lock + Unlock, Unpublish), the VERSION HISTORY with its actions, the
- * public gallery section (NSO-340, when the server runs one) and the health
- * panels (recent errors, traffic / 404s).
- *
- * Per version: number, time, author (agent / user + e-mail), the agent's
- * reasoning, compile status (+ the first error), and — editor+ only —
- * "Publish" (a compiled, unpublished version; an older one IS the rollback)
- * and "Restore" (a NEW version with that version's files becomes the working
- * copy, i.e. the preview; production changes only on publish). "Open"
- * links to `<slug>--v<N>` on the apps origin (a link, never a frame — the
- * dashboard origin must not run app code). Server code lives in the .server.ts.
+ * /workspaces/:slug/apps/:appSlug — the app page's Overview tab:
+ * the shared header (production / preview URLs each with "Show QR", compile state, the agent
+ * lock + Unlock, Unpublish), "Before you publish" (the newest version's
+ * publish readiness report), the version history (version-history-section:
+ * pinned versions, a page of the history, keep / unkeep, the clean-up), the
+ * public gallery section (when the server runs one) and the health panels
+ * (recent errors, traffic / 404s). The ErrorBoundary explains a page that
+ * could not load. Server code lives in the .server.ts.
  */
-import { Form, Link, useActionData, useLoaderData, useNavigation } from 'react-router';
+import { isRouteErrorResponse, Link, useActionData, useLoaderData, useNavigation, useRouteError } from 'react-router';
+import { DashboardPage } from '@drobek/tenancy/layout';
 import type { action, loader } from './workspaces.$slug.apps.$appSlug.server.js';
-import { ActionError, AppPage, appStyles } from '../app-header.js';
+import { ActionError, AppPage } from '../app-header.js';
 import { DuplicateResult } from '../duplicate-result.js';
 import { GallerySection } from '../gallery-section.js';
 import { PendingBanner } from '../pending-banner.js';
+import { ReadinessSection } from '../readiness-section.js';
+import { SyncBanner } from '../sync-banner.js';
+import { VersionHistorySection } from '../version-history-section.js';
 import { formatTimestamp } from '../view.js';
 
 export function meta({ data }: { data?: Awaited<ReturnType<typeof loader>> }) {
@@ -26,14 +25,6 @@ export function meta({ data }: { data?: Awaited<ReturnType<typeof loader>> }) {
 }
 
 const styles = {
-  visuallyHidden: {
-    position: 'absolute',
-    width: '1px',
-    height: '1px',
-    overflow: 'hidden',
-    clip: 'rect(0 0 0 0)',
-    whiteSpace: 'nowrap',
-  },
   h2: { fontSize: '1.15rem', marginTop: '2.25rem', marginBottom: '0.5rem' },
   mono: { fontFamily: 'ui-monospace, monospace', fontSize: '0.85rem' },
   muted: { color: '#8a8a8e' },
@@ -108,144 +99,23 @@ const styles = {
   },
 } as const;
 
-const COMPILE_LABEL: Record<string, string> = {
-  ok: 'build succeeded',
-  error: 'build failed',
-  pending: 'not built',
-};
-
 export default function AppDetailRoute() {
-  const { header, versions, errors, logs, canPublish, pendingBanner, duplicateResult, gallery } = useLoaderData<typeof loader>();
+  const data = useLoaderData<typeof loader>();
+  const { header, qr, errors, logs, visits, readiness, pendingBanner, syncBanner, duplicateResult, gallery } = data;
   const actionData = useActionData<typeof action>();
   const nav = useNavigation();
   const submitting = nav.state !== 'idle';
-  const s = appStyles;
 
   return (
-    <AppPage header={header}>
+    <AppPage header={header} qr={qr}>
       <ActionError actionData={actionData} />
       <DuplicateResult result={duplicateResult} />
       <PendingBanner banner={pendingBanner} />
+      <SyncBanner banner={syncBanner} />
 
-      <h2 style={styles.h2}>Versions</h2>
-      {versions.length === 0 ? (
-        <p style={styles.muted}>No versions yet — your agent writes the first one.</p>
-      ) : (
-        <div style={s.tableWrap}>
-          <table style={s.table} className="dk-cards dk-versions" data-testid="version-history">
-            <thead>
-              <tr>
-                <th style={s.th}>Version</th>
-                <th style={s.th}>By</th>
-                <th style={s.th}>Build</th>
-                <th style={s.th}>Note</th>
-                <th style={s.th}>Created</th>
-                <th style={s.th}>
-                  <span style={styles.visuallyHidden}>Actions</span>
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {versions.map((v) => (
-                <tr key={v.id} data-testid="version-row" data-version={v.number}>
-                  <td style={s.td} data-cell="version">
-                    <code style={styles.mono}>v{v.number}</code>{' '}
-                    {v.published ? (
-                      <span style={s.okBadge} data-testid="version-published">
-                        published
-                      </span>
-                    ) : null}
-                  </td>
-                  <td style={s.td} data-cell="by" data-label="By">
-                    {v.actorKind}
-                    {v.author ? <div style={{ ...styles.muted, fontSize: '0.78rem' }}>{v.author}</div> : null}
-                  </td>
-                  <td style={s.td} data-cell="build" data-label="Build" data-testid="version-compile" data-status={v.compileStatus}>
-                    {COMPILE_LABEL[v.compileStatus]}
-                    {v.compileErrorCount > 0 ? ` (${v.compileErrorCount})` : ''}
-                    {v.compileFirstError ? (
-                      // React escapes the compiler's message (it quotes app source).
-                      <div style={{ ...styles.mono, fontSize: '0.75rem', color: '#991b1b', wordBreak: 'break-word' }}>
-                        {v.compileFirstError}
-                      </div>
-                    ) : null}
-                  </td>
-                  {/* React escapes the agent-supplied reasoning. */}
-                  <td style={s.td} data-cell="note" data-label="Note">{v.reasoning ?? <span style={styles.muted}>—</span>}</td>
-                  <td style={s.td} data-cell="created" data-label="Created">
-                    {formatTimestamp(v.createdAt)}
-                  </td>
-                  <td style={s.td} data-cell="actions">
-                    <span style={{ ...s.inline, flexWrap: 'nowrap', overflowWrap: 'normal' }}>
-                      {canPublish && v.publishable && header.publishApproval ? (
-                        <button
-                          type="button"
-                          style={s.button}
-                          disabled
-                          title={header.publishApproval.notice}
-                          data-testid="publish-button"
-                          data-version={v.number}
-                          data-blocked={header.publishApproval.kind}
-                        >
-                          Publish
-                        </button>
-                      ) : canPublish && v.publishable ? (
-                        <Form method="post">
-                          <input type="hidden" name="intent" value="publish" />
-                          <input type="hidden" name="versionId" value={v.id} />
-                          <button
-                            type="submit"
-                            style={s.button}
-                            disabled={submitting}
-                            data-testid="publish-button"
-                            data-version={v.number}
-                          >
-                            Publish
-                          </button>
-                        </Form>
-                      ) : null}
-                      {canPublish && v.restorable ? (
-                        <Form method="post">
-                          <input type="hidden" name="intent" value="restore" />
-                          <input type="hidden" name="version" value={v.number} />
-                          <button
-                            type="submit"
-                            style={s.secondaryButton}
-                            disabled={submitting}
-                            title="Copy these files into a new preview version. The published version stays unchanged."
-                            data-testid="restore-button"
-                            data-version={v.number}
-                          >
-                            Restore
-                          </button>
-                        </Form>
-                      ) : null}
-                      {v.openUrl ? (
-                        <a
-                          href={v.openUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          data-testid="version-open-link"
-                          data-version={v.number}
-                        >
-                          Open
-                        </a>
-                      ) : null}
-                      <Link
-                        to={`${header.basePath}/files?version=${v.number}`}
-                        data-testid="version-files-link"
-                        data-version={v.number}
-                      >
-                        Files
-                      </Link>
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+      <ReadinessSection readiness={readiness} />
+
+      <VersionHistorySection data={data} />
 
       {gallery ? (
         <GallerySection
@@ -295,6 +165,7 @@ export default function AppDetailRoute() {
                 </div>
                 <div style={styles.errMeta}>
                   {e.type}
+                  {e.module ? ` · ${e.module} job ${e.job ?? ''}` : ''}
                   {e.fileHint ? ` · ${e.fileHint}` : ''} · last{' '}
                   {formatTimestamp(e.lastSeen)}
                 </div>
@@ -348,7 +219,70 @@ export default function AppDetailRoute() {
             ))
           )}
         </section>
+
+        {visits ? (
+          <section style={styles.panel} data-testid="visits-panel" aria-label="Visits in the last 7 days">
+            <div style={styles.panelHead}>
+              <p style={styles.panelTitle}>Visits (7 days)</p>
+              <Link to={`${header.basePath}/analytics`} style={styles.muted} data-testid="visits-link">
+                Analytics
+              </Link>
+            </div>
+            {visits.error ? (
+              <p style={styles.muted} role="alert" data-testid="visits-error">
+                The visit counts could not be loaded. Open Analytics or reload the page.
+              </p>
+            ) : (
+              <>
+                <div style={styles.statRow}>
+                  <span>
+                    <span style={styles.statNum} data-testid="visits-views">
+                      {visits.views}
+                    </span>
+                    <span style={styles.statLabel}>page views</span>
+                  </span>
+                  <span>
+                    <span style={styles.statNum} data-testid="visits-visitors">
+                      {visits.visitors}
+                    </span>
+                    <span style={styles.statLabel}>visitors</span>
+                  </span>
+                </div>
+                {visits.views === 0 ? (
+                  <p style={styles.muted} data-testid="visits-empty">
+                    {header.publishedVersion === null
+                      ? 'No visits yet — publish the app and share its address.'
+                      : 'No visits yet — share the app’s production address.'}
+                  </p>
+                ) : null}
+              </>
+            )}
+          </section>
+        ) : null}
       </div>
     </AppPage>
+  );
+}
+
+/** A page that could not load: an unknown app, no access, or a server error. */
+export function ErrorBoundary() {
+  const error = useRouteError();
+  const status = isRouteErrorResponse(error) ? error.status : 500;
+  const message =
+    status === 404
+      ? 'This app does not exist in this workspace, or it was deleted. Pick an app from the workspace’s list.'
+      : status === 403
+        ? 'Your role in this workspace does not allow this. Ask a workspace admin for the editor role.'
+        : 'The app page could not be loaded, so its versions are not shown. Reload the page; if it keeps failing, the server log says why.';
+  return (
+    <DashboardPage crumbs={[{ label: 'Workspaces', to: '/workspaces' }]}>
+      <h1 style={{ fontSize: '1.4rem', margin: '0 0 0.5rem' }}>{status === 404 ? 'App not found' : 'Something went wrong'}</h1>
+      <p role="alert" data-testid="app-page-error" data-status={status}>
+        {message}
+      </p>
+      <p>
+        <Link to="/workspaces">Back to your workspaces</Link>
+      </p>
+    </DashboardPage>
   );
 }

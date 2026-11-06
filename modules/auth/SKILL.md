@@ -5,7 +5,7 @@
 Only some people may use the app (invited e-mails, a company domain), some
 of them are admins, or records must belong to the signed-in person. Sign-in
 is a 6-digit code e-mailed by drobek, or a sign-in provider the server runs
-(company SSO; `drobek.auth.providers()` lists them); no passwords. Never
+(company SSO with OpenID Connect: `skill_info('oidc')`); no passwords. Never
 build your own login; Firebase Auth, Auth0, Clerk, NextAuth cannot run here.
 
 ## 2. Minimal working code
@@ -120,7 +120,7 @@ subdomains), `allow.anyone` everybody, `adminEmails` may sign in as `admin`,
 - A code lives 10 minutes, works once, dies after 5 wrong tries.
 - Every module request re-checks the user: removed from `allow` or disabled
   → anonymous at once; the role follows `adminEmails` on the next request.
-  Other modules apply their `user` / `owner` / `admin` rules to this user.
+  Other modules apply their `user` / `owner` / `admin` rules to this user. As the owner you use `list_end_users`, `set_end_user_role` (edits `adminEmails`), `set_end_user_blocked` and, after the user's yes, `sign_out_end_users`.
 - Per app: `AUTH_CODES_PER_IP_15MIN` 5, `AUTH_CODES_PER_IP_DAY` 20,
   `AUTH_CODES_PER_EMAIL_HOUR` 3 (more requests answer "sent", send nothing),
   `AUTH_CODES_PER_APP_HOUR` 100 (never above the app's share of the server's
@@ -138,7 +138,7 @@ subdomains), `allow.anyone` everybody, `adminEmails` may sign in as `admin`,
 | `invalid_code` (400) | wrong, used or expired code | re-enter, or `sendCode` again |
 | `too_many_attempts` (429) | 5 wrong codes | request a new code |
 | `rate_limited` (429) | too many codes/attempts from one IP | wait `Retry-After`; show a message |
-| `unavailable` (503) | sign-in mail paused or SMTP down | try later |
+| `unavailable` (503) | sign-in mail paused or the mail server down | let the user try again later; a failed send uses up none of their codes |
 | `limit_exceeded` (429) | `END_USERS_MAX_PER_APP` reached | the owner removes users |
 | `account_linked` (409 page) | the provider account (issuer + subject) is not the one the user's account is linked to | sign in the linked way or with the e-mail code; for an issuer migration the owner confirms `relinkByEmail` |
 | `csrf_rejected` (403) | raw `fetch` or another origin | use `drobek.auth` / `<LoginGate>` |

@@ -1,5 +1,5 @@
 /**
- * Where asset bytes live (NSO-358): `ASSETS_DIR/<app_id>/<storage_key>` on
+ * Where asset bytes live: `ASSETS_DIR/<app_id>/<storage_key>` on
  * the data volume (default `/data/assets`, the `assets_data` volume in the
  * production compose — part of `task backup`).
  *
@@ -7,7 +7,7 @@
  * counted and sniffed — never buffered in memory — and only a complete,
  * accepted upload is renamed to its final place (atomic: tmp is on the same
  * filesystem). An aborted, oversized or refused upload removes its temp file.
- * The storage key is the bytes' sha256 (NSO-362; rows from before it keep a
+ * The storage key is the bytes' sha256 (legacy rows keep a
  * random key), so a file is never rewritten with other bytes: replacing an
  * asset points its row at another file, and the old one is removed only when
  * neither the draft nor a published set references it (an open read stream
@@ -136,9 +136,9 @@ export class AssetDisk {
     await rm(this.pathOf(appId, key), { force: true });
   }
 
-  /** Delete every stored file of an app (idempotent). */
+  /** Delete every stored file of an app (idempotent; an id no directory can have is a no-op). */
   async removeApp(appId: string): Promise<void> {
-    if (!APP_ID_RE.test(appId)) throw new Error('AssetDisk: bad app id');
+    if (!APP_ID_RE.test(appId)) return;
     await rm(join(this.root, appId), { recursive: true, force: true });
   }
 }

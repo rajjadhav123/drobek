@@ -6,7 +6,7 @@ import { TEST_ENV } from '../playwright.config';
 import { pollLoginCode, skipUnlessLocal, uniqueEmail } from './helpers/auth';
 
 /**
- * U3 acceptance (PHY-53): Google OIDC login, account-link by email — driven
+ * Google OIDC login, account-link by email — driven
  * entirely by the mock provider (tests-e2e/mock-google.mjs). The web container
  * reaches the mock's /token + /userinfo via host.docker.internal:3049; the
  * browser opens /authorize on localhost:3049 (see docker-compose.yml env).
@@ -82,7 +82,7 @@ test('new user: consent → authed, /me shows the canned email @local', async ({
 
   await runGoogleConsentFlow(page, { email });
   await page.waitForURL(/\/me$/);
-  await expect(page.getByText(email)).toBeVisible();
+  await expect(page.getByTestId('me-account-email')).toHaveText(email);
 });
 
 test('account link: google login with a magic-code email reuses the SAME user row @local', async ({
@@ -92,7 +92,7 @@ test('account link: google login with a magic-code email reuses the SAME user ro
   skipUnlessLocal();
   const email = uniqueEmail('google-link');
 
-  // 1) Create the user via the U2 magic-code flow.
+  // 1) Create the user via the magic-code flow.
   await page.goto('/login');
   await page.getByLabel('Email', { exact: true }).fill(email);
   await page.getByRole('button', { name: 'Send code' }).click();
@@ -109,7 +109,7 @@ test('account link: google login with a magic-code email reuses the SAME user ro
   // 3) Google flow with the SAME canned email → must land on the same account.
   await runGoogleConsentFlow(page, { email });
   await page.waitForURL(/\/me$/);
-  await expect(page.getByText(email)).toBeVisible();
+  await expect(page.getByTestId('me-account-email')).toHaveText(email);
 
   // 4) The acceptance: exactly ONE users row for the email, google_sub set.
   const dbUrl = process.env.DATABASE_URL;
@@ -137,6 +137,10 @@ test('tampered state is rejected: no session cookie, bounced to /login?error=goo
   const start = await request.get('/auth/google', { maxRedirects: 0 });
   expect(start.status()).toBe(302);
   expect(start.headers()['location']).toContain('/authorize');
+  const authorize = new URL(start.headers()['location']);
+  expect(authorize.searchParams.get('code_challenge_method')).toBe('S256');
+  expect(authorize.searchParams.get('code_challenge')).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  expect(authorize.searchParams.get('nonce')).toMatch(/^[A-Za-z0-9_-]{43}$/);
 
   // …then call back with a DIFFERENT (well-formed) state.
   const cb = await request.get(

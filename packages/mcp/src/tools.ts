@@ -1,9 +1,10 @@
 /**
- * The MCP tool bodies (plan §4): list_apps, create_app, get_app, read_file,
- * write_files, restore_version (M0-05), publish (M0-06), skill_info and
- * configure_module (M1-01), query_data (M1-03), get_logs (M1-07),
- * set_gallery_listing and duplicate_app (NSO-340). Each takes the caller + validated
- * arguments and returns a plain JSON payload or throws a ToolError; the MCP
+ * The MCP tool bodies: list_apps, create_app, get_app,
+ * write_files, restore_version, publish, skill_info, configure_module,
+ * query_data, get_logs, set_gallery_listing, duplicate_app and sync_now
+ * (the app lifecycle tools are in lifecycle.ts, the version history tools in
+ * versions.ts, the data write tools in data.ts).
+ * Each takes the caller + validated arguments and returns a plain JSON payload or throws a ToolError; the MCP
  * wiring (register.ts) turns that into a CallToolResult.
  *
  * Invariants:
@@ -21,24 +22,34 @@
  *    logs (get_logs): browser error texts come from the app and its users;
  *  - every compile a write runs lands in the app's compile history
  *    (get_logs 'compile'), refused ones included;
- *  - an app a super-admin took down (NSO-293) refuses write_files,
+ *  - an app a super-admin took down refuses write_files,
  *    restore_version, publish and configure_module with `app_locked_by_admin`
  *    (the reason category only); list_apps / get_app show `locked_by_admin`;
- *  - listing an app in the public gallery (NSO-340) needs the publish scope,
+ *  - listing an app in the public gallery needs the publish scope,
  *    a published app and `user_confirmed: true` — the user's explicit yes;
  *    unlisting needs none of that. get_app shows the gallery state;
  *  - duplicate_app copies only a gallery app whose owner allows it, as the
  *    same @drobek/apps + @drobek/modules functions as the dashboard page:
  *    the published files and the module settings through the copy's own
  *    confirmation flow, never secrets, data or the source's proxy upstreams;
- *  - an opt-in module (NSO-346) that is off for the app's workspace is left
+ *  - an opt-in module that is off for the app's workspace is left
  *    out of the app's skills and compile hints, get_app says
  *    `enabled: false` and configure_module answers `module_not_enabled`;
  *  - publish in a workspace a super-admin blocked answers `publish_blocked`,
  *    and with PUBLISH_APPROVAL=approval in one the operator has not allowed
- *    `publish_not_approved` (both + `contact`, NSO-366); list_apps and
+ *    `publish_not_approved` (both + `contact`); list_apps and
  *    get_app say `can_publish` (+ `publish_contact`) and the workspace's
- *    `publishing` state.
+ *    `publishing` state;
+ *  - every new version (write_files, create_app, restore_version,
+ *    duplicate_app) counts against VERSIONS_PER_APP_HOUR /
+ *    VERSIONS_PER_USER_HOUR of the app's workspace: `rate_limited` with
+ *    `retry_after_seconds`, checked before the compile and the lease, and
+ *    again by @drobek/apps when the version is stored;
+ *  - a new version whose new bytes would take the workspace's apps past
+ *    WORKSPACE_SOURCE_QUOTA answers `limit_exceeded` (`limit`, `value`,
+ *    `used_bytes`) and stores nothing; a version the history retention
+ *    deleted (APP_VERSIONS_KEEP) answers `not_found` saying so, and get_app
+ *    states how many versions the app keeps (`version_retention`).
  */
 import {
   APP_LOCK_TTL_SEC,
@@ -50,6 +61,8 @@ import {
 } from '@drobek/agent-dx';
 import {
   AppsError,
+  assertSourceQuota,
+  assertVersionRate,
   classifyHost,
   copyName,
   createApp as createAppRow,
@@ -58,13 +71,16 @@ import {
   deriveSlug,
   duplicateAppFiles,
   duplicationSource,
+  feedbackCounts,
   galleryCounts,
   galleryEnabled,
   galleryState,
   getVersion,
   hostConfig,
   lockCategory,
+  listAssets,
   listVersions,
+  missingVersionMessage,
   normalizeGalleryDescription,
   previewUrl,
   publishPermissions,
@@ -73,20 +89,27 @@ import {
   readBlobs,
   readVersionFile,
   restore,
+  scheduleVersionTypecheck,
   setGalleryListing,
   suggestSlug,
   validateAppSlug,
+  versionRateLimitsOf,
+  versionRetention,
+  versionStorageLimitsOf,
   type Actor,
   type VersionFileInput,
+  type VersionRateLimits,
+  type VersionStorageLimits,
   type WorkspacePublishing,
 } from '@drobek/apps';
 import { actorKindForSurface } from '@drobek/audit';
 import { listDomains, resolveCustomHost, verifiedDomainsOf } from '@drobek/domains';
 import { maskEmail } from '@drobek/auth';
 import {
-  BINARY_EXTS,
+  CONFIG_FILE,
   TEXT_EXTS,
   normalizeAppPath,
+  readAppConfig,
   scanForSecrets,
   type CompileMessage,
   type CompileResult,
@@ -95,10 +118,11 @@ import { confirmUrl, duplicateModuleConfigs, isModuleError, type ModuleRuntime, 
 import { ensurePersonalWorkspace, listAllWorkspaces, listUserWorkspaces } from '@drobek/tenancy';
 import { authorizeApp, authorizeWorkspace } from './access.js';
 import type { ToolDeps, ToolPrincipal } from './context.js';
-import { LOG_KINDS, logsWindowStart, type LogKind } from '@drobek/insights';
+import { LOG_KINDS, analyticsEnabled, logsWindowStart, type LogKind, type RuntimeEntry } from '@drobek/insights';
 import { dbErrorForLog } from '@drobek/db';
 import { ToolError, lockedByAdmin, notFound, publishRefused } from './errors.js';
 import type { Lease } from './lease.js';
+import { filesReadiness, storedReadiness } from './readiness.js';
 import {
   appsInWorkspace,
   appsOfMember,
@@ -109,24 +133,24 @@ import {
   type AppRow,
 } from './queries.js';
 import { templateFiles, type TemplateName } from './templates.js';
+import { mcpMaxBodyBytes } from './request-limit.js';
 
 export interface CallContext {
   principal: ToolPrincipal;
-  /** MCP session id — recorded in the lease (the same user may take it over). */
-  sessionId: string;
+  /** The grant the call came through (`api_key:<id>` / `oauth:<client_id>`), recorded in the lease; the same user may take it over from another grant. */
+  grant: string;
   deps: ToolDeps;
   /** The platform modules + skills of this process (resolved once per call). */
   modules: ModuleRuntime;
 }
 
 const NAME_MAX = 80;
-const utf8 = new TextDecoder('utf-8', { fatal: true });
 
 function actorOf(ctx: CallContext): Actor {
   return { userId: ctx.principal.userId, kind: actorKindForSurface('mcp') };
 }
 
-/** NSO-293: a taken-down app refuses every change (write, restore, publish, module config). */
+/** A taken-down app refuses every change (write, restore, publish, module config). */
 function refuseIfLockedByAdmin(app: AppRow): void {
   if (app.lockedReason) throw lockedByAdmin(app.lockedReason);
 }
@@ -138,7 +162,7 @@ function extOf(path: string): string {
 
 /**
  * `{ code, file, line, column, text, hint? }` — the agent-facing compile
- * message. `hint` (M1-01) points a backend import the platform replaces at its
+ * message. `hint` points a backend import the platform replaces at its
  * skill, e.g. `unresolved_import` of `firebase` → `skill_info('data')`.
  */
 export interface CompileErrorOut {
@@ -166,8 +190,8 @@ function toCompileOut(messages: unknown, modules?: ModuleRuntime, enabled?: Read
   });
 }
 
-/** The briefing of an app: `enabled` = its workspace's enabledModules() (NSO-346). */
-function briefing(ctx: CallContext, enabled: ReadonlySet<string>): string {
+/** The briefing of an app: `enabled` = its workspace's enabledModules(), `versions` = its version limits. */
+function briefing(ctx: CallContext, enabled: ReadonlySet<string>, versions: VersionLimits): string {
   const L = ctx.deps.limits;
   return renderBriefing({
     limits: {
@@ -175,31 +199,87 @@ function briefing(ctx: CallContext, enabled: ReadonlySet<string>): string {
       maxFileBytes: L.maxFileBytes,
       maxTotalBytes: L.maxTotalBytes,
       timeoutMs: L.timeoutMs,
+      maxRequestBytes: mcpMaxBodyBytes(ctx.deps.env, L.maxTotalBytes),
+      versionsPerAppHour: versions.rate.perApp,
+      versionsPerUserHour: versions.rate.perUser,
+      versionsKeep: versions.storage.keep,
+      sourceQuotaBytes: versions.storage.sourceQuota,
     },
     skills: ctx.modules.skillList(enabled),
   });
 }
 
-/** The skills of an app: the opt-in modules off for its workspace are left out (NSO-346). */
+// ── the version limits ───────────────────────────────────────────────────────
+
+/** A workspace's version rate and history limits. */
+interface VersionLimits {
+  /** VERSIONS_PER_APP_HOUR / VERSIONS_PER_USER_HOUR */
+  rate: VersionRateLimits;
+  /** APP_VERSIONS_KEEP / WORKSPACE_SOURCE_QUOTA */
+  storage: VersionStorageLimits;
+}
+
+function versionLimitsFrom(limits: Readonly<Record<string, number>>, env: NodeJS.ProcessEnv): VersionLimits {
+  return { rate: versionRateLimitsOf(limits, env), storage: versionStorageLimitsOf(limits, env) };
+}
+
+/** The version limits of a workspace: its plan, else the env. */
+async function versionLimitsOf(ctx: CallContext, workspaceId: string): Promise<VersionLimits> {
+  return versionLimitsFrom(await ctx.modules.workspaceLimits(workspaceId), ctx.deps.env);
+}
+
+/**
+ * A new version @drobek/apps refused — over its rate (`rate_limited`) or the
+ * workspace's WORKSPACE_SOURCE_QUOTA (`limit_exceeded`) — as the tool error;
+ * anything else unchanged.
+ */
+function versionStoreError(err: unknown): unknown {
+  return err instanceof AppsError && (err.code === 'rate_limited' || err.code === 'limit_exceeded')
+    ? new ToolError(err.code, err.message, { ...err.details })
+    : err;
+}
+
+/** `rate_limited` ahead of the work when one more version of `appId` (when given) or by the caller would pass its rate. */
+async function refuseOverVersionRate(ctx: CallContext, limits: VersionRateLimits, appId?: string): Promise<void> {
+  try {
+    await assertVersionRate({ appId, userId: ctx.principal.userId }, limits);
+  } catch (err) {
+    throw versionStoreError(err);
+  }
+}
+
+/** The not_found of a version the app does not have — saying so when the history retention or a clean-up deleted it. */
+export async function missingVersion(ctx: CallContext, app: AppRow, number: number, keep?: number): Promise<ToolError> {
+  const k = keep ?? versionStorageLimitsOf(await ctx.modules.workspaceLimits(app.workspaceId), ctx.deps.env).keep;
+  return new ToolError('not_found', await missingVersionMessage(app.id, number, { keep: k }));
+}
+
+/** The skills of an app: the opt-in modules off for its workspace are left out. */
 function skills(ctx: CallContext, enabled: ReadonlySet<string>): SkillListItem[] {
   return ctx.modules.skillList(enabled);
 }
 
 // ── leases ───────────────────────────────────────────────────────────────────
 
-async function takeLease(ctx: CallContext, appId: string): Promise<void> {
+/** Take (or renew) the app's single-writer lease for the caller's grant; another user's lease → `app_locked`. */
+export async function takeLease(ctx: CallContext, appId: string): Promise<void> {
   const res = await ctx.deps.leases.acquire(
     appId,
-    { userId: ctx.principal.userId, sessionId: ctx.sessionId },
+    { userId: ctx.principal.userId, grant: ctx.grant },
     APP_LOCK_TTL_SEC * 1000
   );
   if (res.acquired) return;
-  const emails = await emailsByUserIds([res.lease.holder_user_id]);
-  const holder = maskEmail(emails.get(res.lease.holder_user_id) ?? '');
-  throw new ToolError(
+  throw await appLocked(res.lease);
+}
+
+/** `app_locked` for a lease another user holds: their masked e-mail and when it runs out. */
+export async function appLocked(lease: Lease, suffix = ''): Promise<ToolError> {
+  const emails = await emailsByUserIds([lease.holder_user_id]);
+  const holder = maskEmail(emails.get(lease.holder_user_id) ?? '');
+  return new ToolError(
     'app_locked',
-    `${holder} is editing this app right now (their agent holds the write lease until ${res.lease.expires_at}).`,
-    { holder, expires_at: res.lease.expires_at }
+    `${holder} is editing this app right now (their agent holds the write lease until ${lease.expires_at}).${suffix}`,
+    { holder, expires_at: lease.expires_at }
   );
 }
 
@@ -227,7 +307,7 @@ export interface AppSummary {
   latest_version: number;
   compile_status: string | null;
   locked_by?: string;
-  /** NSO-293: taken down by a super-admin — nothing can be changed or published. */
+  /** Taken down by a super-admin — nothing can be changed or published. */
   locked_by_admin?: true;
   /** The takedown category (with locked_by_admin). */
   locked_reason?: string;
@@ -313,7 +393,7 @@ interface PublishOut {
   publishing: WorkspacePublishing;
 }
 
-/** NSO-366: may the workspace publish, its state as a super-admin set it, and whom to ask when it may not. */
+/** May the workspace publish, its state as a super-admin set it, and whom to ask when it may not. */
 function publishOut(p: { allowed: boolean; contact: string | null; publishing: WorkspacePublishing } | undefined): PublishOut {
   if (!p) return { can_publish: true, publishing: 'default' };
   if (p.allowed) return { can_publish: true, publishing: p.publishing };
@@ -325,11 +405,11 @@ function publishOut(p: { allowed: boolean; contact: string | null; publishing: W
 export async function getApp(ctx: CallContext, args: { app_id: string }) {
   const { app } = await authorizeApp(ctx.principal, args.app_id, 'viewer');
   const { items, latest, locks } = await summarize([app], ctx.deps);
-  const versions = await listVersions(app.id, { limit: 20 });
+  const { versions } = await listVersions(app.id, { limit: 20 });
   const head = latest.get(app.id);
   const detail = head ? await getVersion(app.id, { id: head.id }) : null;
   const lock = locks.get(app.id);
-  const enabled = await ctx.modules.enabledModules(app.workspaceId);
+  const [enabled, versionLimits] = await Promise.all([ctx.modules.enabledModules(app.workspaceId), versionLimitsOf(ctx, app.workspaceId)]);
   const permission = (await publishPermissions([app.workspaceId], { env: ctx.deps.env, actorUserId: ctx.principal.userId })).get(
     app.workspaceId
   );
@@ -338,10 +418,18 @@ export async function getApp(ctx: CallContext, args: { app_id: string }) {
     (m) => confirmUrl(ctx.modules.deps.env, app.workspaceSlug, app.slug, m),
     enabled
   );
+  // The newest version's readiness report — with its type errors once the background check is done.
+  const readiness = head ? await storedReadiness(ctx, app.id, enabled, head.number) : undefined;
+  const render = head ? await renderSignal(ctx, app.id, head) : undefined;
+  const traffic = await trafficSummary(ctx, app.id);
+  const previewErrors = await previewErrorsOf(ctx, app.id);
   return {
     ...items[0],
     compile_errors: head?.compileStatus === 'error' ? toCompileOut(head.compileErrors, ctx.modules, enabled) : [],
-    briefing: briefing(ctx, enabled),
+    ...(readiness ? { readiness } : {}),
+    ...(render ? { render } : {}),
+    ...(previewErrors ? { preview_errors: previewErrors } : {}),
+    briefing: briefing(ctx, enabled, versionLimits),
     files: (detail?.files ?? [])
       .filter((f) => f.kind === 'source')
       .map((f) => ({ path: f.path, size: f.size, sha256: f.sha256 })),
@@ -351,23 +439,111 @@ export async function getApp(ctx: CallContext, args: { app_id: string }) {
       actor_kind: v.actorKind,
       reasoning: v.reasoning,
       compile_status: v.compileStatus,
+      published: v.published,
+      preview: v.preview,
+      kept: v.kept,
     })),
+    version_retention: retentionOut(await versionRetention(app.id, versionLimits.storage.keep)),
     modules,
     skills: skills(ctx, enabled),
+    visibility: app.visibility,
+    frame_ancestors: app.frameAncestors,
     gallery: await galleryOut(app, ctx.deps.env),
     ...(app.duplicatedFromSlug ? { duplicated_from: app.duplicatedFromSlug } : {}),
-    // NSO-366: the custom domains in short; list_domains has the DNS records and the last check.
+    // The custom domains in short; list_domains has the DNS records and the last check.
     domains: (await listDomains({ id: app.id, slug: app.slug, workspaceId: app.workspaceId }, ctx.deps.env)).map((d) => ({
       host: d.hostname,
       status: d.verified ? 'verified' : 'pending',
       primary: d.isPrimary,
     })),
+    // Notes members left on the preview (list_feedback reads them, inside the untrusted envelope).
+    feedback: (await feedbackCounts([app.id])).get(app.id) ?? { open: 0, resolved: 0 },
+    ...(traffic ? { traffic } : {}),
     ...publishOut(permission),
     ...(lock ? { lock } : {}),
   };
 }
 
-/** get_app's `gallery` (NSO-340): the public gallery state and its likes / opens (30 days), read-only. */
+/**
+ * get_app's `traffic`: page views, estimated visitors and bot views of the
+ * production address and custom domains over the last 7 days (counts only;
+ * get_analytics has the series and top lists). Absent when the server counts
+ * no visits (ANALYTICS_ENABLED=0) or the read failed.
+ */
+async function trafficSummary(ctx: CallContext, appId: string) {
+  if (!analyticsEnabled(ctx.deps.env)) return undefined;
+  try {
+    const t = await ctx.deps.traffic(appId, 7, 0);
+    return { days: 7, views: t.totals.views, visitors: t.totals.visitors, bot_views: t.totals.bot_views };
+  } catch (err) {
+    ctx.deps.log.warn('get_app traffic summary failed', { error: dbErrorForLog(err) });
+    return undefined;
+  }
+}
+
+/**
+ * get_app's `preview_errors`: the browser errors the pages of the version the
+ * preview serves now reported (get_logs `browser` reads them) — `count`
+ * distinct errors, `occurrences` in all, `latest_at`. Absent when nothing has
+ * compiled yet or the read failed.
+ */
+async function previewErrorsOf(ctx: CallContext, appId: string) {
+  try {
+    const version = await lastOkVersionNumber(appId);
+    if (version === null) return undefined;
+    return { version, ...(await ctx.deps.browserErrors.summary(appId, version)) };
+  } catch (err) {
+    ctx.deps.log.warn('get_app preview errors failed', { error: dbErrorForLog(err) });
+    return undefined;
+  }
+}
+
+/** How many distinct browser errors version `version` of the app reported (0 when unknown). */
+async function browserErrorCount(ctx: CallContext, appId: string, version: number | null): Promise<number> {
+  if (version === null) return 0;
+  try {
+    return (await ctx.deps.browserErrors.summary(appId, version)).count;
+  } catch (err) {
+    ctx.deps.log.warn('browser error count failed', { error: dbErrorForLog(err) });
+    return 0;
+  }
+}
+
+/**
+ * The render signal of a version (get_app, get_logs runtime): how many of
+ * its pages loaded in a browser and how many browser errors they reported —
+ * counts the beacon sent, nothing about the visitors. `beacon: false` = the
+ * version's drobek.json turned the beacon off, so nothing is reported.
+ */
+export interface RenderSignal {
+  version: number;
+  beacon: boolean;
+  page_loads: number;
+  errors: number;
+}
+
+/** Does the version's drobek.json leave the beacon on? (An unreadable config counts as on, like the compiler's default.) */
+async function beaconOn(versionId: string): Promise<boolean> {
+  const bytes = await readVersionFile(versionId, CONFIG_FILE, 'source');
+  if (!bytes) return true;
+  return readAppConfig(new Map([[CONFIG_FILE, bytes.toString('utf8')]])).config.beacon;
+}
+
+async function renderSignal(ctx: CallContext, appId: string, version: { id: string; number: number }): Promise<RenderSignal> {
+  if (!(await beaconOn(version.id))) return { version: version.number, beacon: false, page_loads: 0, errors: 0 };
+  return { version: version.number, beacon: true, ...(await ctx.deps.logs.render(appId, version.number)) };
+}
+
+/** One sentence on the render signal for the get_logs note. */
+function renderNote(r: RenderSignal): string {
+  if (!r.beacon) return `Version ${r.version} has "beacon": false in drobek.json: its pages report nothing and nothing is counted.`;
+  if (r.page_loads === 0) {
+    return `No page of version ${r.version} has loaded in a browser yet — give the user the preview_url and call get_app or get_logs again after they opened it.`;
+  }
+  return `Version ${r.version}: ${r.page_loads} page load${r.page_loads === 1 ? '' : 's'}, ${r.errors} browser error${r.errors === 1 ? '' : 's'} reported by its pages.`;
+}
+
+/** get_app's `gallery`: the public gallery state and its likes / opens (30 days), read-only. */
 async function galleryOut(app: AppRow, env: NodeJS.ProcessEnv) {
   if (!galleryEnabled(env)) return { enabled: false };
   const g = galleryState(app);
@@ -383,46 +559,9 @@ async function galleryOut(app: AppRow, env: NodeJS.ProcessEnv) {
   };
 }
 
-// ── read_file ────────────────────────────────────────────────────────────────
-
-export interface ReadFileResult {
-  path: string;
-  version: number;
-  untrusted: true;
-  content?: string;
-  binary?: true;
-  size?: number;
-}
-
-export async function readFile(
-  ctx: CallContext,
-  args: { app_id: string; path: string; version?: number }
-): Promise<ReadFileResult> {
-  const { app } = await authorizeApp(ctx.principal, args.app_id, 'viewer');
-  if (args.version !== undefined && (!Number.isInteger(args.version) || args.version < 1)) {
-    throw new ToolError('invalid_params', '`version` must be a positive integer.');
-  }
-  const path = normalizeAppPath(String(args.path ?? ''));
-  if (!path) throw new ToolError('invalid_path', `Unsafe file path ${JSON.stringify(args.path)}.`);
-
-  const number = args.version ?? (await latestVersions([app.id])).get(app.id)?.number;
-  const version = number ? await getVersion(app.id, { number }) : null;
-  if (!version) {
-    throw new ToolError('not_found', number ? `Version ${number} does not exist.` : 'The app has no versions yet.');
-  }
-  const file = version.files.find((f) => f.kind === 'source' && f.path === path);
-  if (!file) throw new ToolError('not_found', `No file "${path}" in version ${version.number}.`);
-  const bytes = await readVersionFile(version.id, path, 'source');
-  if (!bytes) throw new ToolError('not_found', `No file "${path}" in version ${version.number}.`);
-
-  if (!BINARY_EXTS.has(extOf(path))) {
-    try {
-      return { path, version: version.number, untrusted: true, content: utf8.decode(bytes) };
-    } catch {
-      // not UTF-8 → report as binary below
-    }
-  }
-  return { path, version: version.number, untrusted: true, binary: true, size: bytes.length };
+/** get_app's `version_retention`: how many versions the app keeps and has. */
+function retentionOut(r: { keep: number; stored: number; oldest: number | null }) {
+  return { keep_newest: r.keep, stored: r.stored, oldest_version: r.oldest };
 }
 
 // ── compile + store (create_app v1, write_files) ─────────────────────────────
@@ -483,15 +622,19 @@ async function compileAndStore(
   sources: Map<string, string | Buffer>,
   reasoning: string,
   trigger: 'create_app' | 'write_files',
+  versionLimits: VersionLimits,
   baseVersion?: number | null
-): Promise<{ number: number; result: CompileResult }> {
+): Promise<{ number: number; result: CompileResult; typecheck?: 'pending' }> {
   // The bare `drobek` import → this server's versioned SDK (immutable caching);
-  // `drobek/<module>` → that module's inline source, built into the app (M1-02);
-  // every entry loads the error beacon first (M1-07, drobek.json can opt out).
+  // `drobek/<module>` → that module's inline source, built into the app;
+  // every entry loads the error beacon first (drobek.json can opt out).
+  // The app's uploaded assets share its URL space: a reference to one is not missing.
+  const assets = await listAssets(app.id);
   const result = await ctx.deps.compile(sources, {
     sdkUrl: ctx.modules.sdk.url,
     sdkSources: ctx.modules.sdk.inline,
     beaconUrl: ctx.modules.sdk.beacon.url,
+    servedPaths: assets.map((a) => a.name),
   });
   try {
     refuseUnstorable(result);
@@ -499,15 +642,27 @@ async function compileAndStore(
     await logCompile(ctx, app.id, null, result, trigger);
     throw err;
   }
-  const { number } = await createVersion(app.id, versionFiles(sources, result), {
-    actor: actorOf(ctx),
-    reasoning,
-    compile: { status: result.ok ? 'ok' : 'error', errors: result.ok ? null : result.errors },
-    ...(baseVersion !== undefined ? { baseVersion } : {}),
-  });
+  let stored: { id: string; number: number };
+  try {
+    stored = await createVersion(app.id, versionFiles(sources, result), {
+      actor: actorOf(ctx),
+      reasoning,
+      compile: { status: result.ok ? 'ok' : 'error', errors: result.ok ? null : result.errors },
+      versionLimits: versionLimits.rate,
+      sourceQuota: versionLimits.storage.sourceQuota,
+      ...(baseVersion !== undefined ? { baseVersion } : {}),
+    });
+  } catch (err) {
+    const refused = versionStoreError(err);
+    if (refused !== err) await logCompile(ctx, app.id, null, result, trigger);
+    throw refused;
+  }
+  const { id, number } = stored;
   await logCompile(ctx, app.id, number, result, trigger);
   await ctx.deps.notifyAppChanged({ app_id: app.id, slug: app.slug, version: number });
-  return { number, result };
+  // The TypeScript check runs in the background — the write never waits for it.
+  const typecheck = result.ok ? scheduleVersionTypecheck({ id, appId: app.id }, sources, ctx.deps.log) : undefined;
+  return { number, result, ...(typecheck ? { typecheck } : {}) };
 }
 
 // ── create_app ───────────────────────────────────────────────────────────────
@@ -534,8 +689,19 @@ export async function createApp(
   // a free `-xxxx` variant instead of an error round trip.
   const base = deriveSlug(name);
   let slug = validateAppSlug(base) ? suggestSlug(base || 'app') : base;
-  // The workspace's plan (limits provider) or the env default (NSO-329).
-  const maxApps = (await ctx.modules.workspaceLimits(ws.id)).APPS_MAX_PER_WORKSPACE;
+  // The workspace's plan (limits provider) or the env default.
+  const wsLimits = await ctx.modules.workspaceLimits(ws.id);
+  const maxApps = wsLimits.APPS_MAX_PER_WORKSPACE;
+  const versionLimits = versionLimitsFrom(wsLimits, ctx.deps.env);
+  const files = templateFiles(template, name);
+  // Version 1 counts against the caller's VERSIONS_PER_USER_HOUR and the workspace's
+  // WORKSPACE_SOURCE_QUOTA: refused before the app exists.
+  await refuseOverVersionRate(ctx, versionLimits.rate);
+  try {
+    await assertSourceQuota(ws.id, [...files.values()].map((content) => ({ content })), versionLimits.storage.sourceQuota);
+  } catch (err) {
+    throw versionStoreError(err);
+  }
   let created: { id: string; slug: string } | null = null;
   for (let attempt = 0; attempt < 4 && !created; attempt++) {
     try {
@@ -556,9 +722,10 @@ export async function createApp(
   const { number, result } = await compileAndStore(
     ctx,
     created,
-    templateFiles(template, name),
+    files,
     `Created from the ${template} template`,
-    'create_app'
+    'create_app',
+    versionLimits
   );
   await ctx.modules.runHook('onAppCreate', { id: created.id, slug: created.slug, workspaceId: ws.id });
   const enabled = await ctx.modules.enabledModules(ws.id);
@@ -571,7 +738,7 @@ export async function createApp(
     version: number,
     compile: compileOut(result, ctx.modules, enabled),
     preview_url: previewUrl(created.slug, ctx.deps.env),
-    briefing: briefing(ctx, enabled),
+    briefing: briefing(ctx, enabled, versionLimits),
     skills: skills(ctx, enabled),
   };
 }
@@ -616,12 +783,12 @@ async function duplicateSourceSlug(from: string, env: NodeJS.ProcessEnv): Promis
 }
 
 /**
- * Copy a gallery app into the caller's workspace (NSO-340) — the dashboard's
+ * Copy a gallery app into the caller's workspace — the dashboard's
  * /duplicate/:slug in one call. Only an app shown in the public gallery whose
  * owner allows duplicates; the copy is the published files as version 1 of a
  * new, unpublished app (provenance kept), and the source's module settings
- * are proposed to it through its confirmation flow (e-mail addresses and
- * proxy upstreams dropped). Never secrets, data, users, uploads, assets or
+ * are proposed to it through its confirmation flow (e-mail addresses,
+ * proxy upstreams and sync sources dropped). Never secrets, data, users, uploads, assets or
  * domains. write scope, editor+ in the target workspace (default: personal).
  */
 export async function duplicateApp(ctx: CallContext, args: { from: string; workspace?: string; name?: string }) {
@@ -641,12 +808,15 @@ export async function duplicateApp(ctx: CallContext, args: { from: string; works
   try {
     source = await duplicationSource(from, env);
     const name = copyName(args.name, source);
+    const wsLimits = await ctx.modules.workspaceLimits(ws.id);
     copy = await duplicateAppFiles({
       source,
       workspaceId: ws.id,
       name,
       actor: actorOf(ctx),
-      maxApps: (await ctx.modules.workspaceLimits(ws.id)).APPS_MAX_PER_WORKSPACE,
+      maxApps: wsLimits.APPS_MAX_PER_WORKSPACE,
+      versionLimits: versionRateLimitsOf(wsLimits, env),
+      sourceQuota: versionStorageLimitsOf(wsLimits, env).sourceQuota,
       env,
     });
   } catch (err) {
@@ -698,7 +868,7 @@ export interface FileChange {
   path: string;
   content?: string;
   delete?: boolean;
-  /** NSO-382: exact-string replacements applied to the file of the version the write builds on. */
+  /** Exact-string replacements applied to the file of the version the write builds on. */
   edits?: FileEdit[];
 }
 
@@ -753,8 +923,7 @@ function validateChanges(files: unknown, reasoning: unknown, warnings: WriteWarn
     if (!path) throw new ToolError('invalid_path', `Unsafe file path ${JSON.stringify(f?.path)}.`);
     const del = f.delete === true;
     const hasContent = typeof f.content === 'string';
-    // Before NSO-382 `edits` next to `content` / `delete` was dropped silently;
-    // such a call still does what it did, now with a warning.
+    // `edits` next to `content` / `delete` is ignored, with a warning.
     const edits = f.edits !== undefined && !del && !hasContent ? validateEdits(path, f.edits) : undefined;
     if (f.edits !== undefined && edits === undefined) {
       warnings.push({
@@ -882,12 +1051,16 @@ export async function writeFiles(
   refuseIfLockedByAdmin(app);
   const warnings: WriteWarning[] = [];
   const changes = validateChanges(args.files, args.reasoning, warnings);
+  const versionLimits = await versionLimitsOf(ctx, app.workspaceId);
+  await refuseOverVersionRate(ctx, versionLimits.rate, app.id);
   await takeLease(ctx, app.id);
   // The lease keeps other users out, not the same user's other session. Edits
   // are only valid against the version they were applied to, so a call with
   // edits is stored only on top of its base and re-applied to a newer one;
   // whole-file writes land on top of the latest version as they always did.
   const hasEdits = changes.some((c) => c.edits !== undefined);
+  // What the preview showed before this write: the agent hears when its pages reported errors.
+  const previousErrors = await browserErrorCount(ctx, app.id, await lastOkVersionNumber(app.id));
 
   for (let attempt = 1; ; attempt++) {
     const { base, files } = await latestSources(app.id);
@@ -911,9 +1084,9 @@ export async function writeFiles(
     }
     checkSizes(files, ctx.deps);
 
-    let stored: { number: number; result: CompileResult };
+    let stored: Awaited<ReturnType<typeof compileAndStore>>;
     try {
-      stored = await compileAndStore(ctx, app, files, args.reasoning.trim(), 'write_files', hasEdits ? base : undefined);
+      stored = await compileAndStore(ctx, app, files, args.reasoning.trim(), 'write_files', versionLimits, hasEdits ? base : undefined);
     } catch (err) {
       if (!(err instanceof AppsError && err.code === 'version_conflict')) throw err;
       if (attempt >= EDIT_WRITE_ATTEMPTS) {
@@ -924,14 +1097,18 @@ export async function writeFiles(
       }
       continue;
     }
-    const { number, result } = stored;
+    const { number, result, typecheck } = stored;
+    const enabled = await ctx.modules.enabledModules(app.workspaceId);
+    const compile = compileOut(result, ctx.modules, enabled);
     return {
       version: number,
       base_version: base,
-      compile: compileOut(result, ctx.modules, await ctx.modules.enabledModules(app.workspaceId)),
+      compile,
       preview_url: previewUrl(app.slug, ctx.deps.env),
       changed,
+      readiness: await filesReadiness(ctx, app.id, enabled, files, compile.errors, typecheck),
       ...(await previewNote(app.id, result.ok)),
+      ...(previousErrors > 0 ? { previous_version_browser_errors: previousErrors } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
     };
   }
@@ -945,15 +1122,15 @@ export async function restoreVersion(ctx: CallContext, args: { app_id: string; v
   if (!Number.isInteger(args.version) || args.version < 1) {
     throw new ToolError('invalid_params', '`version` must be a positive integer.');
   }
+  const versionLimits = await versionLimitsOf(ctx, app.workspaceId);
+  await refuseOverVersionRate(ctx, versionLimits.rate, app.id);
   await takeLease(ctx, app.id);
   let created: { id: string; number: number; assetsRestored: boolean };
   try {
-    created = await restore(app.id, args.version, actorOf(ctx));
+    created = await restore(app.id, args.version, actorOf(ctx), { versionLimits: versionLimits.rate });
   } catch (err) {
-    if (err instanceof AppsError && err.code === 'not_found') {
-      throw new ToolError('not_found', `Version ${args.version} does not exist.`);
-    }
-    throw err;
+    if (err instanceof AppsError && err.code === 'not_found') throw await missingVersion(ctx, app, args.version, versionLimits.storage.keep);
+    throw versionStoreError(err);
   }
   const v = await getVersion(app.id, { id: created.id });
   const ok = v?.compileStatus === 'ok';
@@ -961,7 +1138,7 @@ export async function restoreVersion(ctx: CallContext, args: { app_id: string; v
   return {
     version: created.number,
     restored_from: args.version,
-    // NSO-362: true = the draft assets were reset to the set that version had when it was last published.
+    // True = the draft assets were reset to the set that version had when it was last published.
     assets_restored: created.assetsRestored,
     compile: {
       ok,
@@ -983,7 +1160,7 @@ export async function restoreVersion(ctx: CallContext, args: { app_id: string; v
  * files and cannot interleave with a write — it only moves one pointer
  * (atomic, audited `app.publish` by @drobek/apps). A workspace a super-admin
  * blocked answers `publish_blocked`; an unapproved one (PUBLISH_APPROVAL=
- * approval, NSO-366) `publish_not_approved`, and that refusal already
+ * approval) `publish_not_approved`, and that refusal already
  * e-mailed the operator an approval request.
  */
 export async function publishApp(ctx: CallContext, args: { app_id: string; version?: number }) {
@@ -1000,7 +1177,7 @@ export async function publishApp(ctx: CallContext, args: { app_id: string; versi
     );
   }
   const version = await getVersion(app.id, { number });
-  if (!version) throw new ToolError('not_found', `Version ${number} does not exist.`);
+  if (!version) throw await missingVersion(ctx, app, number);
 
   let result: { number: number; previousNumber: number | null; assets: 'draft' | 'kept' };
   try {
@@ -1012,23 +1189,24 @@ export async function publishApp(ctx: CallContext, args: { app_id: string; versi
     if (err instanceof AppsError && err.code === 'not_publishable') {
       throw new ToolError('not_publishable', err.message, { version: number });
     }
-    if (err instanceof AppsError && err.code === 'not_found') {
-      throw new ToolError('not_found', `Version ${number} does not exist.`);
-    }
+    if (err instanceof AppsError && err.code === 'not_found') throw await missingVersion(ctx, app, number);
     throw err;
   }
   await ctx.deps.notifyAppChanged({ app_id: app.id, slug: app.slug, version: result.number, kind: 'publish' });
   await ctx.modules.runHook('onPublish', { id: app.id, slug: app.slug, workspaceId: app.workspaceId, version: result.number });
   const url = publishedUrl(app.slug, ctx.deps.env);
+  // Warnings only — a version that compiled is published whatever they say.
+  const readiness = await storedReadiness(ctx, app.id, await ctx.modules.enabledModules(app.workspaceId), result.number);
   return {
     published_version: result.number,
     previous_version: result.previousNumber,
     published_url: url,
-    // The production host, then every VERIFIED custom domain (M3-01) — all serve this version now.
+    // The production host, then every VERIFIED custom domain — all serve this version now.
     domains: [new URL(url).host, ...(await verifiedDomainsOf(app.id))],
-    // NSO-362: which asset set went live with it — the draft (what the preview shows) or, for a
+    // Which asset set went live with it — the draft (what the preview shows) or, for a
     // rollback, the set the version had when it was last published.
     assets: result.assets === 'draft' ? 'draft' : 'as_last_published',
+    ...(readiness ? { readiness } : {}),
   };
 }
 
@@ -1036,7 +1214,7 @@ export async function publishApp(ctx: CallContext, args: { app_id: string; versi
 
 /**
  * List a PUBLISHED app in the server's public gallery with a short public
- * description, change the description, or unlist it (NSO-340) — the same
+ * description, change the description, or unlist it — the same
  * @drobek/apps function as the dashboard switch, audited as the agent.
  * publish scope (tools/list), editor+ role. Listing refuses, in this order: a
  * server without a gallery (`gallery_disabled`), a taken-down app, an entry
@@ -1116,14 +1294,14 @@ export async function setGalleryListingTool(
 // ── skill_info ───────────────────────────────────────────────────────────────
 
 /**
- * The agent-facing documentation of this server's backends (M1-01):
+ * The agent-facing documentation of this server's backends:
  * `skill_info()` lists every skill (active modules + general skills) with its
  * "use when…" sentence; `skill_info(name)` returns one skill's Markdown (for a
  * module also its SDK types, config schema/defaults, limits and the NAMES of
  * its secrets). Server-wide: it never returns a secret value or any app's
  * config. An opt-in module's skill carries `availability: 'opt-in'`; with
  * `app_id` (viewer+ of that app) it also says `enabled_for_workspace` — is
- * the module active for the app's workspace (NSO-346).
+ * the module active for the app's workspace.
  */
 export async function skillInfo(ctx: CallContext, args: { name?: string; app_id?: string }) {
   let enabled: ReadonlySet<string> | null = null;
@@ -1157,12 +1335,13 @@ export async function skillInfo(ctx: CallContext, args: { name?: string; app_id?
 // ── configure_module ─────────────────────────────────────────────────────────
 
 /**
- * Set a platform module's per-app config (M1-01). `config` is a PARTIAL
+ * Set a platform module's per-app config. `config` is a PARTIAL
  * config (JSON merge patch: only the keys you change; null resets a key).
  * Validated against the module's configSchema (`invalid_params` with the
  * field paths). Changes the module marks as needing the owner's OK (e.g.
  * opening data to the public, a new e-mail recipient) are held as pending:
- * `applied:false`, `pending_confirmation`, `confirm_url` for the user.
+ * `applied:false`, `pending_confirmation`, `confirm_url` for the user; a
+ * proposal made while another waits joins it (`merged_with_pending`).
  * editor+; takes the single-writer lease like write_files.
  */
 export async function configureModule(
@@ -1188,6 +1367,9 @@ export async function configureModule(
         ? {
             note:
               'Give the user confirm_url and tell them what needs their confirmation. The pending change applies only after they confirm it in the drobek dashboard; until then the config above stays in force.' +
+              (out.merged_with_pending
+                ? ' A change was already waiting (merged_with_pending): this proposal joined it, so pending_confirmation lists the combined change, and the user confirms or rejects it all at once.'
+                : '') +
               (out.confirm_role === 'admin' ? ' Only a workspace admin of the app\'s workspace can confirm this one (confirm_role: admin).' : ''),
           }
         : {}),
@@ -1223,7 +1405,7 @@ export interface QueryDataResult {
 }
 
 /**
- * Read an app's stored records (M1-03) as its owner: viewer+ of the app's
+ * Read an app's stored records as its owner: viewer+ of the app's
  * workspace, authorized per call; the end-user rules do not apply. The
  * records module (the built-in `data`) answers for THIS app only, so another
  * app's collections are simply not found. ≤ 100 records per call; the
@@ -1279,28 +1461,51 @@ export async function queryData(
 
 // ── get_logs ─────────────────────────────────────────────────────────────────
 
+/**
+ * get_logs kinds: the insights logs plus `browser` (the preview's browser
+ * errors), `sync` (the sync module's run history) and `webhooks` (the
+ * webhooks module's deliveries).
+ */
+type GetLogsKind = LogKind | 'browser' | 'sync' | 'webhooks';
+const GET_LOGS_KINDS: readonly GetLogsKind[] = [...LOG_KINDS, 'browser', 'sync', 'webhooks'];
+const GET_LOGS_MAX = 100;
+
 export interface GetLogsResult {
   app_id: string;
-  kind: LogKind;
+  kind: GetLogsKind;
   /** The start of the window the entries cover (ISO; at most 30 days back). */
   since: string;
   entries: unknown[];
   untrusted: true;
+  /** kind runtime: the newest version's page loads and browser errors. */
+  render?: RenderSignal;
   note?: string;
 }
 
-const EMPTY_NOTES: Record<LogKind, string> = {
+const EMPTY_NOTES: Record<GetLogsKind, string> = {
   runtime:
-    'No browser errors in this window. Every page that loads a compiled entry reports uncaught errors and unhandled promise rejections here within seconds (unless drobek.json has "beacon": false) — open the preview_url to reproduce a problem, then call get_logs again.',
+    'No browser errors in this window. Every page that loads a compiled entry reports uncaught errors, unhandled promise rejections, files that failed to load and requests the CSP blocked here within seconds (unless drobek.json has "beacon": false) — open the preview_url to reproduce a problem, then call get_logs again.',
+  browser:
+    'No browser errors from the preview in this window. Pages of the preview and of version addresses report their uncaught errors, unhandled promise rejections and console.error calls with an Error here within seconds (unless drobek.json has "browserErrors": false); they are kept 48 hours by default. Ask the user to open the preview_url and repeat what failed, then call get_logs again.',
   compile: 'No compiles in this window.',
   requests: 'No requests in this window.',
+  sync: 'No sync runs in this window. A source runs on its schedule once the owner confirmed it; sync_now runs it at once.',
+  webhooks:
+    'No webhook deliveries in this window. An endpoint takes deliveries once the owner confirmed it; the sending service must post to its url (get_app → modules.webhooks.info.endpoints).',
 };
 
 /**
- * What happened to an app (M1-07), for the viewer+ of its workspace:
- *   runtime  — browser errors reported by the app's pages (deduped, with counts);
+ * What happened to an app, for the viewer+ of its workspace:
+ *   runtime  — browser errors reported by the app's pages (deduped, with counts,
+ *              each with the version of its page) + the newest version's render
+ *              signal (page loads, errors of its pages);
+ *   browser  — the preview's browser errors (preview and version hosts only;
+ *              console.error included), deduped with counts, each stack mapped
+ *              through its version's source map to the app's sources;
  *   compile  — the last 50 compiles (ok / errors / version / duration);
- *   requests — per UTC day: requests, 5xx, 404s, and module calls by status class.
+ *   requests — per UTC day: requests, 5xx, 404s, and module calls by status class;
+ *   sync     — the latest runs of the app's sync sources (newest first);
+ *   webhooks — the latest deliveries to the app's webhook endpoints (newest first, never a body).
  * `since` (ISO) narrows the window; nothing older than 30 days exists. ≤ 100
  * entries. Everything is app-authored or user-supplied text → `untrusted`.
  */
@@ -1309,20 +1514,65 @@ export async function getLogs(
   args: { app_id: string; kind: string; since?: string }
 ): Promise<GetLogsResult> {
   const { app } = await authorizeApp(ctx.principal, args.app_id, 'viewer');
-  const kind = args.kind as LogKind;
-  if (!(LOG_KINDS as readonly string[]).includes(kind)) {
-    throw new ToolError('invalid_params', '`kind` must be "runtime", "compile" or "requests".');
+  const kind = args.kind as GetLogsKind;
+  if (!(GET_LOGS_KINDS as readonly string[]).includes(kind)) {
+    throw new ToolError('invalid_params', '`kind` must be "runtime", "browser", "compile", "requests", "sync" or "webhooks".');
   }
   if (args.since !== undefined && (typeof args.since !== 'string' || Number.isNaN(Date.parse(args.since)))) {
     throw new ToolError('invalid_params', '`since` must be an ISO 8601 date-time, e.g. "2026-09-23T10:00:00Z".');
   }
   const from = logsWindowStart(args.since ?? null);
-  const entries =
-    kind === 'runtime'
-      ? await ctx.deps.logs.runtime(app.id, from)
-      : kind === 'compile'
-        ? await ctx.deps.logs.compile(app.id, from)
-        : await ctx.deps.logs.requests(app.id, from);
+  if (kind === 'sync') {
+    const sync = await ctx.modules.sync({ id: app.id, slug: app.slug, workspaceId: app.workspaceId });
+    const runs = sync ? await sync.runs({ since: from, limit: GET_LOGS_MAX }) : [];
+    return {
+      app_id: app.id,
+      kind,
+      since: from.toISOString(),
+      entries: runs,
+      untrusted: true,
+      ...(runs.length === 0 ? { note: sync ? EMPTY_NOTES.sync : 'This server has no sync module: apps here import nothing on a schedule.' } : {}),
+    };
+  }
+  if (kind === 'webhooks') {
+    const hooks = await ctx.modules.webhooks({ id: app.id, slug: app.slug, workspaceId: app.workspaceId });
+    const entries = hooks ? await hooks.deliveries({ since: from, limit: GET_LOGS_MAX }) : [];
+    return {
+      app_id: app.id,
+      kind,
+      since: from.toISOString(),
+      entries,
+      untrusted: true,
+      ...(entries.length === 0 ? { note: hooks ? EMPTY_NOTES.webhooks : 'This server has no webhooks module: apps here receive no webhooks.' } : {}),
+    };
+  }
+  if (kind === 'browser') {
+    const entries = await ctx.deps.browserErrors.read(app.id, { since: from, limit: GET_LOGS_MAX });
+    return {
+      app_id: app.id,
+      kind,
+      since: from.toISOString(),
+      entries,
+      untrusted: true,
+      ...(entries.length === 0 ? { note: EMPTY_NOTES.browser } : {}),
+    };
+  }
+  if (kind === 'runtime') {
+    const entries: RuntimeEntry[] = await ctx.deps.logs.runtime(app.id, from);
+    const head = (await latestVersions([app.id])).get(app.id);
+    const render = head ? await renderSignal(ctx, app.id, head) : undefined;
+    const note = [entries.length === 0 ? EMPTY_NOTES.runtime : null, render ? renderNote(render) : null].filter(Boolean).join(' ');
+    return {
+      app_id: app.id,
+      kind,
+      since: from.toISOString(),
+      entries,
+      untrusted: true,
+      ...(render ? { render } : {}),
+      ...(note ? { note } : {}),
+    };
+  }
+  const entries = kind === 'compile' ? await ctx.deps.logs.compile(app.id, from) : await ctx.deps.logs.requests(app.id, from);
   return {
     app_id: app.id,
     kind,
@@ -1331,4 +1581,47 @@ export async function getLogs(
     untrusted: true,
     ...(entries.length === 0 ? { note: EMPTY_NOTES[kind] } : {}),
   };
+}
+
+// ── sync_now ─────────────────────────────────────────────────────────────────
+
+/**
+ * Run one of the app's sync sources now, the dashboard's Run now
+ * over MCP: editor+, a paused source too (a successful run resumes one paused
+ * after failures). A failed RUN is not a tool error: the answer is the run
+ * with `status: "failed"` and its `error`. Rate limited per source
+ * (SYNC_NOW_PER_MINUTE) and by the app's hourly runs; audited `sync.run`
+ * with the agent as the actor.
+ */
+const SYNC_NOW_PASSED_CODES = ['not_found', 'module_not_enabled', 'rate_limited', 'limit_exceeded'] as const;
+
+export async function syncNow(ctx: CallContext, args: { app_id: string; source: string }) {
+  const { app } = await authorizeApp(ctx.principal, args.app_id, 'editor');
+  if (typeof args.source !== 'string' || args.source.length === 0) {
+    throw new ToolError('invalid_params', '`source` must be the name of a sync source of the app (get_app lists them under modules.sync).');
+  }
+  refuseIfLockedByAdmin(app);
+  const sync = await ctx.modules.sync({ id: app.id, slug: app.slug, workspaceId: app.workspaceId });
+  if (!sync) {
+    throw new ToolError('not_found', 'This server has no sync module: apps here import nothing on a schedule.', { hint: 'skill_info()' });
+  }
+  try {
+    const run = await sync.runNow(args.source, { userId: ctx.principal.userId, surface: 'mcp' });
+    return {
+      app_id: app.id,
+      run,
+      ...(run.status === 'failed'
+        ? { note: `The run failed and changed nothing: ${run.error ?? 'see get_logs(kind: "sync")'}. skill_info('${sync.module}') maps the usual errors to their fix.` }
+        : {}),
+    };
+  } catch (err) {
+    if (isModuleError(err)) {
+      const details = (err.details && typeof err.details === 'object' ? err.details : {}) as Record<string, unknown>;
+      const hint = { hint: `skill_info('${sync.module}')` };
+      const passed = SYNC_NOW_PASSED_CODES.find((c) => c === err.code);
+      if (passed) throw new ToolError(passed, err.message, { ...details, ...hint });
+      if (err.code === 'conflict') throw new ToolError('busy', err.message, { ...details, reason: 'sync_running', ...hint });
+    }
+    throw err;
+  }
 }

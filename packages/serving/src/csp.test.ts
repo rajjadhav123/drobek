@@ -14,7 +14,7 @@ import {
   withFrameAncestors,
 } from './csp.js';
 
-describe('app CSP (plan §3.3)', () => {
+describe('app CSP', () => {
   it('is exactly the documented policy', () => {
     expect(APP_CSP).toBe(
       "default-src 'self'; script-src 'self' https://esm.sh 'unsafe-inline'; style-src 'self' 'unsafe-inline' https:; " +
@@ -29,14 +29,24 @@ describe('app CSP (plan §3.3)', () => {
     expect(appCsp('https://intranet.example.com')).toContain('frame-ancestors https://intranet.example.com;');
   });
 
-  it('takes a frame-src list (NSO-358)', () => {
+  it('takes one more connect-src origin (the dashboard on the preview host); anything but a bare origin is ignored', () => {
+    expect(appCsp(undefined, undefined, 'https://dash.drobek.app')).toContain("connect-src 'self' https://esm.sh https://dash.drobek.app;");
+    expect(appSecurityHeaders({ noindex: true, connectSrcExtra: 'https://dash.drobek.app' })['Content-Security-Policy']).toContain(
+      "connect-src 'self' https://esm.sh https://dash.drobek.app/api/screenshots/;"
+    );
+    for (const bad of ['https://dash.drobek.app; script-src *', 'https://*.drobek.app', 'https:', "'self'", 'https://dash.drobek.app/x']) {
+      expect(appSecurityHeaders({ noindex: true, connectSrcExtra: bad })['Content-Security-Policy'], bad).toContain("connect-src 'self' https://esm.sh;");
+    }
+  });
+
+  it('takes a frame-src list', () => {
     expect(appCsp(undefined, `${DEFAULT_FRAME_SRC} https://embed.example.com`)).toContain(
       `frame-src ${DEFAULT_FRAME_SRC} https://embed.example.com;`
     );
   });
 });
 
-describe('APP_FRAME_SRC_EXTRA (NSO-358)', () => {
+describe('APP_FRAME_SRC_EXTRA', () => {
   it('accepts comma / space separated https origins, lower-cased, de-duplicated', () => {
     expect(parseFrameSrcExtra('https://Embed.Example.com, https://tube.example.org:8443  https://embed.example.com/')).toEqual({
       sources: ['https://embed.example.com', 'https://tube.example.org:8443'],
@@ -106,11 +116,11 @@ describe('parseFrameAncestors', () => {
 });
 
 describe('appSecurityHeaders (snapshot)', () => {
-  it('production host: CSP + nosniff + no-referrer, indexable', () => {
+  it('production host: CSP + nosniff + strict-origin referrer, indexable', () => {
     expect(appSecurityHeaders({ noindex: false })).toEqual({
       'Content-Security-Policy': APP_CSP,
       'X-Content-Type-Options': 'nosniff',
-      'Referrer-Policy': 'no-referrer',
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
     });
   });
 
@@ -118,7 +128,7 @@ describe('appSecurityHeaders (snapshot)', () => {
     expect(appSecurityHeaders({ noindex: true })).toEqual({
       'Content-Security-Policy': APP_CSP,
       'X-Content-Type-Options': 'nosniff',
-      'Referrer-Policy': 'no-referrer',
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
       'X-Robots-Tag': 'noindex',
     });
   });
@@ -129,7 +139,7 @@ describe('appSecurityHeaders (snapshot)', () => {
   });
 });
 
-describe('withFrameAncestors (NSO-342 dashboard thumbnail, GALLERY_FRAME_ANCESTORS)', () => {
+describe('withFrameAncestors (dashboard thumbnail, GALLERY_FRAME_ANCESTORS)', () => {
   const dash = 'https://drobek.example.com';
   const gallery = 'https://www.example.com';
 

@@ -5,14 +5,14 @@ import { SKILL_SECTIONS, codeBlocks, formatSkillIssue, knownErrorCodes, skillFor
 import { BUILTIN_MODULES, EXPECTED_SKILLS, skillSources, skillsRuntime } from './skills.js';
 
 /**
- * NSO-308: the content `skill_info` serves. Written for the AGENT only, one
- * format for all 10 skills (docs/MODULES.md "Skills"):
+ * The content `skill_info` serves. Written for the AGENT only, one
+ * format for all 14 skills (docs/MODULES.md "Skills"):
  *
  *   ## 1. When to use / ## 2. Minimal working code / ## 3. API and types /
  *   ## 4. Rules and limits / ## 5. Errors → fix — at most 150 lines.
  *
  * The rules are `skillFormatIssues` of @drobek/modules/testing — the same
- * `checkSkill` library an external module runs in its own tests (NSO-349).
+ * `checkSkill` library an external module runs in its own tests.
  * The code inside is verified by examples.test.ts.
  */
 const CORE_CODES = ERROR_CATALOGUE.map((e) => e.code);
@@ -20,28 +20,29 @@ const CORE_CODES = ERROR_CATALOGUE.map((e) => e.code);
 const sources = await skillSources();
 
 describe('skill_info() with every built-in module', () => {
-  it('lists exactly the 10 skills — modules first, then the general skills', async () => {
+  it('lists exactly the 14 skills — modules first, then the general skills', async () => {
     const rt = await skillsRuntime();
     expect(rt.skillList().map((s) => s.name)).toEqual([...EXPECTED_SKILLS]);
   });
 
   it('the checker knows exactly the catalogue codes (+ the module codes)', () => {
-    expect([...CORE_ERROR_CODES].sort()).toEqual([...new Set(CORE_CODES.filter((c) => /^[a-z][a-z0-9_]*$/.test(c)))].sort());
+    expect([...CORE_ERROR_CODES].sort()).toEqual([...new Set(CORE_CODES.filter((c) => /^[a-z][a-z_]*$/.test(c)))].sort());
     const auth = sources.find((s) => s.name === 'auth')!;
     expect(knownErrorCodes(auth, BUILTIN_MODULES).has('invalid_code')).toBe(true);
     expect(knownErrorCodes(auth, BUILTIN_MODULES).has('ssrf_blocked')).toBe(false); // proxy's code, not auth's
   });
 
-  it('the merged error catalogue (core + every built-in module) has one owner per code; skill_info returns the module codes (NSO-344)', async () => {
+  it('the merged error catalogue (core + every built-in module) has one owner per code; skill_info returns the module codes', async () => {
     const rt = await skillsRuntime();
     const moduleCodes = rt.errorCatalogue().flatMap((s) => s.errors.map((e) => e.code));
     const all = [...CORE_CODES, ...moduleCodes];
     expect(new Set(all).size).toBe(all.length);
-    for (const code of ['email_not_allowed', 'invalid_code', 'too_many_attempts', 'invalid_form_token', 'submitted_too_fast', 'validation_failed', 'unsupported_type', 'ssrf_blocked', 'proxy_busy', 'path_not_allowed', 'upstream_error']) {
+    for (const code of ['email_not_allowed', 'invalid_code', 'too_many_attempts', 'invalid_form_token', 'submitted_too_fast', 'validation_failed', 'unsupported_type', 'ssrf_blocked', 'proxy_busy', 'path_not_allowed', 'upstream_error', 'upstream_redirect', 'invalid_signature', 'webhook_secret_not_set', 'webhook_not_stored']) {
       expect(moduleCodes, code).toContain(code);
     }
     for (const m of BUILTIN_MODULES) {
-      expect(m.contract, m.name).toBe('^1.1');
+      // webhooks needs 1.3 (secretsFor, ctx.records.create, passwordGate); sync 1.2 (app jobs); the others run on 1.1.
+      expect(m.contract, m.name).toBe(m.secretsFor ? '^1.3' : m.jobs ? '^1.2' : '^1.1');
       expect(rt.skillInfo(m.name)!.errors, m.name).toEqual(m.errors ?? []);
     }
   });
@@ -53,7 +54,9 @@ describe('skill_info() with every built-in module', () => {
       expect(info, src.name).toMatchObject({ name: src.name, kind: src.kind, use_when: src.useWhen });
       expect(info.content).toBe(src.content);
       expect(src.fileText.trimEnd().endsWith(info.content.trimEnd()), src.name).toBe(true);
-      if (src.kind === 'module') expect(info.sdk?.types, src.name).toContain(`export declare namespace ${src.name}`);
+      // A module without an SDK (sync: nothing for the browser to call) has no types.
+      if (src.kind === 'module' && rt.get(src.name)?.sdk) expect(info.sdk?.types, src.name).toContain(`export declare namespace ${src.name}`);
+      else if (src.kind === 'module') expect(info.sdk, src.name).toBeUndefined();
     }
   });
 });
@@ -82,6 +85,15 @@ describe('skill start', () => {
     expect(start.content).toContain('3 minutes');
     expect(start.content).toContain('never RUNS anything');
   });
+
+  it('has the agent write the description, the favicon, absolute link-preview URLs and noindex into the head', () => {
+    expect(start.content).toContain('drobek adds nothing to your `<head>`');
+    expect(start.content).toContain('<meta name="description" content="…">');
+    expect(start.content).toContain('<link rel="icon" href="/favicon.svg" type="image/svg+xml">');
+    expect(start.content).toContain('`og:image` = ABSOLUTE `published_url`');
+    expect(start.content).toContain('(no SVG)');
+    expect(start.content).toContain('<meta name="robots" content="noindex">');
+  });
 });
 
 describe('skill ui', () => {
@@ -91,6 +103,36 @@ describe('skill ui', () => {
     const html = codeBlocks(ui.content).find((b) => b.lang === 'html')!;
     expect(html.code).toContain(`<script type="module" src="${TAILWIND_BROWSER_URL}"></script>`);
     expect(renderBriefing()).toContain(TAILWIND_BROWSER_URL);
+  });
+});
+
+describe('skill port-app', () => {
+  const port = sources.find((s) => s.name === 'port-app')!;
+
+  it('maps every Supabase-era backend to the module skill that replaces it', () => {
+    for (const m of ['auth', 'data', 'sync', 'files', 'proxy', 'email', 'forms', 'webhooks', 'ui', 'port-artifact']) {
+      expect(port.content, m).toContain(`skill_info('${m}')`);
+    }
+    expect(port.content).toContain('`create_records` (≤ 500 a call)');
+  });
+
+  it('keeps the @/ alias through drobek.json paths and pins one React with ?deps', () => {
+    const map = JSON.parse(codeBlocks(port.content).find((b) => b.meta === 'drobek.json')!.code) as { imports: Record<string, string>; paths: unknown };
+    expect(map.paths).toEqual({ '@/*': ['src/*'] });
+    const react = /react@([\d.]+)$/.exec(map.imports.react)![1];
+    for (const [name, url] of Object.entries(map.imports)) {
+      if (/react-dom|react-router|radix|lucide/.test(name)) expect(url, name).toContain(`?deps=react@${react}`);
+    }
+    expect(port.content).toContain('Not `?external=react`');
+  });
+
+  it('loads the Tailwind browser build the briefing names, and states what is never ported and when to publish', () => {
+    const html = codeBlocks(port.content).find((b) => b.lang === 'html')!;
+    expect(html.code).toContain(`<script type="module" src="${TAILWIND_BROWSER_URL}"></script>`);
+    expect(html.code).toContain('<style type="text/tailwindcss">');
+    for (const never of ['`vite.config.*`', '`.env*`', '`node_modules`', 'server code', '`cdn.gpteng.co`']) expect(port.content, never).toContain(never);
+    expect(port.content).toContain('ONLY when the user explicitly asks');
+    expect(port.content).toContain('Next.js');
   });
 });
 

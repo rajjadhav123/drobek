@@ -1,5 +1,5 @@
 /**
- * The public gallery, the pure half (NSO-340): the on/off switch
+ * The public gallery, the pure half: the on/off switch
  * (GALLERY_ENABLED), the public description rules, the page size, the
  * search / sort / page parameters and the opaque cursor of
  * `GET /api/public/gallery`. The stateful half (listing, the super-admin
@@ -101,6 +101,14 @@ export function utcDay(at: Date): string {
 /** The first UTC day inside the `opens` window that ends on `now`. */
 export function galleryOpensSince(now: Date): string {
   return utcDay(new Date(now.getTime() - (GALLERY_OPENS_WINDOW_DAYS - 1) * 86_400_000));
+}
+
+/** Days of open counts kept before the `opens` window; older days are deleted by the daily retention prune. */
+export const GALLERY_OPENS_PRUNE_MARGIN_DAYS = 7;
+
+/** The oldest UTC day of `gallery_opens` the retention prune keeps on `now`. */
+export function galleryOpensKeptSince(now: Date): string {
+  return utcDay(new Date(now.getTime() - (GALLERY_OPENS_WINDOW_DAYS + GALLERY_OPENS_PRUNE_MARGIN_DAYS - 1) * 86_400_000));
 }
 
 /**

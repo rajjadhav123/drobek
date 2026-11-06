@@ -1,6 +1,6 @@
 /**
- * The public error-beacon HTTP handler (PHY-123; on the apps origin since
- * M1-07): `POST /__drobek/v1/_beacon` on every app host. Framework-free — a
+ * The public error-beacon HTTP handler on the apps origin:
+ * `POST /__drobek/v1/_beacon` on every app host. Framework-free — a
  * plain request description in, a plain response out; @drobek/serving calls it
  * for the app it resolved from the Host (after the password gate), so the app
  * is never named by the client.
@@ -15,7 +15,8 @@
  *      answers 'too_large' past the cap while DRAINING the rest of the body
  *      (never destroying/cancelling the request stream — see the regression
  *      test in @drobek/serving node.test.ts: 9 KiB → 413, process alive);
- *   4. parse the JSON batch → recordBeacon (rate limits, redaction, ring buffer);
+ *   4. parse the JSON batch → recordBeacon (page load count, rate limits,
+ *      redaction, ring buffer);
  *   5. 204 fast + no-store. Over-cap → 413, rate-limited → 429, bad JSON → 400.
  */
 import { recordBeacon, type RecordBeaconInput, type RecordBeaconResult } from './beacon.server.js';
@@ -47,6 +48,8 @@ export type BeaconRecorder = (input: RecordBeaconInput) => Promise<RecordBeaconR
 export interface BeaconOptions {
   /** Storage seam (tests); default recordBeacon. */
   record?: BeaconRecorder;
+  /** The version the app host serves right now (null = none) — for a page that does not say its own. */
+  servedVersion?: number | null;
 }
 
 function beaconResponse(status: number, extra: Record<string, string> = {}): BeaconResponse {
@@ -103,7 +106,7 @@ export async function handleBeacon(
   }
 
   try {
-    await (opts.record ?? recordBeacon)({ appId, batch, ip: req.clientIp });
+    await (opts.record ?? recordBeacon)({ appId, batch, ip: req.clientIp, servedVersion: opts.servedVersion ?? null });
     return beaconResponse(204);
   } catch (err) {
     if (err instanceof InsightsError) return beaconResponse(insightsErrorStatus(err.code));

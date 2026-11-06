@@ -1,5 +1,5 @@
 /**
- * Pure shaping for the read side (PHY-123): the stored rows → the
+ * Pure shaping for the read side: the stored rows → the
  * agent-actionable + dashboard shapes. No DB / no Redis here → unit-tested.
  */
 import { fileHintFromStack } from './sanitize.js';
@@ -15,6 +15,11 @@ export interface ErrorRow {
   url: string;
   createdAt: Date;
   ts: Date | null;
+  /** `module_job` rows: the module and job that failed. */
+  module?: string | null;
+  job?: string | null;
+  /** The app version the reporting page was served from (null = unknown). */
+  versionNumber?: number | null;
 }
 
 export interface DedupedError {
@@ -25,8 +30,13 @@ export interface DedupedError {
   firstSeen: string;
   lastSeen: string;
   lastUrl: string;
+  /** The version of the page of the latest occurrence (null = unknown). */
+  lastVersion: number | null;
   /** `file:line:col` extracted from the most recent stack, when present. */
   fileHint: string | null;
+  /** `module_job` errors: the module and job that failed (absent for browser errors). */
+  module?: string;
+  job?: string;
 }
 
 export interface AppErrorsView {
@@ -54,7 +64,10 @@ export function dedupErrors(rows: ErrorRow[]): AppErrorsView {
         firstSeen: r.createdAt.toISOString(),
         lastSeen: r.createdAt.toISOString(),
         lastUrl: r.url,
+        lastVersion: r.versionNumber ?? null,
         fileHint: fileHintFromStack(r.stack),
+        ...(r.module ? { module: r.module } : {}),
+        ...(r.job ? { job: r.job } : {}),
         _lastAt: at,
         _firstAt: at,
       });
@@ -65,6 +78,7 @@ export function dedupErrors(rows: ErrorRow[]): AppErrorsView {
       existing._lastAt = at;
       existing.lastSeen = r.createdAt.toISOString();
       existing.lastUrl = r.url;
+      existing.lastVersion = r.versionNumber ?? null;
       existing.message = r.message;
       existing.fileHint = fileHintFromStack(r.stack) ?? existing.fileHint;
     }

@@ -1,5 +1,5 @@
 /**
- * The MCP endpoint as an OAuth 2.1 Protected Resource (U5, M0-04).
+ * The MCP endpoint as an OAuth 2.1 Protected Resource.
  *
  * The RS never mints tokens — it validates the Bearer against the drobek AS's
  * token store and enforces RFC 8707: an OAuth access token's `audience` MUST
@@ -73,6 +73,8 @@ export interface AuthContext {
   kind: 'oauth' | 'api_key';
   /** Row id of the access token / API key (never the secret). */
   credentialId: string;
+  /** The OAuth client the token was issued to (stable across refreshes); null for an API key. */
+  oauthClientId: string | null;
   userId: string;
   email: string;
   /** Global SUPERADMIN_EMAIL override: reaches every workspace. */
@@ -99,12 +101,12 @@ export async function authenticate(req: Request): Promise<AuthOutcome> {
   const bearer = extractBearer(req);
   if (!bearer) return { kind: 'no_token' };
 
-  let claims: { id: string; userId: string; scope: string; audience: string | null };
+  let claims: { id: string; userId: string; scope: string; audience: string | null; oauthClientId: string | null };
   let kind: AuthContext['kind'];
   if (looksLikeApiKey(bearer)) {
     const key = await validateApiKey(bearer);
     if (!key) return { kind: 'invalid' };
-    claims = { ...key, audience: null };
+    claims = { ...key, audience: null, oauthClientId: null };
     kind = 'api_key';
   } else {
     const token = await validateAccessToken(bearer, { audience: mcpResourceUri() });
@@ -125,6 +127,7 @@ export async function authenticate(req: Request): Promise<AuthOutcome> {
     ctx: {
       kind,
       credentialId: claims.id,
+      oauthClientId: claims.oauthClientId,
       userId: claims.userId,
       email: u.email,
       superAdmin: isSuperAdmin(u.email),

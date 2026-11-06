@@ -1,41 +1,50 @@
 /**
- * The app-host request handler (M0-06): one request on `<slug>[--preview|--v<N>]
+ * The app-host request handler: one request on `<slug>[--preview|--v<N>]
  * .<APPS_DOMAIN>` → one response. Framework-free: a plain request description
  * in, a plain response out; `node.ts` adapts it to node:http / Express.
  *
  * Order (each step before any byte of the app is touched):
  *   1. method — GET/HEAD, plus POST to the password-unlock path; else 405;
- *   2. the app behind the host (404 page when there is none; NSO-315: a client
+ *   2. the app behind the host (404 page when there is none; a client
  *      IP past its unknown-host budget gets 429 instead — and, while throttled,
- *      429 before any lookup for hosts the cache does not know as live apps);
+ *      429 before any lookup for hosts the cache does not know as live apps).
+ *      A version host whose version does not exist or did not compile is
+ *      counted against the same budget (429 past it; else its 404 at step 4);
  *   3. the visibility gate (password page / unlock POST);
  *   4. the version the host serves (404 "not published" / "nothing compiled");
  *   5. the file: built wins over source, TS/JSX sources never served, SPA
- *      fallback for extension-less paths, ETag = sha256 → 304. NSO-381: on
+ *      fallback for extension-less paths, ETag = sha256 → 304. On
  *      the production host and custom domains a built JS/CSS bundle is served
  *      without its inline source map (ETag `"<sha256>-nomap"`), pointing at
  *      `<file>.map`, which serves that map; the preview and version hosts
  *      serve the bundle exactly as stored (see sourcemap.ts);
  *   6. no such file and the path can name an asset (`/film.mp4`,
- *      `/img/s1.jpg`): the app's uploaded asset (NSO-358, `deps.assets` —
- *      video/audio/images/fonts, Range 206, see assets.ts). NSO-362: the
+ *      `/img/s1.jpg`): the app's uploaded asset (`deps.assets` —
+ *      video/audio/images/fonts, Range 206, see assets.ts). The
  *      production host and custom domains serve the set the publish froze,
  *      the preview host the draft, a version host that version's set (or
  *      the draft) — `assetScopeFor`. The version's own file at the same path
  *      wins. Asset paths always carry a media extension, so the SPA fallback
  *      never answers for one.
  *
- * BEACON (M1-07): `POST /__drobek/v1/_beacon` goes to `deps.beacon` (core, not
- * a module — every app reports its browser errors without configuration),
- * after steps 2 and 3 like a platform path; it is not counted as a request.
+ * BEACON: `POST /__drobek/v1/_beacon` goes to `deps.beacon` (core, not
+ * a module — every app reports its browser errors and page loads without
+ * configuration), after steps 2 and 3 like a platform path, with the version
+ * the host serves now; it is not counted as a request. Every HTML file
+ * response names the version it was served from in `Server-Timing:
+ * drobek-version;desc="<N>"`, which the beacon reads from the page's
+ * navigation timing and sends along, so a report is filed under the version
+ * of its page even after the host moved on.
  *
- * PLATFORM paths (M1-01): `/__drobek/*` (except the unlock POST) go to
+ * PLATFORM paths: `/__drobek/*` (except the unlock POST) go to
  * `deps.platform` — the module runtime (SDK, module routes) — AFTER steps 2
  * and 3, so a module route never runs for a missing app or behind a locked
- * password gate (that answers JSON 401 `password_required`). Any method may reach
+ * password gate (that answers JSON 401 `password_required`) — except a route
+ * that authenticates the caller itself (`deps.platformSkipsGate`, a signed
+ * webhook). Any method may reach
  * it; the runtime answers 405 itself. The app's files are never involved.
  *
- * CUSTOM DOMAINS (M3-01): a verified custom domain arrives as target
+ * CUSTOM DOMAINS: a verified custom domain arrives as target
  * `custom` and is served exactly like the production host (published
  * version, indexable). When the app has a PRIMARY domain, its production host
  * answers a GET/HEAD page request with 302 → the same path on that domain
@@ -43,11 +52,11 @@
  *
  * ISOLATION: this handler reads exactly ONE cookie, the app-access cookie of
  * the password gate, and sets no other; the platform handler additionally
- * reads the app's end-user cookie (`drobek_eu`, M1-01). The dashboard session
+ * reads the app's end-user cookie (`drobek_eu`). The dashboard session
  * is never parsed, looked up or touched here, whatever the request carries.
  * Every response — 200, 304, 401, 404, 405, 429, 500 — carries the app CSP,
  * nosniff, Referrer-Policy and (preview/version hosts) X-Robots-Tag; a module
- * response may add a stricter CSP of its own as a second policy (NSO-325).
+ * response may add a stricter CSP of its own as a second policy.
  *
  * GALLERY EMBEDDING: the operator's GALLERY_FRAME_ANCESTORS origins join
  * `frame-ancestors` (next to the dashboard origin and the owner's override)
@@ -55,7 +64,36 @@
  * shows right now (`ServeApp.galleryVisible`, cached like the rest of the app
  * row) — never on its preview or version hosts.
  *
- * ABUSE (M4-02, NSO-293): `GET /.well-known/drobek-report` on ANY app host
+ * FEEDBACK: with `deps.feedback`, every HTML file the preview and version
+ * hosts serve carries the feedback widget's script tag before `</body>` (its
+ * ETag says so: `"<sha256>-fb<N>-<widget hash>"`), unless the version's
+ * drobek.json says `"feedback": false`; `GET /__drobek/feedback.js` serves the
+ * widget there, after steps 2 and 3, and is not counted as a request. The
+ * production host and custom domains never carry or serve it (see
+ * feedback-widget.ts).
+ *
+ * PREVIEW SCRIPT: with `deps.preview`, an HTML file the preview and version
+ * hosts serve also carries `/__drobek/preview.js` (before the feedback tag;
+ * its ETag gains `-pv<N><parts>-<script hash>`) unless no part of it is on
+ * for the version (reload: preview host only, not with `"reload": false`;
+ * errors: not with `"browserErrors": false`; screenshots: preview host only,
+ * not with `"screenshots": false`, and only when the script knows the
+ * dashboard origin — every preview-host response then lets `connect-src`
+ * reach that origin, where the script answers a screenshot request);
+ * `GET /__drobek/preview.js`
+ * serves the script there. `GET /__drobek/preview/events` on the preview
+ * host is the event stream (`deps.previewEvents`, see
+ * preview-events.server.ts) behind the password gate (401 JSON).
+ * `POST /__drobek/preview/errors` on the preview and version hosts takes the
+ * script's error beacon (`deps.browserErrors`, see browser-errors.server.ts)
+ * and always answers 204: behind a locked password gate, for a version
+ * with `"browserErrors": false` or with nothing served, the beacon is
+ * dropped unread. None of them is counted as a request. Every other
+ * `/__drobek/preview*` request — and any of them on the production host or a
+ * custom domain — answers 404 without reaching the platform (see
+ * preview-script.ts).
+ *
+ * ABUSE: `GET /.well-known/drobek-report` on ANY app host
  * answers `{ report_url, app, terms_url }` (public, cacheable 1 h) before
  * anything else — where to report this host. A taken-down app
  * (`lockedReason`) answers 451 on every host (prod, preview, version,
@@ -66,6 +104,7 @@
  */
 import type { Readable } from 'node:stream';
 import { readCookieValue } from '@drobek/core';
+import type { PageViewInput } from '@drobek/insights';
 import {
   REPORT_WELL_KNOWN_PATH,
   lockCategory,
@@ -77,6 +116,17 @@ import {
 } from '@drobek/apps';
 import { assetNameOf, assetResponsePlan, type AssetSource } from './assets.js';
 import { contentTypeForPath } from './content-type.js';
+import { FEEDBACK_SCRIPT_PATH, feedbackScriptTag, injectBeforeBodyEnd, type FeedbackWidget } from './feedback-widget.js';
+import {
+  PREVIEW_ERRORS_PATH,
+  PREVIEW_EVENTS_PATH,
+  PREVIEW_PATH_PREFIX,
+  PREVIEW_SCRIPT_PATH,
+  previewPartsKey,
+  previewScriptTag,
+  type PreviewScript,
+  type PreviewScriptParts,
+} from './preview-script.js';
 import { appSecurityHeaders, parseFrameAncestors, withFrameAncestors } from './csp.js';
 import { UNLOCK_PATH, errorPage, lockedPage, missingPage, passwordPage, type MissingReason } from './pages.js';
 import {
@@ -96,7 +146,7 @@ import {
 } from './resolve.js';
 import { mayCarryInlineSourceMap } from './sourcemap.js';
 import type { ServedManifest } from './manifest.js';
-import type { ServeApp, ServeStore } from './store.server.js';
+import type { ServeApp, ServeStore, ServeVersion } from './store.server.js';
 import type { UnknownHostLimiter } from './unknown-host.js';
 import { decideVisibility } from './visibility.js';
 
@@ -127,18 +177,27 @@ export interface AppRequest {
 /** Where the platform (module runtime) answers on every app host. */
 export const PLATFORM_PREFIX = '/__drobek/';
 
-/** The browser error beacon on every app host (M1-07; handled by core, not a module). */
+/** The browser error beacon on every app host (handled by core, not a module). */
 export const BEACON_PATH = '/__drobek/v1/_beacon';
 
-/** Answers the beacon POST for a resolved, visibility-cleared app. */
-export type BeaconHandler = (req: AppRequest, app: ServeApp) => Promise<AppResponse>;
+/** Answers the beacon POST for a resolved, visibility-cleared app; `version` = what the host serves now (null = nothing). */
+export type BeaconHandler = (req: AppRequest, app: ServeApp, version: ServeVersion | null) => Promise<AppResponse>;
+
+/** The `Server-Timing` metric that names the version an HTML page was served from (read by the beacon). */
+export const VERSION_TIMING_METRIC = 'drobek-version';
+
+/** Answers `GET /__drobek/preview/events` on a preview host for a resolved, visibility-cleared app; `version` = what it serves now. */
+export type PreviewEventsHandler = (req: AppRequest, app: ServeApp, version: ServeVersion | null) => AppResponse | Promise<AppResponse>;
+
+/** Takes `POST /__drobek/preview/errors` of a resolved, unlocked app whose served `version` collects errors (never throws). */
+export type BrowserErrorsHandler = (req: AppRequest, app: ServeApp, version: ServeVersion) => Promise<void>;
 
 /** Answers a `/__drobek/*` request for a resolved, visibility-cleared app. */
 export type PlatformHandler = (req: AppRequest, ctx: { app: ServeApp; target: AppHostTarget }) => Promise<AppResponse>;
 
 export interface AppResponse {
   status: number;
-  headers: Record<string, string>;
+  headers: Record<string, string | string[]>;
   /** A Readable (a platform file download) is piped by the adapter. */
   body: Buffer | string | Readable | null;
 }
@@ -151,15 +210,27 @@ export interface HandlerDeps {
   allowUnlockAttempt(appId: string, clientIp: string | null): Promise<boolean>;
   /** Best-effort, fire-and-forget request/404/5xx counters; `4xx` (a platform 4xx) and a 5xx with `path` record the failing path. */
   signal?(appId: string, kind: 'request' | '404' | '4xx' | '5xx', path?: string): void;
+  /**
+   * Best-effort, fire-and-forget page-view counter (app traffic analytics):
+   * called for a successful (200 / 304) GET of an HTML document on the
+   * production host or a custom domain only (absent → nothing is counted).
+   */
+  pageView?(appId: string, view: PageViewInput): void;
   now?: () => number;
   /** `__Host-` + Secure app-access cookie (default true; false only on plain-http dev). */
   secureCookies?: boolean;
   /** The module runtime for `/__drobek/*` (absent → those paths are plain 404s). */
   platform?: PlatformHandler;
+  /**
+   * Whether a platform request goes to a module route that authenticates the
+   * caller itself (`passwordGate: 'skip'`, e.g. a signed webhook): the
+   * password gate lets it through (absent → every platform path is gated).
+   */
+  platformSkipsGate?(method: string, path: string): boolean;
   /** The browser error beacon at BEACON_PATH (absent → the path falls to `platform`). */
   beacon?: BeaconHandler;
   /**
-   * M3-01: the origin of a custom domain, for the primary-domain redirect
+   * The origin of a custom domain, for the primary-domain redirect
    * (default `https://<hostname>`; node.ts derives scheme + port from the apps origin).
    */
   customDomainOrigin?: (hostname: string) => string;
@@ -167,10 +238,10 @@ export interface HandlerDeps {
   reportUrl?: (host: string) => string;
   /** The terms the 451 page links (default: TERMS_URL, else `<PUBLIC_APP_URL>/terms`). */
   termsUrl?: string;
-  /** NSO-315: per-IP budget of "no app here" answers (absent → never throttled). */
+  /** Per-IP budget of "no app here" answers (absent → never throttled). */
   unknownHosts?: UnknownHostLimiter;
   /**
-   * NSO-342: the dashboard origin (PUBLIC_APP_URL), always allowed in
+   * The dashboard origin (PUBLIC_APP_URL), always allowed in
    * `frame-ancestors` so the workspace app list can show a sandboxed,
    * non-interactive thumbnail of the app (absent → only the app's own setting).
    */
@@ -183,13 +254,21 @@ export interface HandlerDeps {
    * never get them (absent → no gallery embedding).
    */
   galleryFrameAncestors?: readonly string[];
-  /** NSO-358: the frame-src list of every app host (frameSrcFromEnv; absent → the curated embeds). */
+  /** The frame-src list of every app host (frameSrcFromEnv; absent → the curated embeds). */
   frameSrc?: string;
-  /** NSO-358: the app's uploaded assets at `/<name>` (absent → only the version's files are served). */
+  /** The app's uploaded assets at `/<name>` (absent → only the version's files are served). */
   assets?: AssetSource;
+  /** The feedback widget of the preview and version hosts (absent → no widget). */
+  feedback?: FeedbackWidget | null;
+  /** The preview script of the preview and version hosts (absent → no script). */
+  preview?: PreviewScript | null;
+  /** The preview host's event stream (absent → `/__drobek/preview/events` answers 404). */
+  previewEvents?: PreviewEventsHandler;
+  /** The preview's error beacon (absent → `/__drobek/preview/errors` answers 404). */
+  browserErrors?: BrowserErrorsHandler;
 }
 
-/** Header naming the app behind an app-host response (M4-02). */
+/** Header naming the app behind an app-host response. */
 export const APP_HEADER = 'X-Drobek-App';
 
 const HTML = 'text/html; charset=utf-8';
@@ -200,7 +279,7 @@ export const UNLOCK_ATTEMPTS = 10;
 /**
  * Unlock attempts per app over ALL clients per window — the per-password cap
  * that also holds for a request without a resolved client IP, which has no
- * per-IP bucket (NSO-328).
+ * per-IP bucket.
  */
 export const UNLOCK_APP_ATTEMPTS = 100;
 export const UNLOCK_WINDOW_MS = 15 * 60 * 1000;
@@ -223,7 +302,8 @@ export async function handleAppRequest(req: AppRequest, deps: HandlerDeps): Prom
   const kind = req.target?.kind;
   const production = kind === 'prod' || kind === 'custom';
   const noindex = !production;
-  let security = appSecurityHeaders({ noindex, frameSrc: deps.frameSrc });
+  const connectSrcExtra = kind === 'preview' ? (deps.preview?.uploadOrigin ?? null) : null;
+  let security = appSecurityHeaders({ noindex, frameSrc: deps.frameSrc, connectSrcExtra });
 
   const page = (status: number, html: string, extra: Record<string, string> = {}): AppResponse => ({
     status,
@@ -234,19 +314,29 @@ export async function handleAppRequest(req: AppRequest, deps: HandlerDeps): Prom
 
   const isUnlock = method === 'POST' && req.path === UNLOCK_PATH;
   const isBeacon = deps.beacon !== undefined && req.path === BEACON_PATH;
-  const isPlatform = !isUnlock && !isBeacon && deps.platform !== undefined && req.path.startsWith(PLATFORM_PREFIX);
-  if (method !== 'GET' && method !== 'HEAD' && !isUnlock && !isPlatform && !isBeacon) {
+  const widget = !production && kind !== undefined ? (deps.feedback ?? null) : null;
+  const isWidget = widget !== null && (method === 'GET' || method === 'HEAD') && req.path === FEEDBACK_SCRIPT_PATH;
+  const preview = !production && kind !== undefined ? (deps.preview ?? null) : null;
+  const isPreviewPath = req.path === PREVIEW_SCRIPT_PATH || req.path.startsWith(PREVIEW_PATH_PREFIX);
+  const isPreviewScript = preview !== null && (method === 'GET' || method === 'HEAD') && req.path === PREVIEW_SCRIPT_PATH;
+  const isEvents = kind === 'preview' && deps.previewEvents !== undefined && method === 'GET' && req.path === PREVIEW_EVENTS_PATH;
+  const isErrors = preview !== null && deps.browserErrors !== undefined && method === 'POST' && req.path === PREVIEW_ERRORS_PATH;
+  // Every other preview path answers JSON: the stream, its gate, or 404 where it does not exist.
+  const isPreviewJson = isPreviewPath && !isPreviewScript;
+  const isPlatform =
+    !isUnlock && !isBeacon && !isWidget && !isPreviewPath && deps.platform !== undefined && req.path.startsWith(PLATFORM_PREFIX);
+  if (method !== 'GET' && method !== 'HEAD' && !isUnlock && !isPlatform && !isBeacon && !isPreviewJson) {
     return page(405, errorPage('Method not allowed', 'This address only serves files.'), {
       Allow: 'GET, HEAD',
     });
   }
 
-  // ── where to report this host (M4-02) — any app host, before anything else ──
+  // ── where to report this host — any app host, before anything else ──
   if ((method === 'GET' || method === 'HEAD') && req.path === REPORT_WELL_KNOWN_PATH) {
     return wellKnownReport(req, deps, method, security);
   }
 
-  // ── the app (NSO-315: unknown hosts are counted per client IP) ──
+  // ── the app (unknown hosts are counted per client IP) ──
   const throttled = (): AppResponse => ({
     status: 429,
     headers: {
@@ -261,7 +351,7 @@ export async function handleAppRequest(req: AppRequest, deps: HandlerDeps): Prom
     deps.unknownHosts && !(await deps.unknownHosts.allow(req.clientIp)) ? throttled() : missing('no-app');
 
   if (!req.target) return unknownApp();
-  if (deps.unknownHosts?.isThrottled(req.clientIp) && !deps.store.knowsLiveApp(req.target.slug)) {
+  if (deps.unknownHosts?.isThrottled(req.clientIp) && !deps.store.knowsLiveHost(req.target)) {
     return throttled();
   }
   const { app, version } = await deps.store.resolve(req.target);
@@ -270,6 +360,7 @@ export async function handleAppRequest(req: AppRequest, deps: HandlerDeps): Prom
     ...appSecurityHeaders({
       noindex,
       frameSrc: deps.frameSrc,
+      connectSrcExtra,
       frameAncestors: withFrameAncestors(parseFrameAncestors(app.frameAncestors), [
         deps.dashboardOrigin,
         ...(production && app.galleryVisible ? (deps.galleryFrameAncestors ?? []) : []),
@@ -277,13 +368,17 @@ export async function handleAppRequest(req: AppRequest, deps: HandlerDeps): Prom
     }),
     [APP_HEADER]: app.slug,
   };
-  if (!isBeacon) deps.signal?.(app.id, 'request');
+  // A version host without its version counts like an unknown host: `--v<N>` takes any N.
+  if (req.target.kind === 'version' && !version && deps.unknownHosts && !(await deps.unknownHosts.allow(req.clientIp))) {
+    return throttled();
+  }
+  if (!isBeacon && !isWidget && !isPreviewPath) deps.signal?.(app.id, 'request');
 
-  // ── taken down by a super-admin (M4-02): 451 on every host and path ──
+  // ── taken down by a super-admin: 451 on every host and path ──
   if (app.lockedReason) {
     const category = lockCategory(app.lockedReason);
     const terms = deps.termsUrl ?? termsUrl();
-    if (isPlatform || isBeacon) {
+    if (isPlatform || isBeacon || isPreviewJson) {
       return {
         status: 451,
         headers: { ...security, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': NO_STORE },
@@ -299,7 +394,7 @@ export async function handleAppRequest(req: AppRequest, deps: HandlerDeps): Prom
     });
   }
 
-  // ── primary custom domain: the production host redirects there (M3-01) ──
+  // ── primary custom domain: the production host redirects there ──
   if (
     req.target.kind === 'prod' &&
     app.primaryDomain &&
@@ -319,8 +414,14 @@ export async function handleAppRequest(req: AppRequest, deps: HandlerDeps): Prom
       ? verifyAppAccessToken(token, app.id, deps.accessSecret, (deps.now ?? Date.now)())
       : false;
   const locked = decideVisibility({ visibility: app.visibility, hasAppAccess }).action === 'password';
-  if (isPlatform || isBeacon) {
-    if (locked) {
+  if (isErrors) {
+    if (!locked && version && (await deps.store.previewOptions(version.id)).browserErrors) {
+      await deps.browserErrors!(req, app, version);
+    }
+    return { status: 204, headers: { ...security, 'Cache-Control': NO_STORE }, body: null };
+  }
+  if (isPlatform || isBeacon || isPreviewJson) {
+    if (locked && !(isPlatform && deps.platformSkipsGate?.(method, req.path))) {
       return {
         status: 401,
         headers: { ...security, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': NO_STORE },
@@ -328,8 +429,19 @@ export async function handleAppRequest(req: AppRequest, deps: HandlerDeps): Prom
       };
     }
     if (isBeacon) {
-      const b = await deps.beacon!(req, app);
+      const b = await deps.beacon!(req, app, version);
       return { ...b, headers: { ...b.headers, ...security } };
+    }
+    if (isEvents) {
+      const e = await deps.previewEvents!(req, app, version);
+      return { ...e, headers: { ...e.headers, ...security } };
+    }
+    if (isPreviewJson) {
+      return {
+        status: 404,
+        headers: { ...security, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': NO_STORE },
+        body: method === 'HEAD' ? null : JSON.stringify({ error: 'not_found', message: 'Nothing is served at this address on this host.' }),
+      };
     }
     const r = await deps.platform!(req, { app, target: req.target });
     if (r.status >= 500) deps.signal?.(app.id, '5xx', req.path);
@@ -341,6 +453,8 @@ export async function handleAppRequest(req: AppRequest, deps: HandlerDeps): Prom
     const next = safeNext(req.query ? `${req.path}?${req.query}` : req.path);
     return page(401, passwordPage({ next }));
   }
+  if (isWidget) return serveWidget(req, widget, security);
+  if (isPreviewScript) return servePreviewScript(req, preview, security);
 
   // ── the version this host serves ──
   if (!version) {
@@ -384,32 +498,103 @@ export async function handleAppRequest(req: AppRequest, deps: HandlerDeps): Prom
     production && entry.built && mayCarryInlineSourceMap(hit.path)
       ? await deps.store.splitSourceMap(entry.sha256, hit.path)
       : null;
-  const etag = split ? etagFor(`${entry.sha256}-nomap`) : etagFor(entry.sha256);
+  const contentType = contentTypeForPath(hit.path);
+  const isHtml = contentType.startsWith('text/html');
+  const withWidget = widget !== null && isHtml && (await deps.store.feedbackEnabled(version.id));
+  const previewParts = preview !== null && isHtml ? await previewPartsFor(req.target.kind, deps.store, version.id, preview) : null;
+  const previewTag = previewParts ? previewScriptTag(app.slug, version.number, previewParts) : null;
+  const etag = split
+    ? etagFor(`${entry.sha256}-nomap`)
+    : etagFor(
+        entry.sha256 +
+          (withWidget ? `-fb${version.number}-${widget.hash}` : '') +
+          (previewTag ? `-pv${version.number}${previewPartsKey(previewParts!)}-${preview!.hash}` : '')
+      );
   const headers: Record<string, string> = {
     ...security,
-    'Content-Type': contentTypeForPath(hit.path),
+    'Content-Type': contentType,
     ETag: etag,
     'Cache-Control': cacheControlFor({
       path: hit.path,
       query: req.query,
       isPrivate: app.visibility !== 'public',
     }),
+    ...(contentType.startsWith('text/html') ? { 'Server-Timing': `${VERSION_TIMING_METRIC};desc="${version.number}"` } : {}),
+  };
+  const countView = () => {
+    if (production && method === 'GET' && contentType.startsWith('text/html')) deps.pageView?.(app.id, pageViewOf(req, deps));
   };
   if (isNotModified(req.header('if-none-match'), etag)) {
+    countView();
     return { status: 304, headers, body: null };
   }
-  const bytes = split ? split.code : await deps.store.blob(entry.sha256);
-  if (!bytes) {
+  const stored = split ? split.code : await deps.store.blob(entry.sha256);
+  if (!stored) {
     // metadata without bytes — fail closed
     deps.signal?.(app.id, '5xx', req.path);
     return missing('no-file');
   }
+  const inject = (previewTag ?? '') + (withWidget ? feedbackScriptTag(app.slug, version.number) : '');
+  const bytes = inject ? injectBeforeBodyEnd(stored, inject) : stored;
   headers['Content-Length'] = String(bytes.length);
+  countView();
   return { status: 200, headers, body: method === 'HEAD' ? null : bytes };
 }
 
+/** `GET /__drobek/feedback.js` on a preview or version host: the widget, revalidated by its ETag. */
+function serveWidget(req: AppRequest, widget: FeedbackWidget, security: Record<string, string>): AppResponse {
+  const etag = etagFor(`feedback-${widget.hash}`);
+  const headers: Record<string, string> = {
+    ...security,
+    'Content-Type': 'text/javascript; charset=utf-8',
+    ETag: etag,
+    'Cache-Control': 'no-cache',
+  };
+  if (isNotModified(req.header('if-none-match'), etag)) return { status: 304, headers, body: null };
+  headers['Content-Length'] = String(widget.script.length);
+  return { status: 200, headers, body: req.method.toUpperCase() === 'HEAD' ? null : widget.script };
+}
+
+/** Which parts of the preview script a page of `versionId` on a `kind` host runs. */
+async function previewPartsFor(kind: AppHostTarget['kind'], store: ServeStore, versionId: string, preview: PreviewScript): Promise<PreviewScriptParts> {
+  const options = await store.previewOptions(versionId);
+  return {
+    reload: kind === 'preview' && options.reload,
+    errors: options.browserErrors,
+    screenshots: kind === 'preview' && options.screenshots && preview.uploadOrigin !== null,
+  };
+}
+
+/** `GET /__drobek/preview.js` on a preview or version host: the script, revalidated by its ETag. */
+function servePreviewScript(req: AppRequest, preview: PreviewScript, security: Record<string, string>): AppResponse {
+  const etag = etagFor(`preview-${preview.hash}`);
+  const headers: Record<string, string> = {
+    ...security,
+    'Content-Type': 'text/javascript; charset=utf-8',
+    ETag: etag,
+    'Cache-Control': 'no-cache',
+  };
+  if (isNotModified(req.header('if-none-match'), etag)) return { status: 304, headers, body: null };
+  headers['Content-Length'] = String(preview.script.length);
+  return { status: 200, headers, body: req.method.toUpperCase() === 'HEAD' ? null : preview.script };
+}
+
+/** What the page-view counter is told about a request (it keeps none of it but counts). */
+function pageViewOf(req: AppRequest, deps: HandlerDeps): PageViewInput {
+  return {
+    path: req.path,
+    host: req.header('host'),
+    userAgent: req.header('user-agent'),
+    referer: req.header('referer'),
+    clientIp: req.clientIp,
+    secFetchDest: req.header('sec-fetch-dest'),
+    purpose: req.header('sec-purpose') ?? req.header('purpose'),
+    frameOrigins: [...(deps.dashboardOrigin ? [deps.dashboardOrigin] : []), ...(deps.galleryFrameAncestors ?? [])],
+  };
+}
+
 /**
- * NSO-381: `/<bundle>.map` on the production host / a custom domain, when
+ * `/<bundle>.map` on the production host / a custom domain, when
  * the version has no file there: the inline source map of the built JS/CSS
  * bundle `<bundle>` (null → not such a request; the caller answers as before).
  */
@@ -438,7 +623,7 @@ async function serveSourceMap(
 }
 
 /**
- * Which asset set a host serves (NSO-362): the production host and custom
+ * Which asset set a host serves: the production host and custom
  * domains only the set the publish of their version froze; the preview host
  * the draft; a version host that version's set, or the draft when it was
  * never published.
@@ -448,7 +633,7 @@ function assetScopeFor(kind: AppHostTarget['kind'], versionId: string): AssetSco
   return kind === 'version' ? { versionId, orDraft: true } : { versionId };
 }
 
-/** An uploaded asset of the app (NSO-358), or null when the app has none by that name. */
+/** An uploaded asset of the app, or null when the app has none by that name. */
 async function serveAsset(
   req: AppRequest,
   assets: AssetSource,
@@ -477,13 +662,13 @@ const CSP_HEADER = 'Content-Security-Policy';
  * `Content-Security-Policy` is kept as a SECOND policy next to the app CSP
  * (`<app csp>, <module csp>`: a browser enforces every policy of the list, so
  * a module can only tighten it — e.g. the files module's `sandbox` on served
- * files, NSO-325).
+ * files).
  */
-function withAppSecurity(headers: Record<string, string>, security: Record<string, string>): Record<string, string> {
+function withAppSecurity(headers: Record<string, string | string[]>, security: Record<string, string>): Record<string, string | string[]> {
   let moduleCsp: string | null = null;
-  const out: Record<string, string> = {};
+  const out: Record<string, string | string[]> = {};
   for (const [k, v] of Object.entries(headers)) {
-    if (k.toLowerCase() === CSP_HEADER.toLowerCase()) moduleCsp = v.trim() || null;
+    if (k.toLowerCase() === CSP_HEADER.toLowerCase()) moduleCsp = (Array.isArray(v) ? v.join(', ') : v).trim() || null;
     else out[k] = v;
   }
   Object.assign(out, security);
@@ -528,7 +713,9 @@ async function wellKnownReport(
   security: Record<string, string>
 ): Promise<AppResponse> {
   const host = (req.header('host') ?? '').trim().toLowerCase().replace(/\.+(?=:|$)/, '');
-  const app = req.target ? (await deps.store.resolve(req.target)).app : null;
+  // Only the app is needed: a version host looks up its production host, whatever N it names.
+  const target = req.target?.kind === 'version' ? { kind: 'prod' as const, slug: req.target.slug } : req.target;
+  const app = target ? (await deps.store.resolve(target)).app : null;
   const body = JSON.stringify({
     report_url: (deps.reportUrl ?? ((h: string) => reportFormUrl(h)))(host),
     app: app?.slug ?? null,

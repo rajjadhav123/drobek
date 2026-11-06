@@ -1,5 +1,5 @@
 /**
- * The module runtime of ONE server process (M1-01): the active modules, their
+ * The module runtime of ONE server process: the active modules, their
  * route tables, the composed SDK and the skill registry — plus the operations
  * the rest of drobek calls:
  *
@@ -7,7 +7,7 @@
  *    and its visibility gate were resolved by @drobek/serving): the SDK, the
  *    beacon script, and the module routes — each response of a matched route
  *    of an active module (not a 429) is counted for get_logs `requests`
- *    (M1-07; Redis counters flushed lazily, @drobek/insights);
+ *    (Redis counters flushed lazily, @drobek/insights);
  *  - `skillList()` / `skillInfo()` — the `skill_info` tool, create_app, get_app;
  *  - `configure()` / `confirm()` / `reject()` — configure_module and the
  *    dashboard's pending-change API;
@@ -18,20 +18,28 @@
  *  - `contributions()` — the slot contributions of the active modules
  *    (`ModuleServices.contributions`; routes, `endUsers.current`, the
  *    end-user callback's `app()` and create / publish hooks get those of the
- *    workspace's enabled modules only — NSO-360); `errorCatalogue()` — the
+ *    workspace's enabled modules only); `errorCatalogue()` — the
  *    modules' own error codes (skill_info, /llms-full.txt);
  *  - `isEnabled()` / `enabledModules()` / `workspaceModules()` /
- *    `setWorkspaceModule()` — NSO-346: an `availability: 'opt-in'` module
+ *    `setWorkspaceModule()` — an `availability: 'opt-in'` module
  *    is active for a workspace when the limits provider's plan says
  *    `MODULE_ENABLED_<NAME>: 1` (0 = off, whatever else says), else when the
  *    env sets `MODULE_ENABLED_<NAME>=1` (every workspace), else when a
- *    super-admin enabled it in the dashboard (`workspace_modules`). An
+ *    super-admin enabled it in the dashboard (`workspace_modules`) — and
+ *    only while every module it `requires` is active there too
+ *    (transitively; the switch refuses to enable it before them). An
  *    inactive one answers `404 module_not_enabled` on its routes and in
  *    configure_module / confirm, is left out of an app's skills, runs no
  *    onAppCreate / onPublish hook and contributes to no other module's slot
  *    there. The SDK stays one per server.
  *  - `endUserCallback()` — the end-user sign-in providers' IdP callback on
- *    the dashboard host (the `endUsers` authority's `callback`, NSO-348).
+ *    the dashboard host (the `endUsers` authority's `callback`);
+ *  - `jobApps()` / `serverJobContext()` / `appJobContext()` — what the
+ *    module-jobs scheduler (./jobs.ts) runs a module's `jobs` with
+ *    (a per-app job also calls the app's upstreams and imports records
+ *    through their authorities);
+ *  - `sync()` — the scheduled-import module's owner view: the
+ *    dashboard's sources and Run now, MCP `sync_now` and get_logs `sync`.
  *
  * `moduleRuntime()` is the process-wide instance, loaded once from
  * `DROBEK_MODULES` (memoised on globalThis, so the dev server's Vite-loaded
@@ -41,15 +49,16 @@ import { appsOrigin, dashboardOrigin } from '@drobek/apps';
 import { AUDIT_ACTIONS, AUDIT_SUBJECT_TYPES, actorKindForSurface, writeAudit } from '@drobek/audit';
 import { renderPlatformEmail, renderTextEmailHtml, sendEmail, serverHost, trustedActionUrl, type EmailAction } from '@drobek/email';
 import { scanForSecrets } from '@drobek/compile';
-import { createConsoleLogger, getRedis, type Logger } from '@drobek/core';
-import { apps, dbErrorForLog, getDb, memberships, runJournalMigrations, users, workspaceModules, type DB } from '@drobek/db';
+import { createConsoleLogger, getRedis, hitFixedWindow, reportError, type FixedWindowRedis, type Logger } from '@drobek/core';
+import { apps, dbErrorForLog, getDb, isQueryTimeout, memberships, moduleConfigs, runJournalMigrations, users, workspaceModules, type DB } from '@drobek/db';
 import { recordModuleRequest } from '@drobek/insights';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNull } from 'drizzle-orm';
 import type { Readable } from 'node:stream';
 import { z } from 'zod';
 import { MODULE_CONTRACT_VERSION, normalizeConfirmItems } from './contract.js';
 import type {
   AnyModule,
+  AppJobContext,
   ConfirmRole,
   EmailMessage,
   EndUser,
@@ -71,32 +80,56 @@ import type {
   ModuleContext,
   ModuleDashboardEditor,
   ModuleErrorDoc,
+  ModuleAppView,
+  ModuleSecretDoc,
   ModuleServices,
   Principal,
   RateLimitResult,
   RecordsCollection,
   RecordsPage,
   RecordsQuery,
+  RecordsUpdateOptions,
   RecordsView,
+  ServerJobContext,
+  SyncRun,
+  SyncSourceState,
+  WebhookDelivery,
+  WebhookEndpointState,
 } from './contract.js';
-import { readConfigRow, readConfigRows, withLockedConfig, type PendingChange } from './configs.server.js';
+import { asObject, asPending, readConfigRow, readConfigRows, withLockedConfig, type PendingChange } from './configs.server.js';
+import { installModuleEmailTransport } from './email-transport-slot.js';
+import { CORE_SLOTS, installModuleErrorReporter } from './error-reporter-slot.js';
 import { assertSignInSender, capEmailText, emailKind, redactAddresses, resolveRecipients, sanitizeSubject } from './email.js';
-import { CORE_ERROR_CODES, ModuleError, isModuleError, issuePaths, moduleNotEnabled, skillHint } from './errors.js';
+import {
+  CORE_ERROR_CODES,
+  ModuleError,
+  ModuleLoadError,
+  databaseTimeout,
+  isModuleError,
+  issuePaths,
+  moduleNotEnabled,
+  moduleRequiresNotEnabled,
+  skillHint,
+} from './errors.js';
 import { CORE_LIMITS, createLimitsProvider, moduleEnabledLimit, moduleEnabledLimitName, type CatalogueLimit, type LimitsProvider } from './limits.js';
 import { mailGuardConfigFromEnv, redisMailGuard, type MailGuard, type MailGuardRedis } from './mail-guard.js';
 import { Lru, jsonKey } from './memo.js';
-import { jsonEqual, mergePatch } from './merge-patch.js';
+import { diffMergePatch, jsonEqual, mergePatch } from './merge-patch.js';
 import { cookiePrincipalResolver, endUserCookiesSecure, type PrincipalResolver } from './principal.js';
 import {
-  ModuleLoadError,
   checkModuleSet,
   collectContributions,
   endUserAuthorityOf,
   filesAuthorityOf,
+  isAppFacing,
   loadModuleSet,
   mailAuthorityOf,
   recordsAuthorityOf,
   submissionsAuthorityOf,
+  syncAuthorityOf,
+  upstreamsAuthorityOf,
+  webhooksAuthorityOf,
+  type AppFacingModule,
   type ModuleOrigin,
   type ModuleSource,
   type ResolveOptions,
@@ -104,9 +137,10 @@ import {
 } from './registry.js';
 import { collectRoutes, errorResult, isReadable, matchRoute, runRoute, type PipelineRequest, type PipelineResult, type Route } from './router.js';
 import { decideAccess } from './rules.js';
+import { moduleJobsSettingsFromEnv } from './jobs.js';
 import { BEACON_SCRIPT_PATH, SDK_PATH, SDK_TYPES_PATH, buildSdk, moduleTypes, toPath, type SdkBundle } from './sdk-build.js';
 import { PENDING_MAIL_WINDOW_MS, pendingMail, pendingMailKey } from './pending-mail.js';
-import { getModuleSecret, secretsSet, secretsStatus } from './secrets.server.js';
+import { SECRET_NAME_RE, getModuleSecret, secretsSet, secretsStatus, storedSecretNames } from './secrets.server.js';
 import { generalSkillsDir, loadGeneralSkills, mergeSkills, moduleSkills, skillForImport, type SkillEntry } from './skills.js';
 
 // ── deps ─────────────────────────────────────────────────────────────────────
@@ -144,26 +178,19 @@ export interface RuntimeDeps {
   /** The operator-wide hourly cap on module e-mail (auto-pause). */
   mailGuard: MailGuard;
   /**
-   * Count one response of a MATCHED route of an active module (M1-07 — get_logs
+   * Count one response of a MATCHED route of an active module (get_logs
    * `requests`; never a 429, an unknown route or a wrong method). Best-effort:
    * never awaited by the response, errors dropped.
    */
   requestStats?: (appId: string, module: string, status: number) => Promise<void> | void;
 }
 
-type RedisLike = ReturnType<typeof getRedis>;
-
-/** Fixed-window counter in Redis (atomic INCR + PEXPIRE), `drobek:rl:` keys. */
-export function redisRateLimiter(redis: () => Pick<RedisLike, 'incr' | 'pexpire' | 'ttl'>): RateLimiter {
+/** Fixed-window counter in Redis (`hitFixedWindow` of @drobek/core, the one of `rateLimitRedis`), `drobek:rl:` keys. */
+export function redisRateLimiter(redis: () => FixedWindowRedis): RateLimiter {
   return async (key, max, windowMs) => {
-    const r = redis();
-    const k = `drobek:rl:${key}`;
-    const n = await r.incr(k);
-    if (n === 1) await r.pexpire(k, windowMs);
-    if (n <= max) return { ok: true, count: n, retryAfterSec: 0 };
-    const ttl = await r.ttl(k);
-    if (ttl < 0) await r.pexpire(k, windowMs); // a key that lost its expiry must not lock forever
-    return { ok: false, count: n, retryAfterSec: Math.max(1, ttl > 0 ? ttl : Math.ceil(windowMs / 1000)) };
+    const { count, ttlMs } = await hitFixedWindow(redis(), `drobek:rl:${key}`, windowMs);
+    if (count <= max) return { ok: true, count, retryAfterSec: 0 };
+    return { ok: false, count, retryAfterSec: Math.max(1, Math.ceil(ttlMs / 1000)) };
   };
 }
 
@@ -186,7 +213,7 @@ export function memoryRateLimiter(now: () => number = Date.now): RateLimiter & {
   return fn;
 }
 
-/** Plain-text mail through the operator's transport (@drobek/email: SMTP or Resend per EMAIL_TRANSPORT — the transport of the login codes too). */
+/** Plain-text mail through the operator's transport (@drobek/email: SMTP, Resend or a module transport per EMAIL_TRANSPORT — the transport of the login codes too). */
 export function smtpEmailTransport(log: Logger, env: NodeJS.ProcessEnv = process.env): EmailTransport {
   return {
     async send({ to, subject, text, fromName, replyTo, platform }) {
@@ -232,21 +259,21 @@ export interface PlatformApp {
 export interface SkillListItem {
   name: string;
   use_when: string;
-  /** NSO-346: only on an opt-in module's skill — it is active only for the workspaces it is enabled for. */
+  /** Only on an opt-in module's skill — it is active only for the workspaces it is enabled for. */
   availability?: 'opt-in';
-  /** NSO-346: skill_info() with an app, on an opt-in module's skill: active for the app's workspace. */
+  /** skill_info() with an app, on an opt-in module's skill: active for the app's workspace. */
   enabled_for_workspace?: boolean;
 }
 
-/** NSO-346: what decides that an opt-in module is on or off for a workspace. */
+/** What decides that an opt-in module is on or off for a workspace. */
 export type WorkspaceModuleSource = 'dashboard' | 'plan' | 'env';
 
-/** NSO-346: one opt-in module for one workspace (the dashboard's Workspace → Modules). */
+/** One opt-in module for one workspace (the dashboard's Workspace → Modules). */
 export interface WorkspaceModuleState {
   name: string;
   version: string;
   use_when: string;
-  /** Active for the workspace now. */
+  /** Active for the workspace now: its own state is on and so is every module it requires, transitively. */
   enabled: boolean;
   /**
    * What decides it: the limits provider's plan (`MODULE_ENABLED_<NAME>`, 1 or
@@ -254,6 +281,10 @@ export interface WorkspaceModuleState {
    * switch; null = nothing enables it.
    */
   source: WorkspaceModuleSource | null;
+  /** The opt-in modules it requires (directly or through another one) that are off for the workspace, in the order to enable them; while any is listed, it is off. */
+  missing_requires: string[];
+  /** The modules on for the workspace that require this one (directly or through another one): disabling it turns them off too. */
+  required_by: string[];
   /** The super-admin's switch (a `workspace_modules` row) — a plan value overrides it. */
   dashboard: { enabled: boolean; enabled_by: string | null; enabled_at: string | null };
 }
@@ -281,12 +312,24 @@ export interface SkillInfo {
   /** The extension points the module offers (with who contributes) and its own contributions to other modules' slots. */
   slots?: ModuleFacts['slots'];
   contributes?: ModuleFacts['contributes'];
-  /** NSO-346: skill_info with an app: whether this opt-in module is active for the app's workspace. */
+  /** skill_info with an app: whether this opt-in module is active for the app's workspace. */
   enabled_for_workspace?: boolean;
+  /** The module's scheduled jobs (only when it declares any). */
+  jobs?: SkillJob[];
+}
+
+/** One scheduled job of a module as skill_info shows it. */
+export interface SkillJob {
+  name: string;
+  /** `server` (once per interval for the whole server) or `app` (per app that configured the module). */
+  scope: 'server' | 'app';
+  /** The fixed interval as declared (`'15m'`, or milliseconds), or `config` — each app's config sets it. */
+  every: string | number;
+  description: string | null;
 }
 
 /**
- * The operator-facing facts of one active module, app-independent (NSO-347):
+ * The operator-facing facts of one active module, app-independent:
  * the dashboard's workspace Modules page and the module page's "About", and
  * the same fields in `skill_info(name)`. Never a path on disk, never a
  * secret, never an app's config.
@@ -299,7 +342,7 @@ export interface ModuleFacts {
   contract: string | null;
   availability: ModuleAvailability;
   requires: string[];
-  /** Its slots: name, what a contribution does, the unique key, and the active modules contributing (with their unique value). */
+  /** Its slots: name, what a contribution does, the unique key, and the active modules contributing (with their unique value; operator-only ones for operators only). */
   slots: { name: string; description: string; unique: string | null; contributions: { module: string; key: string | null }[] }[];
   /** Its contributions to other modules' slots: the slot, the host module and the contribution's unique value (null without one). */
   contributes: { slot: string; host: string; key: string | null }[];
@@ -309,6 +352,12 @@ export interface ModuleFacts {
   errors: ModuleErrorDoc[];
   /** The dedicated dashboard editor its config declares it fits (`dashboard.editor`), null for the generic form. */
   editor: ModuleDashboardEditor | null;
+  /** Its name for people (`dashboard.title`), null without one. */
+  title: string | null;
+  /** Its one line for the app's owner (`dashboard.description`), null without one. */
+  description: string | null;
+  /** It has no skill: it serves the server only (operator slots, server jobs, hooks) — agents and app owners never see it. */
+  operatorOnly: boolean;
 }
 
 /** A slot contribution's unique value as text (null when the slot has no unique key or the value is missing). */
@@ -326,7 +375,7 @@ export interface ModuleErrorSection {
 }
 
 export interface AppModuleState {
-  /** NSO-346: active for the app's workspace (always true for a default module). */
+  /** Active for the app's workspace (always true for a default module). */
   enabled: boolean;
   configured: boolean;
   config: unknown;
@@ -364,6 +413,11 @@ export interface ConfigureResult {
   /** Only a workspace admin can confirm the pending change (absent: any editor). */
   confirm_role?: 'admin';
   confirm_url?: string;
+  /**
+   * The changes that already waited before this call: the new proposal joined
+   * them, and `pending_confirmation` lists what the combined change needs.
+   */
+  merged_with_pending?: string[];
   secrets_missing?: string[];
   unchanged?: true;
   /** The module's `appInfo` for the config now in force (secret-free), when it declares one. */
@@ -379,31 +433,37 @@ export interface BoundRecords {
   get(collection: string, id: string): Promise<Record<string, unknown> | null>;
   remove(collection: string, id: string): Promise<boolean>;
   csv(query: Omit<RecordsQuery, 'limit' | 'cursor'>): AsyncIterable<string>;
-  /** Replace a record's fields (owner edit); null when it does not exist. `unavailable` when the module cannot. */
-  update(collection: string, id: string, fields: Record<string, unknown>): Promise<Record<string, unknown> | null>;
+  /** Replace (or with `merge`, merge onto) a record's fields (owner edit); null when it does not exist. `unavailable` when the module cannot. */
+  update(collection: string, id: string, fields: Record<string, unknown>, opts?: RecordsUpdateOptions): Promise<Record<string, unknown> | null>;
+  /** All-or-nothing insert of new records (see RecordsAuthority.create). `unavailable` when the module cannot. */
+  create(collection: string, records: Record<string, unknown>[]): Promise<Record<string, unknown>[]>;
   /** All-or-nothing CSV import (see RecordsAuthority.importCsv). */
   importCsv(collection: string, csv: string): Promise<{ imported: number }>;
   /**
    * Delete a collection: its records and its declaration in the module's
    * config, in ONE transaction under the config lock; audited
-   * `data.collection_delete` (actor user).
+   * `data.collection_delete` (actor: the user, or their agent for `mcp`).
    */
-  dropCollection(collection: string, actorUserId: string): Promise<{ records: number }>;
+  dropCollection(collection: string, actorUserId: string, surface?: 'mcp' | 'web'): Promise<{ records: number }>;
   /** Collections with records but no declaration (orphans); [] when the module cannot tell. */
   orphans(): Promise<{ name: string; records: number }[]>;
   /**
    * Purge the records of an orphan collection, under the config lock (so it
-   * cannot be declared meanwhile); audited `data.collection.purge` (actor user).
+   * cannot be declared meanwhile); audited `data.collection.purge` (actor:
+   * the user, or their agent for `mcp`).
    */
-  purgeOrphan(collection: string, actorUserId: string): Promise<{ records: number }>;
+  purgeOrphan(collection: string, actorUserId: string, surface?: 'mcp' | 'web'): Promise<{ records: number }>;
 }
 
 /** The end users of one app (the module that declares `endUsers`, bound to the app's config). */
 export interface BoundEndUsers {
   module: string;
   list(query: EndUserListQuery): Promise<EndUserPage>;
-  /** Change a role; a config change is applied under the config lock and audited `end_users.role` (actor user). */
-  setRole(id: string, role: 'user' | 'admin', actorUserId: string): Promise<EndUserRecord>;
+  /**
+   * Change a role; a config change is applied under the config lock and
+   * audited `end_users.role` (actor: the user, or their agent for `mcp`).
+   */
+  setRole(id: string, role: 'user' | 'admin', actorUserId: string, surface?: 'mcp' | 'web'): Promise<EndUserRecord>;
   setDisabled(id: string, disabled: boolean): Promise<EndUserRecord | null>;
 }
 
@@ -416,6 +476,30 @@ export interface BoundSubmissions {
   remove(id: string): Promise<boolean>;
 }
 
+/** Who started a run by hand: the dashboard user, or the agent acting for them. */
+export interface RunActor {
+  userId: string;
+  surface: 'mcp' | 'web';
+}
+
+/** The scheduled imports of one app (the module that declares `sync`, bound to the app's config). */
+export interface BoundSync {
+  module: string;
+  sources(): Promise<SyncSourceState[]>;
+  runs(query?: { source?: string; since?: Date; limit?: number }): Promise<SyncRun[]>;
+  /** Run a source now; the run's audit names `actor`. Refused (404 module_not_enabled) when the module is off for the workspace. */
+  runNow(source: string, actor: RunActor): Promise<SyncRun>;
+  /** Clear a pause after failures; audited `<module>.resume` (actor: the person). */
+  resume(source: string, actor: RunActor): Promise<boolean>;
+}
+
+/** The webhook endpoints and deliveries of one app (the module that declares `webhooks`, bound to the app's config). */
+export interface BoundWebhooks {
+  module: string;
+  endpoints(): Promise<WebhookEndpointState[]>;
+  deliveries(query?: { endpoint?: string; since?: Date; limit?: number }): Promise<WebhookDelivery[]>;
+}
+
 /** The end-user uploads of one app (the module that declares `files`). */
 export interface BoundFiles {
   module: string;
@@ -424,13 +508,13 @@ export interface BoundFiles {
   remove(id: string): Promise<boolean>;
 }
 
-/** A pending change as the dashboard shows it (M2-02). */
+/** A pending change as the dashboard shows it. */
 export interface PendingView {
   /** What needs confirming, verbatim from the module's confirmRequired. */
   changes: string[];
   proposed_at: string;
   proposed_by: string | null;
-  /** Who may confirm it: any editor, or only a workspace admin (NSO-322 H3). */
+  /** Who may confirm it: any editor, or only a workspace admin. */
   confirm_role: ConfirmRole;
   /** The effective config once confirmed (null when it no longer validates). */
   after: unknown;
@@ -463,14 +547,17 @@ export interface ModuleDashboardView {
   availability: ModuleAvailability;
   /** The dedicated config editor the module declares (`dashboard.editor`), or null for the generic form. */
   editor: ModuleDashboardEditor | null;
-  /** NSO-347 — the module's facts for the page's "About this module": where it came from, its contract range, requires, slots, contributions and error codes. */
+  /** Its name for people (`dashboard.title`) and its one line for the owner (`dashboard.description`), null without. */
+  title: string | null;
+  description: string | null;
+  /** The module's facts for the page's "About this module": where it came from, its contract range, requires, slots, contributions and error codes. */
   source: ModuleSource;
   contract: string | null;
   requires: string[];
   slots: ModuleFacts['slots'];
   contributes: ModuleFacts['contributes'];
   errors: ModuleErrorDoc[];
-  /** NSO-346: active for the app's workspace (an opt-in module may not be — the page then shows no form). */
+  /** Active for the app's workspace (an opt-in module may not be — the page then shows no form). */
   enabled: boolean;
 }
 
@@ -489,9 +576,14 @@ const IMMUTABLE_CACHE = 'public, max-age=31536000, immutable';
 const REVALIDATE_CACHE = 'public, max-age=0, must-revalidate';
 const V1_RE = /^\/__drobek\/v1\/([^/]+)(\/.*)?$/;
 
-/** The dashboard page where the owner confirms a module change (M2-02 serves it). */
+/** The dashboard page where the owner confirms a module change. */
 export function confirmUrl(env: NodeJS.ProcessEnv, workspaceSlug: string, appSlug: string, module: string): string {
   return `${dashboardOrigin(env)}/workspaces/${encodeURIComponent(workspaceSlug)}/apps/${encodeURIComponent(appSlug)}/modules/${encodeURIComponent(module)}`;
+}
+
+/** The role that may confirm a change made of parts that each need `roles` (missing = editor). */
+function stricterRole(...roles: (ConfirmRole | undefined)[]): ConfirmRole {
+  return roles.includes('admin') ? 'admin' : 'editor';
 }
 
 /** An optional owner-facing authority method the active module does not implement. */
@@ -503,6 +595,41 @@ function unsupported(module: string, what: string): ModuleError {
 
 /** Distinct (module, stored config) pairs kept parsed in memory. */
 const EFFECTIVE_CONFIG_MEMO_ENTRIES = 2000;
+/** Apps read per query when a module's jobs enumerate the apps they run for. */
+const JOB_APPS_BATCH = 500;
+
+/** One app a module's job runs for (see ModuleRuntime.jobApps). */
+export interface JobAppRow {
+  app: HookApp;
+  config: unknown;
+  pendingConfig: unknown;
+}
+
+/** What a job run gets besides its app: the abort signal and when the job last succeeded. */
+export interface JobRunInput {
+  job: string;
+  signal: AbortSignal;
+  lastSuccessAt: Date | null;
+  /** A run a person started (the sync authority's runNow); absent for a scheduled run. */
+  actor?: RunActor;
+}
+
+/** The longest a run started by hand may take: MODULE_JOBS_TIMEOUT_MS, at most a minute (the caller waits for it). */
+const RUN_NOW_MAX_MS = 60_000;
+
+function moduleRunTimeoutMs(env: NodeJS.ProcessEnv): number {
+  return Math.min(moduleJobsSettingsFromEnv(env).settings.timeoutMs, RUN_NOW_MAX_MS);
+}
+
+/** `log` with `meta` added to every line. */
+function taggedLogger(log: Logger, meta: Record<string, unknown>): Logger {
+  return {
+    debug: (message, m) => log.debug(message, { ...meta, ...m }),
+    info: (message, m) => log.info(message, { ...meta, ...m }),
+    warn: (message, m) => log.warn(message, { ...meta, ...m }),
+    error: (message, m) => log.error(message, { ...meta, ...m }),
+  };
+}
 
 /** One active module as /healthz, /api/version and the start log show it — never a path on disk. */
 export interface ModuleSummary {
@@ -511,10 +638,15 @@ export interface ModuleSummary {
   source: ModuleSource;
   /** The contract range the module declares (null: none). */
   contract: string | null;
+  /** Only on a module without a skill: it serves the server only, agents and app owners never see it. */
+  operatorOnly?: true;
 }
 
 export class ModuleRuntime {
+  /** Every active module, operator-only ones included, in DROBEK_MODULES order. */
   readonly modules: AnyModule[];
+  /** The active modules with a skill — what agents and app owners see (the app's Modules tab, get_app, configure_module). */
+  readonly appFacing: AppFacingModule[];
   readonly skills: SkillEntry[];
   readonly sdk: SdkBundle;
   readonly deps: RuntimeDeps;
@@ -525,9 +657,8 @@ export class ModuleRuntime {
   /** Module → the error codes its routes may answer (the core catalogue + its own `errors`). */
   private readonly errorCodes = new Map<string, ReadonlySet<string>>();
   /**
-   * Effective configs by (module, content of the stored config) — NSO-322 H1:
-   * every module request used to re-run configSchema.safeParse (for data: an
-   * ajv compile per collection). Keyed on the stored JSON itself, so a
+   * Effective configs by (module, content of the stored config), so a request
+   * does not re-run configSchema.safeParse. Keyed on the stored JSON itself: a
    * configure / confirm (or a write by another process) is a new key and can
    * never serve a stale config.
    */
@@ -543,6 +674,7 @@ export class ModuleRuntime {
     origins?: Record<string, ModuleOrigin>;
   }) {
     this.modules = input.modules;
+    this.appFacing = input.modules.filter(isAppFacing);
     this.origins = input.origins ?? {};
     this.skills = input.skills;
     this.sdk = input.sdk;
@@ -573,13 +705,14 @@ export class ModuleRuntime {
     return this.origins[name]?.source ?? 'builtin';
   }
 
-  /** The active modules (name, version, source, contract) in DROBEK_MODULES order — for /healthz and /api/version. */
+  /** The active modules (name, version, source, contract, operatorOnly) in DROBEK_MODULES order — for /healthz and /api/version. */
   summary(): ModuleSummary[] {
     return this.modules.map((m) => ({
       name: m.name,
       version: m.version,
       source: this.sourceOf(m.name),
       contract: m.contract ?? null,
+      ...(isAppFacing(m) ? {} : { operatorOnly: true as const }),
     }));
   }
 
@@ -589,7 +722,7 @@ export class ModuleRuntime {
    * The contributions of the active modules to `slot`, in DROBEK_MODULES
    * order, as the slot's schema parsed them ([] when nobody contributes or no
    * active module declares the slot). With `enabled` (a workspace's
-   * enabledModules()) only those of the modules in it (NSO-360).
+   * enabledModules()) only those of the modules in it.
    */
   contributions<T = unknown>(slot: string, enabled?: ReadonlySet<string>): T[] {
     const all = this.slotContributions.get(slot) ?? [];
@@ -613,16 +746,26 @@ export class ModuleRuntime {
       .map((m) => ({ module: m.name, errors: m.errors!.map((e) => ({ code: e.code, meaning: e.meaning, fix: e.fix })) }));
   }
 
-  /** The facts of one active module (see ModuleFacts), or null when no such module is active. */
-  moduleFacts(name: string): ModuleFacts | null {
+  /**
+   * The facts of one active module (see ModuleFacts), or null when no such
+   * module is active. Its slots list the operator-only contributors only
+   * with `operatorOnly: true` (the super-admin's workspace Modules page):
+   * skill_info, the module page and every other member never see them.
+   */
+  moduleFacts(name: string, opts: { operatorOnly?: boolean } = {}): ModuleFacts | null {
     const m = this.byName.get(name);
     if (!m) return null;
+    const shown = (module: string): boolean => {
+      const c = this.byName.get(module);
+      return c !== undefined && (opts.operatorOnly === true || isAppFacing(c));
+    };
     const hostOf = (slot: string) => this.modules.find((h) => h.slots && Object.prototype.hasOwnProperty.call(h.slots, slot));
     const contributes: ModuleFacts['contributes'] = [];
     for (const [slot, list] of this.slotContributions) {
       const host = hostOf(slot);
       for (const c of list) {
-        if (c.module === m.name) contributes.push({ slot, host: host?.name ?? '', key: uniqueKeyOf(c.value, host?.slots?.[slot]?.unique) });
+        const core = CORE_SLOTS[slot];
+        if (c.module === m.name) contributes.push({ slot, host: host?.name ?? (core ? 'core' : ''), key: uniqueKeyOf(c.value, host?.slots?.[slot]?.unique ?? core?.unique) });
       }
     }
     return {
@@ -636,21 +779,26 @@ export class ModuleRuntime {
         name: slot,
         description: def.description,
         unique: def.unique ?? null,
-        contributions: (this.slotContributions.get(slot) ?? []).map((c) => ({ module: c.module, key: uniqueKeyOf(c.value, def.unique) })),
+        contributions: (this.slotContributions.get(slot) ?? [])
+          .filter((c) => shown(c.module))
+          .map((c) => ({ module: c.module, key: uniqueKeyOf(c.value, def.unique) })),
       })),
       contributes,
       limits: (m.limits ?? []).map((l) => ({ name: l.env, default: this.deps.limits.defaults()[l.env] ?? l.default, meaning: l.meaning })),
       errors: (m.errors ?? []).map((e) => ({ code: e.code, meaning: e.meaning, fix: e.fix })),
       editor: m.dashboard?.editor ?? null,
+      title: m.dashboard?.title ?? null,
+      description: m.dashboard?.description ?? null,
+      operatorOnly: !isAppFacing(m),
     };
   }
 
-  /** The facts of every active module, in DROBEK_MODULES order. */
-  moduleFactsList(): ModuleFacts[] {
-    return this.modules.map((m) => this.moduleFacts(m.name)!);
+  /** The facts of every active module (operator-only ones included), in DROBEK_MODULES order; `opts` as moduleFacts. */
+  moduleFactsList(opts: { operatorOnly?: boolean } = {}): ModuleFacts[] {
+    return this.modules.map((m) => this.moduleFacts(m.name, opts)!);
   }
 
-  // ── per-workspace availability (NSO-346) ──
+  // ── per-workspace availability ──
 
   /** The active modules declared `availability: 'opt-in'`. */
   private optInModules(): AnyModule[] {
@@ -687,31 +835,80 @@ export class ModuleRuntime {
     return out;
   }
 
-  /** NSO-346: is module `name` active for `workspaceId`? A default module always is; an unknown one never. */
+  /** Every module `name` requires, directly or through another one, each once, a dependency before its dependents. */
+  private requiresOf(name: string): string[] {
+    const out: string[] = [];
+    const walk = (n: string) => {
+      for (const r of this.byName.get(n)?.requires ?? []) {
+        if (out.includes(r)) continue;
+        walk(r);
+        out.push(r);
+      }
+    };
+    walk(name);
+    return out;
+  }
+
+  /** The opt-in modules that depend on `name`, directly or through another one. */
+  private dependentsOf(name: string): string[] {
+    return this.optInModules()
+      .map((m) => m.name)
+      .filter((n) => this.requiresOf(n).includes(name));
+  }
+
+  /**
+   * The opt-in modules on for the workspace once `requires` applies: one whose
+   * own state (plan, env or switch) is on stays on only while every module it
+   * requires, transitively, is on too. A default module requires only
+   * default ones (checkRequires), which are always on.
+   */
+  private effectiveOptIn(states: ReadonlyMap<string, OptInState>): Set<string> {
+    const on = new Set([...states].filter(([, s]) => s.enabled).map(([n]) => n));
+    const isOn = (r: string) => on.has(r) || this.byName.get(r)?.availability !== 'opt-in';
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const n of on) {
+        if ((this.byName.get(n)?.requires ?? []).some((r) => !isOn(r))) {
+          on.delete(n);
+          changed = true;
+        }
+      }
+    }
+    return on;
+  }
+
+  /** The opt-in modules `name` depends on whose own state is off for the workspace, in the order to enable them. */
+  private missingRequires(name: string, states: ReadonlyMap<string, OptInState>): string[] {
+    return this.requiresOf(name).filter((r) => this.byName.get(r)?.availability === 'opt-in' && states.get(r)?.enabled !== true);
+  }
+
+  /** Is module `name` active for `workspaceId`? A default module always is; an unknown one never; an opt-in one per enabledModules(). */
   async isEnabled(workspaceId: string, name: string): Promise<boolean> {
     const m = this.byName.get(name);
     if (!m) return false;
     if (m.availability !== 'opt-in') return true;
-    return (await this.optInStates(workspaceId, [m])).get(m.name)?.enabled === true;
+    return (await this.enabledModules(workspaceId)).has(m.name);
   }
 
   /**
-   * NSO-346: the names of the active modules that are on for `workspaceId`
-   * (every default module + the enabled opt-in ones). No I/O when the server
-   * has no opt-in module. Compute it once per request and pass it on.
+   * The names of the active modules that are on for `workspaceId`
+   * (every default module + the enabled opt-in ones whose required modules
+   * are on too, transitively). No I/O when the server has no opt-in module.
+   * Compute it once per request and pass it on.
    */
   async enabledModules(workspaceId: string): Promise<ReadonlySet<string>> {
     const optIn = this.optInModules();
     const out = new Set(this.defaultModules());
     if (optIn.length === 0) return out;
-    for (const [name, st] of await this.optInStates(workspaceId, optIn)) if (st.enabled) out.add(name);
+    for (const name of this.effectiveOptIn(await this.optInStates(workspaceId, optIn))) out.add(name);
     return out;
   }
 
-  /** NSO-346: every opt-in module with its state for `workspaceId` (the dashboard's Workspace → Modules). */
+  /** Every opt-in module with its state for `workspaceId` (the dashboard's Workspace → Modules). */
   async workspaceModules(workspaceId: string): Promise<WorkspaceModuleState[]> {
     const optIn = this.optInModules();
     const states = await this.optInStates(workspaceId, optIn);
+    const on = this.effectiveOptIn(states);
     const userIds = [...new Set([...states.values()].map((s) => s.row?.enabledBy).filter((v): v is string => !!v))];
     const emails = new Map<string, string>();
     if (userIds.length > 0) {
@@ -723,9 +920,11 @@ export class ModuleRuntime {
       return {
         name: m.name,
         version: m.version,
-        use_when: m.skill.useWhen,
-        enabled: st.enabled,
+        use_when: m.skill?.useWhen ?? '',
+        enabled: on.has(m.name),
         source: st.source,
+        missing_requires: this.missingRequires(m.name, states),
+        required_by: this.dependentsOf(m.name).filter((n) => on.has(n)),
         dashboard: {
           enabled: st.row !== null,
           enabled_by: st.row?.enabledBy ? (emails.get(st.row.enabledBy) ?? null) : null,
@@ -736,19 +935,37 @@ export class ModuleRuntime {
   }
 
   /**
-   * NSO-346: a super-admin turns an opt-in module on or off for a workspace
-   * (the dashboard's switch — the caller has checked super-admin). Audited
+   * A super-admin turns an opt-in module on or off for a workspace
+   * (the dashboard's switch, `surface: 'web'`, or their agent's
+   * set_workspace_module, `'mcp'` — the caller has checked super-admin). Audited
    * `module.workspace_enable` / `module.workspace_disable` (meta: module) when
    * it changes anything. A plan value (`MODULE_ENABLED_<NAME>`) still wins.
+   *
+   * Enabling is refused (409 `module_requires_not_enabled`, `details.missing`)
+   * while a module it requires, directly or through another one, is off for
+   * the workspace. Disabling always applies; `dependentsOff` names the
+   * modules that were on and are off now because they depend on this one.
    */
-  async setWorkspaceModule(input: { workspaceId: string; module: string; enabled: boolean; actorUserId: string }): Promise<{ changed: boolean }> {
+  async setWorkspaceModule(input: {
+    workspaceId: string;
+    module: string;
+    enabled: boolean;
+    actorUserId: string;
+    surface?: 'mcp' | 'web';
+  }): Promise<{ changed: boolean; dependentsOff: string[] }> {
     const m = this.byName.get(input.module);
     if (!m || m.availability !== 'opt-in') {
       throw new ModuleError('not_found', `No opt-in platform module "${String(input.module)}" is active on this server.`, {
         details: { available: this.optInModules().map((x) => x.name) },
       });
     }
-    return this.deps.db().transaction(async (tx) => {
+    if (input.enabled) {
+      const missing = this.missingRequires(m.name, await this.optInStates(input.workspaceId));
+      if (missing.length > 0) throw moduleRequiresNotEnabled(m.name, missing);
+    }
+    const dependents = input.enabled ? [] : this.dependentsOf(m.name);
+    const before = dependents.length > 0 ? await this.enabledModules(input.workspaceId) : null;
+    const { changed } = await this.deps.db().transaction(async (tx) => {
       const changed = input.enabled
         ? (
             await tx
@@ -768,7 +985,7 @@ export class ModuleRuntime {
           {
             workspaceId: input.workspaceId,
             actorUserId: input.actorUserId,
-            actorKind: actorKindForSurface('web'),
+            actorKind: actorKindForSurface(input.surface ?? 'web'),
             action: input.enabled ? AUDIT_ACTIONS.moduleWorkspaceEnable : AUDIT_ACTIONS.moduleWorkspaceDisable,
             subjectType: AUDIT_SUBJECT_TYPES.module,
             target: m.name,
@@ -779,6 +996,9 @@ export class ModuleRuntime {
       }
       return { changed };
     });
+    if (!before) return { changed, dependentsOff: [] };
+    const after = await this.enabledModules(input.workspaceId);
+    return { changed, dependentsOff: dependents.filter((n) => before.has(n) && !after.has(n)) };
   }
 
   // ── end users ──
@@ -849,7 +1069,7 @@ export class ModuleRuntime {
     const enabled = await this.enabledModules(app.workspaceId);
     if (!enabled.has(m.name)) return null;
     const config = this.effectiveConfig(m, (await readConfigRow(app.id, m.name, db)).config);
-    const declared = new Set((m.secrets ?? []).map((s) => s.name));
+    const declared = new Set(this.secretDocs(m, config).map((s) => s.name));
     let limits: Promise<Limits> | null = null;
     return {
       app,
@@ -881,7 +1101,7 @@ export class ModuleRuntime {
   /**
    * The app's records store (the module that declares `records`, e.g. data),
    * bound to the app's effective config — null when no active module stores
-   * records. For the OWNER's view (query_data, the dashboard): the caller has
+   * records. For the OWNER's view (query_data and the MCP data tools, the dashboard): the caller has
    * authorized a drobek account for the app already.
    */
   async records(app: HookApp): Promise<BoundRecords | null> {
@@ -898,50 +1118,77 @@ export class ModuleRuntime {
       get: (collection, id) => r.get(view, collection, id),
       remove: (collection, id) => r.remove(view, collection, id),
       csv: (q) => r.csv(view, q),
-      update: async (collection, id, fields) => {
+      update: async (collection, id, fields, opts) => {
         if (!r.update) throw unsupported(m.name, 'editing records');
-        return r.update(view, collection, id, fields);
+        return r.update(view, collection, id, fields, opts);
+      },
+      create: async (collection, records) => {
+        if (!r.create) throw unsupported(m.name, 'adding records');
+        return r.create(view, collection, records);
       },
       importCsv: async (collection, csv) => {
         if (!r.importCsv) throw unsupported(m.name, 'importing CSV');
         return r.importCsv(view, collection, csv);
       },
-      dropCollection: async (collection, actorUserId) => {
+      dropCollection: async (collection, actorUserId, surface = 'web') => {
         const drop = r.dropCollection?.bind(r);
         if (!drop) throw unsupported(m.name, 'deleting collections');
-        return this.ownerConfigChange(m, app, actorUserId, async (config, tx) => {
-          const out = await drop(this.ownerView(app, config, tx), collection);
-          return {
-            patch: out.configPatch,
-            result: { records: out.records },
-            audit: { action: AUDIT_ACTIONS.dataCollectionDelete, meta: { module: m.name, collection, records: out.records } },
-          };
-        });
+        return this.ownerConfigChange(
+          m,
+          app,
+          actorUserId,
+          async (config, tx) => {
+            const out = await drop(this.ownerView(app, config, tx), collection);
+            return {
+              patch: out.configPatch,
+              result: { records: out.records },
+              audit: { action: AUDIT_ACTIONS.dataCollectionDelete, meta: { module: m.name, collection, records: out.records } },
+            };
+          },
+          surface
+        );
       },
       orphans: async () => (r.orphans ? r.orphans(view) : []),
-      purgeOrphan: async (collection, actorUserId) => {
+      purgeOrphan: async (collection, actorUserId, surface = 'web') => {
         const purge = r.purgeOrphan?.bind(r);
         if (!purge) throw unsupported(m.name, 'purging orphan collections');
-        return this.ownerConfigChange(m, app, actorUserId, async (config, tx) => {
-          const out = await purge(this.ownerView(app, config, tx), collection);
-          return {
-            patch: null,
-            result: { records: out.records },
-            audit: { action: AUDIT_ACTIONS.dataCollectionPurge, meta: { module: m.name, collection, records: out.records, orphan: true } },
-          };
-        });
+        return this.ownerConfigChange(
+          m,
+          app,
+          actorUserId,
+          async (config, tx) => {
+            const out = await purge(this.ownerView(app, config, tx), collection);
+            return {
+              patch: null,
+              result: { records: out.records },
+              audit: { action: AUDIT_ACTIONS.dataCollectionPurge, meta: { module: m.name, collection, records: out.records, orphan: true } },
+            };
+          },
+          surface
+        );
       },
     };
   }
 
   /**
-   * The effective limits of one workspace (NSO-329): the env defaults, or the
+   * The effective limits of one workspace: the env defaults, or the
    * limits provider's plan — CORE_LIMITS (APPS_MAX_PER_WORKSPACE,
-   * DOMAINS_MAX_PER_APP) and every module limit. For core callers: create_app
-   * and the dashboard's custom domains.
+   * DOMAINS_MAX_PER_APP, UPSTREAMS_MAX_PER_WORKSPACE, …) and every module
+   * limit. For core callers: create_app, new versions, the source quota, custom domains and upstreams.
    */
   workspaceLimits(workspaceId: string): Promise<Limits> {
     return this.deps.limits.forWorkspace(workspaceId);
+  }
+
+  /**
+   * Like workspaceLimits, but null while the configured limits provider does
+   * not answer for the workspace — for a job that deletes by a limit (the
+   * history retention, APP_VERSIONS_KEEP), which must not act on the env
+   * fallback.
+   */
+  settledWorkspaceLimits(workspaceId: string): Promise<Limits | null> {
+    const limits = this.deps.limits;
+    return limits.settled ? limits.settled(workspaceId) : limits.forWorkspace(workspaceId);
   }
 
   /** The OwnerView of `app` for an owner-facing authority (limits of the app's workspace, loaded once). */
@@ -951,17 +1198,19 @@ export class ModuleRuntime {
   }
 
   /**
-   * An OWNER's change of module `m`'s config for `app` (the dashboard, never
-   * an agent): under the config lock, `fn` gets the effective config and the
-   * transaction, does its own writes in it and returns a merge patch (or
-   * null); the patched config must pass configSchema. No confirmation: the
-   * owner is the one who confirms. A pending agent change stays pending.
+   * An OWNER's change of module `m`'s config for `app` (the dashboard, or an
+   * agent's call the user explicitly confirmed — `surface: 'mcp'`): under the
+   * config lock, `fn` gets the effective config and the transaction, does its
+   * own writes in it and returns a merge patch (or null); the patched config
+   * must pass configSchema. No pending confirmation: the owner (or their
+   * explicit yes) is the confirmation. A pending agent change stays pending.
    */
   private async ownerConfigChange<T>(
     m: AnyModule,
     app: HookApp,
     actorUserId: string,
-    fn: (config: unknown, tx: DB) => Promise<{ patch: Record<string, unknown> | null; result: T; audit: { action: string; meta: Record<string, unknown> } }>
+    fn: (config: unknown, tx: DB) => Promise<{ patch: Record<string, unknown> | null; result: T; audit: { action: string; meta: Record<string, unknown> } }>,
+    surface: 'mcp' | 'web' = 'web'
   ): Promise<T> {
     return withLockedConfig(app.id, m.name, async (row, write, tx) => {
       const db = tx as unknown as DB;
@@ -975,7 +1224,7 @@ export class ModuleRuntime {
         {
           workspaceId: app.workspaceId,
           actorUserId,
-          actorKind: actorKindForSurface('web'),
+          actorKind: actorKindForSurface(surface),
           action: out.audit.action,
           subjectType: 'app',
           target: app.slug,
@@ -1003,13 +1252,19 @@ export class ModuleRuntime {
         if (!a.list) throw unsupported(m.name, 'listing end users');
         return a.list(view, q);
       },
-      setRole: async (id, role, actorUserId) => {
+      setRole: async (id, role, actorUserId, surface = 'web') => {
         const setRole = a.setRole?.bind(a);
         if (!setRole) throw unsupported(m.name, 'changing roles');
-        return this.ownerConfigChange(m, app, actorUserId, async (config, tx) => {
-          const out = await setRole(this.ownerView(app, config, tx), id, role);
-          return { patch: out.configPatch, result: out.user, audit: { action: AUDIT_ACTIONS.endUserRole, meta: { module: m.name, end_user: id, role } } };
-        });
+        return this.ownerConfigChange(
+          m,
+          app,
+          actorUserId,
+          async (config, tx) => {
+            const out = await setRole(this.ownerView(app, config, tx), id, role);
+            return { patch: out.configPatch, result: out.user, audit: { action: AUDIT_ACTIONS.endUserRole, meta: { module: m.name, end_user: id, role } } };
+          },
+          surface
+        );
       },
       setDisabled: async (id, disabled) => {
         if (!a.setDisabled) throw unsupported(m.name, 'blocking users');
@@ -1059,7 +1314,7 @@ export class ModuleRuntime {
    * The skills list (skill_info(), create_app, get_app). Without `enabled`:
    * every skill, an opt-in module's marked `availability: 'opt-in'`. With the
    * app workspace's `enabled` set (enabledModules): the opt-in modules that
-   * are off for it are left out (NSO-346).
+   * are off for it are left out.
    */
   skillList(enabled?: ReadonlySet<string>): SkillListItem[] {
     const out: SkillListItem[] = [];
@@ -1119,13 +1374,21 @@ export class ModuleRuntime {
       out.slots = facts.slots;
       out.contributes = facts.contributes;
     }
+    if (m.jobs?.length) {
+      out.jobs = m.jobs.map((j) => ({
+        name: j.name,
+        scope: j.scope ?? 'server',
+        every: typeof j.every === 'function' ? 'config' : j.every,
+        description: j.description ?? null,
+      }));
+    }
     return out;
   }
 
   /**
    * The hint for a compile message: backend imports point at the skill that
    * replaces them — only when that skill is on the server and, given the app
-   * workspace's `enabled` set, its module is active there (NSO-346).
+   * workspace's `enabled` set, its module is active there.
    */
   compileHint(msg: { code?: string; specifier?: string }, enabled?: ReadonlySet<string>): string | undefined {
     if (msg.code !== 'unresolved_import' || !msg.specifier) return undefined;
@@ -1150,9 +1413,9 @@ export class ModuleRuntime {
 
   /** The modules of `appId` with a change waiting for the owner (active modules only). */
   async pendingSummary(appId: string): Promise<{ module: string; changes: string[] }[]> {
-    const rows = await readConfigRows(appId, this.modules.map((m) => m.name));
+    const rows = await readConfigRows(appId, this.appFacing.map((m) => m.name));
     const out: { module: string; changes: string[] }[] = [];
-    for (const m of this.modules) {
+    for (const m of this.appFacing) {
       const p = rows.get(m.name)?.pending;
       if (p) out.push({ module: m.name, changes: p.changes });
     }
@@ -1160,7 +1423,7 @@ export class ModuleRuntime {
   }
 
   /**
-   * One module of one app for the owner's dashboard (M2-02): schema, defaults,
+   * One module of one app for the owner's dashboard: schema, defaults,
    * stored + effective config, the pending change with its effective result,
    * the declared secrets with hasSecret / updated_at (NEVER a value), the rule
    * operations and the module's secret-free appInfo.
@@ -1181,7 +1444,7 @@ export class ModuleRuntime {
       };
       if (!r.success) pending.invalid = issuePaths(r.error.issues);
     }
-    const docs = m.secrets ?? [];
+    const docs = await this.appSecretDocs(app.id, m, config, ...(pending?.after ? [pending.after] : []));
     const status = await secretsStatus(app.id, m.name, docs.map((s) => s.name));
     const facts = this.moduleFacts(m.name)!;
     const view: ModuleDashboardView = {
@@ -1204,6 +1467,8 @@ export class ModuleRuntime {
       confirms: Boolean(m.confirmRequired),
       availability: m.availability ?? 'default',
       editor: m.dashboard?.editor ?? null,
+      title: m.dashboard?.title ?? null,
+      description: m.dashboard?.description ?? null,
       source: facts.source,
       contract: facts.contract,
       requires: facts.requires,
@@ -1238,7 +1503,7 @@ export class ModuleRuntime {
     let value: unknown;
     if (r.success) value = r.data;
     else {
-      // Logged once per stored content: the result is memoized below (NSO-323 M6).
+      // Logged once per stored content: the result is memoized below.
       let salvaged: { config: unknown; issues: string[] } | null = null;
       try {
         salvaged = m.salvageConfig ? m.salvageConfig(merged) : null;
@@ -1291,10 +1556,10 @@ export class ModuleRuntime {
     enabled?: ReadonlySet<string>
   ): Promise<Record<string, AppModuleState>> {
     const appId = typeof app === 'string' ? app : app.id;
-    const rows = await readConfigRows(appId, this.modules.map((m) => m.name));
+    const rows = await readConfigRows(appId, this.appFacing.map((m) => m.name));
     const on = enabled ?? (await this.enabledModules(typeof app === 'string' ? await this.workspaceOf(app) : app.workspaceId));
     const out: Record<string, AppModuleState> = {};
-    for (const m of this.modules) {
+    for (const m of this.appFacing) {
       const row = rows.get(m.name);
       const stored = row?.config ?? {};
       const state: AppModuleState = {
@@ -1308,9 +1573,10 @@ export class ModuleRuntime {
         if (row.pending.confirm_role === 'admin') state.confirm_role = 'admin';
         if (confirmLink) state.confirm_url = confirmLink(m.name);
       }
-      if (m.secrets?.length) {
-        const set = await secretsSet(appId, m.name, m.secrets.map((s) => s.name));
-        state.secrets = m.secrets.map((s) => ({ name: s.name, hasSecret: set.has(s.name) }));
+      const docs = await this.appSecretDocs(appId, m, state.config);
+      if (docs.length > 0) {
+        const set = await secretsSet(appId, m.name, docs.map((s) => s.name));
+        state.secrets = docs.map((s) => ({ name: s.name, hasSecret: set.has(s.name) }));
       }
       if (typeof app !== 'string') {
         const info = await this.appInfo(m, app, state.config);
@@ -1328,11 +1594,12 @@ export class ModuleRuntime {
     return row?.workspaceId ?? '';
   }
 
-  private requireModule(name: string): AnyModule {
+  /** An active module with a skill; an operator-only one answers not_found like an unknown name. */
+  private requireModule(name: string): AppFacingModule {
     const m = typeof name === 'string' ? this.byName.get(name) : undefined;
-    if (!m) {
+    if (!m || !isAppFacing(m)) {
       throw new ModuleError('not_found', `No platform module "${String(name)}" is active on this server.`, {
-        details: { available: this.modules.map((x) => x.name) },
+        details: { available: this.appFacing.map((x) => x.name) },
         hint: skillHint(),
       });
     }
@@ -1350,14 +1617,19 @@ export class ModuleRuntime {
     return r.data;
   }
 
-  private async missingSecrets(appId: string, m: AnyModule): Promise<string[]> {
-    const required = (m.secrets ?? []).filter((s) => s.required).map((s) => s.name);
+  private async missingSecrets(appId: string, m: AnyModule, ...configs: unknown[]): Promise<string[]> {
+    const required = this.secretDocs(m, ...configs)
+      .filter((s) => s.required)
+      .map((s) => s.name);
     if (required.length === 0) return [];
     const set = await secretsSet(appId, m.name, required);
     return required.filter((n) => !set.has(n));
   }
 
-  /** configure_module: validate a partial config; apply it, or hold it for the owner. */
+  /**
+   * configure_module: validate a partial config; apply it, or hold it for
+   * the owner — joined with the change that already waits, if any.
+   */
   async configure(input: ConfigureInput): Promise<ConfigureResult> {
     const m = this.requireModule(input.module);
     if (!(await this.isEnabled(input.app.workspaceId, m.name))) throw moduleNotEnabled(m.name);
@@ -1387,9 +1659,14 @@ export class ModuleRuntime {
         return { applied: true, config: before, pending: waiting, role: row.pending?.confirm_role, unchanged: true as const };
       }
       const hookApp: HookApp = { id: input.app.id, slug: input.app.slug, workspaceId: input.app.workspaceId };
-      const required = m.confirmRequired ? await m.confirmRequired(before, after, { app: hookApp, db: tx as unknown as DB }) : [];
-      const { changes, role } = normalizeConfirmItems(Array.isArray(required) ? required : []);
-      if (changes.length === 0) {
+      const confirmItems = async (target: unknown) => {
+        const required = m.confirmRequired
+          ? await m.confirmRequired(before, target, { app: hookApp, db: tx as unknown as DB, limits: () => this.deps.limits.forWorkspace(hookApp.workspaceId) })
+          : [];
+        return normalizeConfirmItems(Array.isArray(required) ? required : []);
+      };
+      const own = await confirmItems(after);
+      if (own.changes.length === 0) {
         await write({ config: nextStored });
         await writeAudit(
           {
@@ -1405,8 +1682,31 @@ export class ModuleRuntime {
         );
         return { applied: true, config: after, pending: waiting, role: row.pending?.confirm_role };
       }
+
+      // A change already waits: this proposal joins it, so the owner confirms
+      // or rejects both as one change over the config in force.
+      let pendingPatch = patch as Record<string, unknown>;
+      let { changes, role } = own;
+      let proposed: unknown = after;
+      const earlier = row.pending;
+      if (earlier) {
+        const combined = mergePatch(mergePatch(row.config, earlier.patch), patch) as Record<string, unknown>;
+        const parsed = m.configSchema.safeParse(mergePatch(m.configDefaults, combined));
+        if (!parsed.success) {
+          throw new ModuleError(
+            'invalid_params',
+            `The ${m.name} config is invalid together with the change that already waits for the owner's confirmation (pending_confirmation): send a change that fits it.`,
+            { details: { issues: issuePaths(parsed.error.issues), pending_confirmation: earlier.changes }, hint: skillHint(m.name) }
+          );
+        }
+        const all = await confirmItems(parsed.data);
+        proposed = parsed.data;
+        pendingPatch = diffMergePatch(row.config, combined);
+        changes = all.changes.length > 0 ? all.changes : [...new Set([...earlier.changes, ...own.changes])];
+        role = stricterRole(earlier.confirm_role, own.role, all.role);
+      }
       const pending: PendingChange = {
-        patch: patch as Record<string, unknown>,
+        patch: pendingPatch,
         changes,
         proposed_at: new Date().toISOString(),
         proposed_by: input.actorUserId,
@@ -1421,11 +1721,16 @@ export class ModuleRuntime {
           action: 'module.pending',
           subjectType: 'app',
           target: input.app.slug,
-          meta: { module: m.name, changes, ...(role === 'admin' ? { confirm_role: role } : {}) },
+          meta: {
+            module: m.name,
+            changes,
+            ...(role === 'admin' ? { confirm_role: role } : {}),
+            ...(earlier ? { merged_with_pending: earlier.changes } : {}),
+          },
         },
         tx
       );
-      return { applied: false, config: before, pending: changes, role };
+      return { applied: false, config: before, pending: changes, role, merged: earlier?.changes, proposed };
     });
 
     const out: ConfigureResult = {
@@ -1439,7 +1744,8 @@ export class ModuleRuntime {
       out.confirm_url = link;
     }
     if ('unchanged' in result && result.unchanged) out.unchanged = true;
-    const missing = await this.missingSecrets(input.app.id, m);
+    if ('merged' in result && result.merged) out.merged_with_pending = result.merged;
+    const missing = await this.missingSecrets(input.app.id, m, result.config, ...('proposed' in result && result.proposed !== undefined ? [result.proposed] : []));
     if (missing.length > 0) out.secrets_missing = missing;
     const info = await this.appInfo(m, { id: input.app.id, slug: input.app.slug, workspaceId: input.app.workspaceId }, result.config);
     if (info) out.info = info;
@@ -1449,7 +1755,7 @@ export class ModuleRuntime {
   }
 
   /**
-   * E-mail the app's owners that changes wait for their confirmation (M2-02):
+   * E-mail the app's owners that changes wait for their confirmation:
    * through the module e-mail path (`{ appOwners: true }`, the mail authority
    * — the `email` module — and the operator-wide budgets), at most once per
    * app per hour (PENDING_MAIL_WINDOW_MS), listing every module that waits.
@@ -1578,8 +1884,8 @@ export class ModuleRuntime {
   async runHook(hook: 'onAppCreate' | 'onAppDelete', app: HookApp): Promise<void>;
   async runHook(hook: 'onPublish', app: HookApp & { version: number }): Promise<void>;
   async runHook(hook: 'onAppCreate' | 'onPublish' | 'onAppDelete', app: HookApp & { version?: number }): Promise<void> {
-    // NSO-346: an opt-in module that is off for the workspace gets no create /
-    // publish hook, and contributes nothing to the others' (NSO-360);
+    // An opt-in module that is off for the workspace gets no create /
+    // publish hook, and contributes nothing to the others';
     // onAppDelete always runs, with every contribution (it cleans up what a
     // module kept while it was on).
     let enabled: ReadonlySet<string> | undefined;
@@ -1601,6 +1907,243 @@ export class ModuleRuntime {
         this.deps.log.error('module hook failed', { module: m.name, hook, app_id: app.id, error: dbErrorForLog(err, { stack: true }) });
       }
     }
+  }
+
+  // ── scheduled jobs ──
+
+  /**
+   * The apps module `m`'s jobs run for: live (not deleted, not taken down),
+   * with a stored config of `m` (a configure_module call, a dashboard save or
+   * a pending change) and `m` on for their workspace — in app-id order, read
+   * `batch` rows at a time, each with its effective config and the config its
+   * pending change would give (null when none or it no longer validates).
+   */
+  async *jobApps(m: AnyModule, batch = JOB_APPS_BATCH): AsyncGenerator<JobAppRow> {
+    const db = this.deps.db();
+    const on = new Map<string, boolean>();
+    let after = '';
+    for (;;) {
+      const rows = await db
+        .select({ id: apps.id, slug: apps.slug, workspaceId: apps.workspaceId, config: moduleConfigs.config, pending: moduleConfigs.pending })
+        .from(moduleConfigs)
+        .innerJoin(apps, eq(apps.id, moduleConfigs.appId))
+        .where(and(eq(moduleConfigs.module, m.name), gt(moduleConfigs.appId, after), isNull(apps.deletedAt), isNull(apps.lockedReason)))
+        .orderBy(asc(moduleConfigs.appId))
+        .limit(batch);
+      for (const r of rows) {
+        let enabled = on.get(r.workspaceId);
+        if (enabled === undefined) {
+          enabled = await this.isEnabled(r.workspaceId, m.name);
+          on.set(r.workspaceId, enabled);
+        }
+        if (!enabled) continue;
+        const stored = asObject(r.config);
+        const pending = asPending(r.pending);
+        const parsed = pending ? this.parsePending(m, stored, pending) : null;
+        yield {
+          app: { id: r.id, slug: r.slug, workspaceId: r.workspaceId },
+          config: this.effectiveConfig(m, stored),
+          pendingConfig: parsed?.success ? parsed.data : null,
+        };
+      }
+      if (rows.length < batch) return;
+      after = rows[rows.length - 1].id;
+    }
+  }
+
+  /** The context of one run of a `scope: 'server'` job of `m`. */
+  serverJobContext(m: AnyModule, input: JobRunInput): ServerJobContext<unknown> {
+    const log = taggedLogger(this.deps.log, { module: m.name, job: input.job });
+    const db = this.deps.db();
+    const self = this;
+    return {
+      ...this.services(this.defaultModules()),
+      log,
+      module: m.name,
+      job: input.job,
+      signal: input.signal,
+      lastSuccessAt: input.lastSuccessAt,
+      limits: async () => this.deps.limits.defaults(),
+      apps: async function* (): AsyncGenerator<ModuleAppView<unknown>> {
+        for await (const row of self.jobApps(m)) yield { app: row.app, config: row.config, db, log };
+      },
+    };
+  }
+
+  /** The context of one run of a `scope: 'app'` job of `m` for one of its jobApps(). */
+  async appJobContext(m: AnyModule, row: JobAppRow, input: JobRunInput): Promise<AppJobContext<unknown>> {
+    const deps = this.deps;
+    const { app } = row;
+    const enabled = await this.enabledModules(app.workspaceId);
+    const declared = new Set(this.secretDocs(m, row.config).map((s) => s.name));
+    let limits: Promise<Limits> | null = null;
+    return {
+      ...this.services(enabled),
+      log: taggedLogger(deps.log, { module: m.name, job: input.job, app_id: app.id }),
+      module: m.name,
+      job: input.job,
+      signal: input.signal,
+      lastSuccessAt: input.lastSuccessAt,
+      app,
+      config: row.config,
+      pendingConfig: row.pendingConfig,
+      limits: () => (limits ??= deps.limits.forWorkspace(app.workspaceId)),
+      rateLimit: (bucket, key, max, windowMs) => deps.rateLimit(`mod:${m.name}:${app.id}:${bucket}:${key}`, max, windowMs),
+      secrets: {
+        get: async (name) => {
+          if (!declared.has(name)) throw new Error(`module "${m.name}" reads undeclared secret "${name}"`);
+          return getModuleSecret(app.id, m.name, name, deps.env);
+        },
+      },
+      upstreams: {
+        fetch: async (name, request = {}) => {
+          const owner = upstreamsAuthorityOf(this.modules);
+          if (!owner?.upstreams || !enabled.has(owner.name)) {
+            throw new ModuleError('unavailable', 'No module that calls upstreams (proxy) is on for this app\'s workspace.');
+          }
+          const db = deps.db();
+          const config = this.effectiveConfig(owner, (await readConfigRow(app.id, owner.name, db)).config);
+          return owner.upstreams.fetch(this.ownerView(app, config, db), name, request);
+        },
+      },
+      records: {
+        import: async (collection, records, opts) => {
+          const owner = recordsAuthorityOf(this.modules);
+          const importRecords = owner?.records?.importRecords?.bind(owner.records);
+          if (!owner || !importRecords || !enabled.has(owner.name)) {
+            throw new ModuleError('unavailable', 'No module that stores records and imports them in batches (data) is on for this app\'s workspace.');
+          }
+          const db = deps.db();
+          const config = this.effectiveConfig(owner, (await readConfigRow(app.id, owner.name, db)).config);
+          return importRecords(this.ownerView(app, config, db), collection, records, opts);
+        },
+      },
+      audit: async (action, meta = {}) => {
+        const actor = input.actor;
+        await writeAudit({
+          workspaceId: app.workspaceId,
+          actorUserId: actor?.userId ?? null,
+          // A scheduled run has no person behind it: kind `user` without a user reads as "system" (like the DNS re-check).
+          actorKind: actor ? actorKindForSurface(actor.surface) : 'user',
+          action: action.startsWith(`${m.name}.`) ? action : `${m.name}.${action}`,
+          subjectType: AUDIT_SUBJECT_TYPES.app,
+          target: app.slug,
+          meta: { ...meta, module: m.name, job: input.job, by: actor ? actor.surface : 'schedule' },
+        });
+      },
+    };
+  }
+
+  // ── scheduled imports ──
+
+  /**
+   * The app's scheduled imports (the module that declares `sync`), bound to
+   * the app's config — null when no active module declares it. For the
+   * OWNER's view (the dashboard, sync_now, get_logs): the caller authorized
+   * a drobek account for the app already.
+   */
+  async sync(app: HookApp): Promise<BoundSync | null> {
+    const m = syncAuthorityOf(this.modules);
+    if (!m?.sync) return null;
+    const authority = m.sync;
+    const db = this.deps.db();
+    const row = await readConfigRow(app.id, m.name, db);
+    const config = this.effectiveConfig(m, row.config);
+    const view = this.ownerView(app, config, db);
+    const runTimeoutMs = moduleRunTimeoutMs(this.deps.env);
+    return {
+      module: m.name,
+      sources: () => authority.sources(view),
+      runs: (q = {}) => authority.runs(view, q),
+      runNow: async (source, actor) => {
+        if (!(await this.isEnabled(app.workspaceId, m.name))) throw moduleNotEnabled(m.name);
+        const pending = row.pending ? this.parsePending(m, row.config, row.pending) : null;
+        const signal = AbortSignal.timeout(runTimeoutMs);
+        const ctx = await this.appJobContext(
+          m,
+          { app, config, pendingConfig: pending?.success ? pending.data : null },
+          { job: 'run_now', signal, lastSuccessAt: null, actor }
+        );
+        return authority.runNow(ctx as never, source);
+      },
+      resume: async (source, actor) => {
+        const resumed = await authority.resume(view, source);
+        if (resumed) {
+          await writeAudit({
+            workspaceId: app.workspaceId,
+            actorUserId: actor.userId,
+            actorKind: actorKindForSurface(actor.surface),
+            action: `${m.name}.resume`,
+            subjectType: AUDIT_SUBJECT_TYPES.app,
+            target: app.slug,
+            meta: { module: m.name, source },
+          });
+        }
+        return resumed;
+      },
+    };
+  }
+
+  // ── webhooks ──
+
+  /**
+   * The app's webhook endpoints and deliveries (the module that declares
+   * `webhooks`), bound to the app's config — null when no active module
+   * declares it. For the OWNER's view (the dashboard, get_logs): the caller
+   * authorized a drobek account for the app already.
+   */
+  async webhooks(app: HookApp): Promise<BoundWebhooks | null> {
+    const m = webhooksAuthorityOf(this.modules);
+    if (!m?.webhooks) return null;
+    const authority = m.webhooks;
+    const db = this.deps.db();
+    const row = await readConfigRow(app.id, m.name, db);
+    const view = this.ownerView(app, this.effectiveConfig(m, row.config), db);
+    return {
+      module: m.name,
+      endpoints: () => authority.endpoints(view),
+      deliveries: (q = {}) => authority.deliveries(view, q),
+    };
+  }
+
+  // ── secrets ──
+
+  /**
+   * The secrets of `m` for an app whose config is one of `configs`: the
+   * declared ones, then those the configs name (`secretsFor`), each name once.
+   */
+  secretDocs(m: AnyModule, ...configs: unknown[]): ModuleSecretDoc[] {
+    const out = new Map<string, ModuleSecretDoc>();
+    for (const s of m.secrets ?? []) out.set(s.name, { name: s.name, description: s.description, required: s.required === true });
+    if (!m.secretsFor) return [...out.values()];
+    for (const config of configs) {
+      let extra: unknown;
+      try {
+        extra = m.secretsFor(config);
+      } catch (err) {
+        this.deps.log.warn('module secretsFor failed', { module: m.name, error: dbErrorForLog(err) });
+        continue;
+      }
+      if (!Array.isArray(extra)) continue;
+      for (const s of extra as Partial<ModuleSecretDoc>[]) {
+        if (!s || typeof s.name !== 'string' || !SECRET_NAME_RE.test(s.name) || out.has(s.name)) continue;
+        out.set(s.name, { name: s.name, description: typeof s.description === 'string' ? s.description : '', required: s.required === true });
+      }
+    }
+    return [...out.values()];
+  }
+
+  /**
+   * The secrets the owner sees and may remove for one app: {@link secretDocs},
+   * plus — for a module whose secrets follow its config — values still stored
+   * under a name the config no longer uses (so they can be removed).
+   */
+  async appSecretDocs(appId: string, m: AnyModule, ...configs: unknown[]): Promise<ModuleSecretDoc[]> {
+    const docs = this.secretDocs(m, ...configs);
+    if (!m.secretsFor) return docs;
+    const known = new Set(docs.map((d) => d.name));
+    const stale = (await storedSecretNames(appId, m.name)).filter((n) => !known.has(n));
+    return [...docs, ...stale.map((name) => ({ name, description: 'No longer used by this app\'s config: remove it.', required: false }))];
   }
 
   // ── e-mail ──
@@ -1686,11 +2229,14 @@ export class ModuleRuntime {
         await writeAudit({
           workspaceId: app.workspaceId,
           actorUserId: null,
-          actorKind: actorKindForSurface('apps'),
+          // The runtime's own mail has no person behind it: kind `user` without a user reads as "system".
+          actorKind: platform ? 'user' : actorKindForSurface('apps'),
           action: 'email.send',
           subjectType: 'app',
           target: app.slug,
-          meta: { module: m.name, kind, recipients: sent, end_user: principal.kind === 'user' ? principal.id : 'anon' },
+          meta: platform
+            ? { module: m.name, kind, recipients: sent, by: 'platform' }
+            : { module: m.name, kind, recipients: sent, end_user: principal.kind === 'user' ? principal.id : 'anon' },
         }).catch((err: unknown) => deps.log.error('audit email.send failed', { app_id: app.id, error: dbErrorForLog(err) }));
       }
     }
@@ -1701,11 +2247,27 @@ export class ModuleRuntime {
 
   /** Answer one `/__drobek/*` request of `app` (never throws). */
   async handle(req: PlatformRequest, app: PlatformApp): Promise<PipelineResult> {
-    const seen: { module?: string } = {};
+    const seen: { module?: string; route?: string } = {};
     const res = await this.dispatch(req, app, seen);
-    // A 429 is not counted: a throttled flood must cost nothing past the limiter (NSO-323 M3).
+    // A 429 is not counted: a throttled flood must cost nothing past the limiter.
     if (seen.module && res.status !== 429) this.countRequest(app.id, seen.module, res.status);
     return res;
+  }
+
+  /**
+   * Whether the `/__drobek/*` request `method path` matches a module route
+   * that declares `passwordGate: 'skip'` (it authenticates the caller
+   * itself): the app host's password gate lets it through to `handle`.
+   * Never a GET or HEAD: a read always stays behind the gate.
+   */
+  skipsPasswordGate(method: string, path: string): boolean {
+    if (method === 'GET' || method === 'HEAD') return false;
+    const match = V1_RE.exec(path);
+    if (!match) return false;
+    const m = this.byName.get(match[1]);
+    if (!m || !isAppFacing(m)) return false;
+    const hit = matchRoute(this.routes.get(m.name) ?? [], method, match[2] ?? '/');
+    return hit.kind === 'route' && hit.route.opts.passwordGate === 'skip';
   }
 
   /** get_logs `requests`: one response of a matched route of an active module (fire-and-forget). */
@@ -1719,7 +2281,7 @@ export class ModuleRuntime {
     }
   }
 
-  private async dispatch(req: PlatformRequest, app: PlatformApp, seen: { module?: string }): Promise<PipelineResult> {
+  private async dispatch(req: PlatformRequest, app: PlatformApp, seen: { module?: string; route?: string }): Promise<PipelineResult> {
     try {
       if (req.path === SDK_PATH || req.path === SDK_TYPES_PATH) return this.serveSdk(req);
       if (req.path === BEACON_SCRIPT_PATH) return this.serveBeaconScript(req);
@@ -1728,16 +2290,16 @@ export class ModuleRuntime {
         return errorResult(new ModuleError('not_found', 'No such drobek endpoint.', { hint: skillHint() }));
       }
       const m = this.byName.get(match[1]);
-      if (!m) {
+      if (!m || !isAppFacing(m)) {
         return errorResult(
           new ModuleError('not_found', `No platform module "${match[1]}" is active on this server.`, {
-            details: { available: this.modules.map((x) => x.name) },
+            details: { available: this.appFacing.map((x) => x.name) },
             hint: skillHint(),
           })
         );
       }
-      // NSO-346: an opt-in module off for the app's workspace answers nothing else (not counted);
-      // NSO-360: nor does it contribute to the modules that are on.
+      // An opt-in module off for the app's workspace answers nothing else (not counted)
+      // and contributes nothing to the modules that are on.
       const enabled = await this.enabledModules(app.workspaceId);
       if (!enabled.has(m.name)) {
         return errorResult(moduleNotEnabled(m.name), m.name);
@@ -1752,22 +2314,24 @@ export class ModuleRuntime {
           m.name
         );
       }
-      // Only a matched route is counted: a flood of unknown routes or methods costs no stats (NSO-323 M3).
+      // Only a matched route is counted: a flood of unknown routes or methods costs no stats.
       seen.module = m.name;
+      seen.route = `/__drobek/v1/${m.name}${hit.route.pattern}`;
       const host = req.header('host');
       const selfOrigin = host ? `${appsOrigin(this.deps.env).scheme}://${host.trim().toLowerCase()}` : null;
       let limits: Limits | null = null;
       const getLimits = async () => (limits ??= await this.deps.limits.forWorkspace(app.workspaceId));
+      const resolvePrincipal = () =>
+        this.deps.principal({
+          app: { id: app.id, slug: app.slug, workspaceId: app.workspaceId },
+          cookieHeader: req.header('cookie'),
+        });
       const res = await runRoute({ ...req, path: match[2] ?? '/' }, hit.route, hit.params, {
         module: m.name,
         errorCodes: this.errorCodes.get(m.name),
         selfOrigin,
-        principal: () =>
-          this.deps.principal({
-            app: { id: app.id, slug: app.slug, workspaceId: app.workspaceId },
-            cookieHeader: req.header('cookie'),
-          }),
-        context: (principal) => this.context(m, app, principal, getLimits, enabled),
+        principal: resolvePrincipal,
+        context: (principal) => this.context(m, app, principal, getLimits, enabled, resolvePrincipal),
         limit: async (name) => {
           const l = await getLimits();
           const v = l[name];
@@ -1782,7 +2346,22 @@ export class ModuleRuntime {
       return res;
     } catch (err) {
       if (isModuleError(err)) return errorResult(err);
+      const timedOut = isQueryTimeout(err);
       this.deps.log.error('module request failed', { app_id: app.id, path: req.path, error: dbErrorForLog(err, { stack: true }) });
+      void reportError({
+        message: 'module request failed',
+        error: err,
+        context: {
+          kind: 'module_route',
+          ...(seen.module ? { module: seen.module } : {}),
+          route: seen.route ?? req.path,
+          method: req.method,
+          status: timedOut ? 503 : 500,
+          appId: app.id,
+          workspaceId: app.workspaceId,
+        },
+      });
+      if (timedOut) return errorResult(databaseTimeout());
       return errorResult(new ModuleError('internal_error', 'drobek hit an internal error.'));
     }
   }
@@ -1827,13 +2406,14 @@ export class ModuleRuntime {
     app: PlatformApp,
     principal: Principal,
     getLimits: () => Promise<Limits>,
-    enabled: ReadonlySet<string>
+    enabled: ReadonlySet<string>,
+    resolvePrincipal: () => Promise<Principal>
   ): Promise<ModuleContext<unknown>> {
     const deps = this.deps;
     const row = await readConfigRow(app.id, m.name, deps.db());
     const config = this.effectiveConfig(m, row.config);
     const pending = row.pending ? this.parsePending(m, row.config, row.pending) : null;
-    const declared = new Set((m.secrets ?? []).map((s) => s.name));
+    const declared = new Set(this.secretDocs(m, config).map((s) => s.name));
     const hookApp: HookApp = { id: app.id, slug: app.slug, workspaceId: app.workspaceId };
     return {
       app: hookApp,
@@ -1841,6 +2421,13 @@ export class ModuleRuntime {
       principal,
       config,
       pendingConfig: pending?.success ? pending.data : null,
+      currentConfig: async () => {
+        const db = deps.db();
+        const [state] = await db.select({ deletedAt: apps.deletedAt, lockedReason: apps.lockedReason }).from(apps).where(eq(apps.id, app.id)).limit(1);
+        if (!state || state.deletedAt || state.lockedReason) throw new ModuleError('not_found', 'This app is no longer served.');
+        return this.effectiveConfig(m, (await readConfigRow(app.id, m.name, db)).config);
+      },
+      currentPrincipal: resolvePrincipal,
       ...this.services(enabled),
       rules: { decide: (rule, ownerId) => decideAccess(rule, principal, ownerId) },
       limits: getLimits,
@@ -1862,6 +2449,18 @@ export class ModuleRuntime {
           meta: { ...meta, module: m.name, end_user: principal.kind === 'user' ? principal.id : 'anon' },
         });
       },
+      records: {
+        create: async (collection, records) => {
+          const owner = recordsAuthorityOf(this.modules);
+          const create = owner?.records?.create?.bind(owner.records);
+          if (!owner || !create || !enabled.has(owner.name)) {
+            throw new ModuleError('unavailable', 'No module that stores records (data) is on for this app\'s workspace.');
+          }
+          const db = deps.db();
+          const ownerConfig = this.effectiveConfig(owner, (await readConfigRow(app.id, owner.name, db)).config);
+          return create(this.ownerView(hookApp, ownerConfig, db), collection, records);
+        },
+      },
       email: {
         send: (message) => this.sendEmail(m, hookApp, principal, config, getLimits, message),
         signInShare: deps.mailGuard.budgets?.perAppSignIn,
@@ -1881,14 +2480,14 @@ export interface LoadRuntimeOptions extends ResolveOptions {
   origins?: Record<string, ModuleOrigin>;
   /** Directory of the general skills (default: generalSkillsDir()). null = none. */
   skillsDir?: string | null;
-  /** Apply a module's migrations (default: runJournalMigrations against DATABASE_URL). */
+  /** Apply a module's migrations (default: runJournalMigrations against DATABASE_URL, under the migration lock). */
   migrate?: (folder: string, table: string) => Promise<void>;
   deps?: Partial<RuntimeDeps>;
 }
 
 /**
  * The limits catalogue of a module set: CORE_LIMITS, every module's `limits`
- * and, per opt-in module, its `MODULE_ENABLED_<NAME>` pseudo-limit (NSO-346).
+ * and, per opt-in module, its `MODULE_ENABLED_<NAME>` pseudo-limit.
  */
 export function limitsCatalogue(modules: readonly AnyModule[]): CatalogueLimit[] {
   return [
@@ -1910,15 +2509,17 @@ export async function loadModuleRuntime(opts: LoadRuntimeOptions = {}): Promise<
     ? { modules: checkModuleSet(opts.modules, env, log), origins: opts.origins ?? {} }
     : await loadModuleSet(env, { ...opts, log });
   const authority = endUserAuthorityOf(modules);
+  installModuleEmailTransport(modules, env, log);
+  installModuleErrorReporter(modules, env, log);
 
   if (env.DROBEK_MIGRATE_ON_START !== '0') {
-    const migrate =
-      opts.migrate ??
-      ((folder: string, table: string) => runJournalMigrations({ migrationsFolder: folder, migrationsTable: table }));
     for (const m of modules) {
       if (!m.migrations) continue;
       log.info('applying module migrations', { module: m.name });
-      await migrate(toPath(m.migrations.folder), moduleJournalTable(m.name));
+      const folder = toPath(m.migrations.folder);
+      const table = moduleJournalTable(m.name);
+      if (opts.migrate) await opts.migrate(folder, table);
+      else await runJournalMigrations({ migrationsFolder: folder, migrationsTable: table, module: { name: m.name, version: m.version }, log });
     }
   }
 
@@ -1979,9 +2580,9 @@ export function moduleRuntime(opts?: LoadRuntimeOptions): Promise<ModuleRuntime>
 }
 
 /**
- * The active modules (name, version, source, contract) for `/healthz` and
- * `/api/version` — never a path. The server entry loads the runtime at boot,
- * so this only misses in tooling: then [].
+ * The active modules (name, version, source, contract, operatorOnly) for
+ * `/healthz` and `/api/version` — never a path. The server entry loads the
+ * runtime at boot, so this only misses in tooling: then [].
  */
 export function activeModules(): Promise<ModuleSummary[]> {
   return moduleRuntime()

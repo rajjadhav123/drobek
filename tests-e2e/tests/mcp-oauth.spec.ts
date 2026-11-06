@@ -1,6 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import {
   expect,
   test,
@@ -14,19 +13,19 @@ import {
   skipUnlessLocal,
   uniqueEmail,
 } from './helpers/auth';
-import { callTool, mcpClient, rawInitialize } from './helpers/mcp';
+import { callTool, mcpClient, newMcpClient, rawInitialize } from './helpers/mcp';
 import { personalWorkspaceOf, seedApp, workspaceIdBySlug } from './helpers/seed';
 
 /**
- * U5 + M0-04 acceptance: the MCP OAuth 2.1 flow end-to-end against the local
+ * The MCP OAuth 2.1 flow end-to-end against the local
  * compose stack — discovery → DCR → browser consent (PKCE S256, the three
  * scope checkboxes, NO workspace choice) → token → Bearer MCP call — plus the
  * security negatives: unauthenticated 401, a foreign `resource` → invalid_target,
  * RFC 9207 `iss` on every authorization response, single-use code, and refresh
- * rotation + reuse detection. The token is USER-bound: list_apps spans every
+ * rotation with a retry. The token is USER-bound: list_apps spans every
  * workspace of the user, and a non-member gets not_found.
  * CIMD, the DCR rate limit, the RS audience check and API keys live in
- * mcp-cimd.spec.ts.
+ * mcp-cimd.spec.ts; refresh reuse in mcp-oauth-refresh.spec.ts.
  */
 
 // A loopback redirect_uri that nothing serves — the browser's cross-origin
@@ -85,7 +84,7 @@ async function consentAndGetCode(
 ): Promise<string> {
   await page.goto(`/oauth/authorize?${authorizeQuery(opts)}`);
   await expect(page.getByTestId('consent-approve')).toBeVisible();
-  // M0-04: the grant is user-bound — no workspace picker on the consent screen.
+  // The grant is user-bound — no workspace picker on the consent screen.
   await expect(page.getByTestId('workspace-select')).toHaveCount(0);
 
   const captured = new Promise<string>((resolve) => {
@@ -222,13 +221,33 @@ test('MCP OAuth 2.1 end-to-end: discovery → register → consent → token →
     new URL(`${BASE_URL_MCP}/mcp`),
     { requestInit: { headers: { Authorization: `Bearer ${accessToken}` } } }
   );
-  const client = new Client({ name: 'drobek-e2e', version: '0.0.0' });
+  const client = newMcpClient();
   await client.connect(transport);
   try {
     const tools = await client.listTools();
     const names = tools.tools.map((t) => t.name);
     // read was granted → the read tools are exposed; write was not → no write tools.
-    expect(names.sort()).toEqual(['get_app', 'get_logs', 'list_apps', 'list_assets', 'list_domains', 'list_upstreams', 'query_data', 'read_file', 'skill_info']);
+    expect(names.sort()).toEqual([
+      'get_analytics',
+      'get_app',
+      'get_feedback_screenshot',
+      'get_logs',
+      'get_screenshot',
+      'list_activity',
+      'list_apps',
+      'list_assets',
+      'list_domains',
+      'list_end_users',
+      'list_feedback',
+      'list_form_submissions',
+      'list_members',
+      'list_uploads',
+      'list_upstreams',
+      'list_versions',
+      'query_data',
+      'read_file',
+      'skill_info',
+    ]);
 
     const listed = await callTool(client, 'list_apps', {});
     expect(listed.isError).toBe(false);
@@ -242,7 +261,7 @@ test('MCP OAuth 2.1 end-to-end: discovery → register → consent → token →
   }
 });
 
-test('MCP OAuth negatives: no-token 401, invalid_target, deny, refresh rotation + reuse, burned + replayed code @local', async ({
+test('MCP OAuth negatives: no-token 401, invalid_target, deny, refresh rotation + retry, burned + replayed code @local', async ({
   page,
   request,
 }) => {
@@ -302,7 +321,7 @@ test('MCP OAuth negatives: no-token 401, invalid_target, deny, refresh rotation 
     expect(denied.searchParams.get('code')).toBeNull();
   }
 
-  // --- single-use code + refresh rotation/reuse ---
+  // --- single-use code + refresh rotation/retry ---
   {
     const { verifier, challenge } = pkcePair();
     const code = await consentAndGetCode(page, {
@@ -324,30 +343,22 @@ test('MCP OAuth negatives: no-token 401, invalid_target, deny, refresh rotation 
     expect(rot.body.access_token).toBeTruthy();
     expect(rot.body.refresh_token).not.toBe(first.body.refresh_token);
 
-    // …reusing the OLD refresh token → invalid_grant (reuse detected)…
-    const reuse = await refresh(request, {
+    // …sending the OLD refresh token again within the retry grace (a client
+    // that lost the response) gets a fresh pair from the lineage's tail.
+    // Reuse after the grace is in mcp-oauth-refresh.spec.ts.
+    const retry = await refresh(request, {
       refreshToken: first.body.refresh_token as string,
       clientId,
     });
-    expect(reuse.status).toBe(400);
-    expect(reuse.body.error).toBe('invalid_grant');
-
-    // …and the lineage is burned: the rotated successor is now dead too.
-    const burned = await refresh(request, {
-      refreshToken: rot.body.refresh_token as string,
-      clientId,
+    expect(retry.status).toBe(200);
+    expect(retry.body.refresh_token).not.toBe(rot.body.refresh_token);
+    const live = await rawInitialize(request, {
+      Authorization: `Bearer ${retry.body.access_token}`,
     });
-    expect(burned.status).toBe(400);
-    expect(burned.body.error).toBe('invalid_grant');
-
-    // …as is every access token of the grant.
-    const dead = await rawInitialize(request, {
-      Authorization: `Bearer ${rot.body.access_token}`,
-    });
-    expect(dead.status()).toBe(401);
+    expect(live.status()).toBe(200);
   }
 
-  // --- a failed exchange burns the code (NSO-332) ---
+  // --- a failed exchange burns the code ---
   {
     const { verifier, challenge } = pkcePair();
     const code = await consentAndGetCode(page, {
@@ -371,7 +382,7 @@ test('MCP OAuth negatives: no-token 401, invalid_target, deny, refresh rotation 
     expect(right.body.error).toBe('invalid_grant');
   }
 
-  // --- replaying an exchanged code revokes what it minted (NSO-332) ---
+  // --- replaying an exchanged code revokes what it minted ---
   {
     const { verifier, challenge } = pkcePair();
     const code = await consentAndGetCode(page, {
@@ -496,13 +507,11 @@ test('OAuth authorization-server discovery returns the authorize endpoint @smoke
 });
 
 /**
- * M1a coherence, READ-ONLY — safe against ANY target (local OR beta/prod).
- * Proves the self-host/beta discovery chain is internally consistent without a
- * single write or a login email: the RS advertises the drobek AS, the AS
+ * READ-ONLY, safe against any target: the RS advertises the drobek AS, the AS
  * advertises PKCE-S256 + the three OAuth endpoints, and both health surfaces
- * are live. This is the beta-safe half of the M1a acceptance.
+ * are live — no write, no login email.
  */
-test('M1a discovery chain is coherent (RS ↔ AS ↔ health) @smoke', async ({
+test('OAuth discovery chain is coherent (RS ↔ AS ↔ health) @smoke', async ({
   request,
 }) => {
   // Web + MCP are both live.

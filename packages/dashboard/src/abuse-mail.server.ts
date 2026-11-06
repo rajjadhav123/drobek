@@ -1,27 +1,29 @@
 /**
- * The moderation e-mails (M4-02, NSO-293), platform mail in the drobek layout
+ * The moderation e-mails, platform mail in the drobek layout
  * (renderPlatformEmail escapes the text, so a reporter's text can never
  * become markup in the operator's mail client; only the queue link, on this
  * server's origin, is a button):
  *
- *  - a new report → every super-admin (SUPERADMIN_EMAIL) and OPERATOR_EMAIL
- *    (deduplicated, case-insensitive), at most ONE mail
- *    per reported app (or unresolved host) per hour — a flood of reports on
- *    one app does not flood the operator (`drobek:abuse:mail:<key>`, Redis
- *    SET NX, 1 h; a Redis error sends anyway);
+ *  - a new report on an app → every super-admin (SUPERADMIN_EMAIL) and
+ *    OPERATOR_EMAIL (deduplicated, case-insensitive), at most ONE mail per
+ *    reported app per hour — a flood of reports on one app does not flood the
+ *    operator (`drobek:abuse:mail:<app id>`, Redis SET NX, 1 h; a Redis error
+ *    sends anyway). A report on a host no app matches only waits in the
+ *    queue: there is nothing to take down, and the form must not be a free
+ *    channel into the operator's mailbox;
  *  - a takedown / a restore → the app's owners (its workspace's editors and
  *    workspace-admins): the reason CATEGORY and what happens next — never the
- *    reporter's text or address.
+ *    reporter's text or address (@drobek/apps mailOwnersAboutModeration,
+ *    re-exported here).
  *
  * Delivery errors are logged and swallowed: the report / the takedown already
  * happened and must not fail because the mailbox is down.
  */
-import { ABUSE_QUEUE_PATH, dashboardOrigin, reasonLabel, termsUrl, type ReportedApp } from '@drobek/apps';
+import { ABUSE_QUEUE_PATH, dashboardOrigin, reasonLabel, type ReportedApp } from '@drobek/apps';
 import { superAdminEmails } from '@drobek/auth';
 import { getRedis, type Logger } from '@drobek/core';
-import { dbErrorForLog, getDb } from '@drobek/db';
+import { dbErrorForLog } from '@drobek/db';
 import { renderPlatformEmail, sendEmail, serverFootNote, type EmailAction } from '@drobek/email';
-import { appOwnerEmails } from '@drobek/modules';
 
 const REPORT_MAIL_DEDUP_MS = 60 * 60 * 1000;
 
@@ -77,19 +79,24 @@ export interface ReportMailInput {
   app: ReportedApp | null;
 }
 
-/** Tell the super-admins and the operator about a new report (deduped per app / host per hour). */
+/** Tell the super-admins and the operator about a new report on an app (deduped per app per hour). */
 export async function mailSuperAdminsAboutReport(
   input: ReportMailInput,
   log: Logger,
   env: NodeJS.ProcessEnv = process.env
 ): Promise<{ sent: number; deduped: boolean }> {
+  const { app } = input;
+  if (!app) {
+    log.info('abuse report on a host no app matches — queued without a mail', { report_id: input.reportId });
+    return { sent: 0, deduped: false };
+  }
   const to = reportMailRecipients(env);
   if (to.length === 0) {
     log.warn('abuse report stored but SUPERADMIN_EMAIL and OPERATOR_EMAIL are empty — nobody is notified', { report_id: input.reportId });
     return { sent: 0, deduped: false };
   }
-  if (!(await firstInWindow(input.app?.id ?? `host:${input.host}`, log))) {
-    log.info('abuse report mail deduped (one per app per hour)', { report_id: input.reportId, app_id: input.app?.id ?? null });
+  if (!(await firstInWindow(app.id, log))) {
+    log.info('abuse report mail deduped (one per app per hour)', { report_id: input.reportId, app_id: app.id });
     return { sent: 0, deduped: true };
   }
   const subject = `Abuse report: ${input.host} (${input.reason})`;
@@ -97,9 +104,7 @@ export async function mailSuperAdminsAboutReport(
     `A new abuse report was filed for ${input.host}.`,
     '',
     `Reason: ${reasonLabel(input.reason)} (${input.reason})`,
-    input.app
-      ? `App: ${input.app.slug} in workspace ${input.app.workspaceSlug}${input.app.lockedReason ? ` — already taken down (${input.app.lockedReason})` : ''}`
-      : 'App: no app on this server matches the host.',
+    `App: ${app.slug} in workspace ${app.workspaceSlug}${app.lockedReason ? ` — already taken down (${app.lockedReason})` : ''}`,
     `Reporter: ${input.reporterEmail ?? 'anonymous'}`,
     '',
     'Details:',
@@ -121,37 +126,5 @@ export async function mailSuperAdminsAboutReport(
   return { sent, deduped: false };
 }
 
-/** Tell the app's owners it was taken down (category only) or restored. */
-export async function mailOwnersAboutModeration(
-  input: { kind: 'takedown' | 'restore'; app: { slug: string; workspaceId: string }; reason: string },
-  log: Logger,
-  env: NodeJS.ProcessEnv = process.env
-): Promise<number> {
-  const to = await appOwnerEmails(getDb(), input.app.workspaceId);
-  if (to.length === 0) return 0;
-  const terms = termsUrl(env);
-  const subject =
-    input.kind === 'takedown'
-      ? `Your app ${input.app.slug} was taken down`
-      : `Your app ${input.app.slug} was restored`;
-  const text =
-    input.kind === 'takedown'
-      ? [
-          `The operator of this drobek server took your app ${input.app.slug} down.`,
-          '',
-          `Reason: ${reasonLabel(input.reason)}.`,
-          '',
-          'The app is unpublished and every one of its addresses shows an "unavailable" page. It cannot be changed, published or reconfigured — neither in the dashboard nor by your coding agent — until the operator restores it.',
-          '',
-          `Terms of service: ${terms}`,
-          'If you think this is a mistake, reply to the operator of this server.',
-        ].join('\n')
-      : [
-          `The operator of this drobek server restored your app ${input.app.slug}.`,
-          '',
-          'You can change it again. It is NOT published: publish a version from the dashboard or ask your agent to publish when it is ready.',
-          '',
-          `Terms of service: ${terms}`,
-        ].join('\n');
-  return deliver(to, { subject, text, footNote: serverFootNote('you can edit this app', env) }, log, { app: input.app.slug, kind: input.kind }, env);
-}
+/** The owners' takedown / restore e-mail lives in @drobek/apps (the MCP tools send it too). */
+export { mailOwnersAboutModeration } from '@drobek/apps';

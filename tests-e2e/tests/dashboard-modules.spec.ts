@@ -6,7 +6,7 @@ import { callTool, mcpClient, type McpClient } from './helpers/mcp';
 import { addMembership, userIdByEmail, withDb, workspaceIdBySlug } from './helpers/seed';
 
 /**
- * M2-02 (NSO-291): the dashboard Modules tab end to end — an agent drives
+ * The dashboard Modules tab end to end — an agent drives
  * configure_module over MCP, the owner (and a viewer) use the UI:
  *
  *  - the agent opens `create` of a data collection to `public` → the
@@ -18,6 +18,9 @@ import { addMembership, userIdByEmail, withDb, workspaceIdBySlug } from './helpe
  *    module, the change and the confirm URL (a button in the HTML part, the
  *    address in the text part, the server named by its host); a second proposal within the hour
  *    sends none (1/h per app);
+ *  - a second proposal joins the change that waits (`merged_with_pending`),
+ *    an owner's relaxation saved in the dashboard joins it too, the page
+ *    shows one diff and Reject drops every part;
  *  - a secret entered in the form → `hasSecret: true` in get_app, and the
  *    value appears in no API response (get_app, skill_info, the page's loader
  *    data) and no HTML;
@@ -26,14 +29,22 @@ import { addMembership, userIdByEmail, withDb, workspaceIdBySlug } from './helpe
  *  - a viewer sees the configuration, the pending change and the secret
  *    status, but no button or input; a direct POST is 403.
  *
- * NSO-347 (EXT-05):
  *  - the workspace Modules page (a workspace tab, viewer+): every active
  *    module with version, source, contract, availability, slots, limits for
  *    the workspace and error codes — secret-free, no path on disk; its
- *    opt-in switch (NSO-346) answers a viewer 403;
+ *    opt-in switch answers a viewer 403;
  *  - the module page's "About this module" + error codes, linking there;
  *  - the generic form edits a record of named entries (the forms module's
- *    `forms`) without client JS: fill the empty entry, save, it is stored.
+ *    `forms`) without client JS: fill the empty entry, save, it is stored;
+ *  - the files form asks who may upload / download with principal
+ *    checkboxes and takes the largest file in MB (stored in bytes); a
+ *    sign-in provider of the auth form leads with its On switch.
+ *
+ * The installed external module `acmecrm` (source dir, opt-in,
+ * its `auth.signedIn` contribution, error and limit) on the workspace page;
+ * its page is the generic form — a list (`tags`, one per line) and a record
+ * (`fields`) save — while `data` keeps its collections editor (a declared
+ * capability, not the module name).
  */
 
 interface Created {
@@ -94,7 +105,7 @@ function modulePath(app: Created, module: string): string {
 
 test.describe.configure({ mode: 'serial' });
 
-test.describe('dashboard Modules tab (M2-02) @local', () => {
+test.describe('dashboard Modules tab @local', () => {
   let mcp: McpClient;
   let owner: BrowserContext;
   let ownerPage: Page;
@@ -212,6 +223,62 @@ test.describe('dashboard Modules tab (M2-02) @local', () => {
     expect(await pendingMails(request, mcp.email)).toHaveLength(1);
   });
 
+  test('a second proposal joins the waiting change (agent and dashboard): one diff on the page, Reject drops all of it', async () => {
+    skipUnlessLocal();
+    expect(await configure(mcp, app.app_id, 'data', { collections: { board: {} } })).toMatchObject({ applied: true });
+    const first = await configure(mcp, app.app_id, 'data', { collections: { board: { rules: { create: 'public' } } } });
+    expect(first.applied).toBe(false);
+    expect(first.merged_with_pending).toBeUndefined();
+    const createItem = 'data.collections.board.rules.create: "user" → "public" (anyone, signed in or not, may add records)';
+    expect(first.pending_confirmation).toEqual([createItem]);
+
+    // The agent's second proposal does not replace the first: the answer names what already waited.
+    const second = await configure(mcp, app.app_id, 'data', { collections: { board: { rules: { update: 'public' } } } });
+    expect(second).toMatchObject({ applied: false, merged_with_pending: [createItem], note: expect.stringContaining('merged_with_pending') });
+    const updateItem = 'data.collections.board.rules.update: "owner|admin" → "public" (anyone, signed in or not, may change every record)';
+    expect(second.pending_confirmation).toEqual([createItem, updateItem]);
+
+    // The owner sees one change with both paths in its diff.
+    await ownerPage.goto(modulePath(app, 'data'));
+    const panel = ownerPage.getByTestId('pending-panel');
+    await expect(panel.getByTestId('pending-change')).toContainText([createItem, updateItem]);
+    await expect(panel.getByTestId('pending-scope')).toContainText('Reject drops all of it');
+    for (const path of ['collections.board.rules.create', 'collections.board.rules.update']) {
+      await expect(panel.locator(`[data-testid="pending-diff-row"][data-path="${path}"] [data-testid="pending-diff-after"]`)).toHaveText('"public"');
+    }
+
+    // A relaxation the owner saves in the dashboard joins it too.
+    await ownerPage.getByTestId('rule-board-delete-public').check();
+    await ownerPage.getByTestId('collection-save-board').click();
+    await expect(ownerPage.getByTestId('done-notice')).toHaveAttribute('data-done', 'merged');
+    await expect(panel.getByTestId('pending-change')).toHaveCount(3);
+    await expect(panel.locator('[data-testid="pending-diff-row"][data-path="collections.board.rules.delete"]')).toBeVisible();
+    await expect(ownerPage.getByTestId('rule-board-create-rule')).toHaveText('user');
+
+    // Reject drops every part; the rules in force never changed.
+    await panel.getByTestId('pending-reject').click();
+    await expect(ownerPage.getByTestId('done-notice')).toHaveAttribute('data-done', 'rejected');
+    await expect(ownerPage.getByTestId('pending-panel')).toHaveCount(0);
+    for (const [op, rule] of [
+      ['create', 'user'],
+      ['update', 'owner|admin'],
+      ['delete', 'owner|admin'],
+    ]) {
+      await expect(ownerPage.getByTestId(`rule-board-${op}-rule`)).toHaveText(rule);
+    }
+    const got = await callTool(mcp.client, 'get_app', { app_id: app.app_id });
+    expect((got.json.modules as Record<string, Record<string, unknown>>).data).toMatchObject({
+      pending: false,
+      config: { collections: { board: { rules: { create: 'user', update: 'owner|admin', delete: 'owner|admin' } } } },
+    });
+    const pendingRows = (await auditRows(app.slug)).filter((r) => r.action === 'module.pending' && JSON.stringify(r.meta).includes('collections.board'));
+    expect(pendingRows.map((r) => [r.actor_kind, r.meta?.merged_with_pending])).toEqual([
+      ['agent', undefined],
+      ['agent', [createItem]],
+      ['user', [createItem, updateItem]],
+    ]);
+  });
+
   test('a secret entered in the dashboard: hasSecret true; the value is in no API response and no HTML', async () => {
     skipUnlessLocal();
     const path = modulePath(app, 'hello');
@@ -300,7 +367,7 @@ test.describe('dashboard Modules tab (M2-02) @local', () => {
     await expect(ownerPage.getByTestId('field-error-greeting')).toBeVisible();
   });
 
-  test('NSO-347: the workspace Modules page lists every module with its facts — secret-free, no path on disk', async () => {
+  test('the workspace Modules page lists every module with its facts — secret-free, no path on disk', async () => {
     skipUnlessLocal();
     await ownerPage.goto(`/workspaces/${app.workspace}/apps`);
     await ownerPage.locator('[data-testid="workspace-tab"][data-tab="modules"]').click();
@@ -369,7 +436,7 @@ test.describe('dashboard Modules tab (M2-02) @local', () => {
     expect(info.json).toMatchObject({ contract: '^1.1', source: 'builtin', availability: 'default', slots: [expect.objectContaining({ name: 'hello.greeter' })] });
   });
 
-  test("NSO-347: the module page's About section + error codes, linking to the workspace page", async () => {
+  test("the module page's About section + error codes, linking to the workspace page", async () => {
     skipUnlessLocal();
     await ownerPage.goto(modulePath(app, 'hello'));
     const about = ownerPage.getByTestId('module-about');
@@ -396,9 +463,32 @@ test.describe('dashboard Modules tab (M2-02) @local', () => {
     await expect(paths.locator('[data-testid="config-path-row"][data-path="allow.emails"]')).toBeHidden();
     await paths.locator('summary').click();
     await expect(paths.locator('[data-testid="config-path-row"][data-path="allow.emails"]')).toBeVisible();
+    // A sign-in provider's own fields follow its On switch.
+    const oidc = ownerPage.locator('fieldset', { has: ownerPage.locator('input[name="cfg.providers.oidc.enabled"]') }).last();
+    await expect(oidc.locator('input').first()).toHaveAttribute('name', 'cfg.providers.oidc.enabled');
   });
 
-  test('NSO-347: the generic form adds a named entry to a record (forms.forms) without client JS', async () => {
+  test('the files form: who may upload / download as principal checkboxes, the largest file in MB', async () => {
+    skipUnlessLocal();
+    await ownerPage.goto(modulePath(app, 'files'));
+    const form = ownerPage.getByTestId('config-form');
+    await expect(form.getByTestId('rule-rules-upload-user')).toBeChecked();
+    await expect(form.getByTestId('rule-rules-upload-owner')).toHaveCount(0);
+    await expect(form.getByTestId('rule-rules-read-owner')).not.toBeChecked();
+    await expect(form.locator('input[name="cfg.rules.upload"]')).toHaveCount(0);
+    await expect(form).toContainText('the limit in force');
+    await form.getByTestId('rule-rules-upload-admin').check();
+    await form.getByTestId('field-maxBytes').fill('2.5');
+    await ownerPage.getByTestId('config-save').click();
+    await expect(ownerPage.getByTestId('done-notice')).toHaveAttribute('data-done', 'applied');
+    const got = await callTool(mcp.client, 'get_app', { app_id: app.app_id });
+    const files = (got.json.modules as Record<string, { config: { rules: { upload: string; read: string }; maxBytes?: number } }>).files;
+    expect(files.config).toMatchObject({ rules: { upload: 'user|admin', read: 'user' }, maxBytes: 2.5 * 1024 * 1024 });
+    await expect(ownerPage.getByTestId('field-maxBytes')).toHaveValue('2.5');
+    await expect(ownerPage.getByTestId('rule-rules-upload-admin')).toBeChecked();
+  });
+
+  test('the generic form adds a named entry to a record (forms.forms) without client JS', async () => {
     skipUnlessLocal();
     await ownerPage.goto(modulePath(app, 'forms'));
     const record = ownerPage.getByTestId('field-forms');
@@ -416,6 +506,57 @@ test.describe('dashboard Modules tab (M2-02) @local', () => {
       await expect(ownerPage.getByTestId('entry-forms')).toHaveCount(1);
       await expect(ownerPage.getByTestId('entry-key-forms-0')).toHaveValue('contact');
     }
+  });
+
+  test('the installed external module — its facts on the workspace page, the generic form with a list and a record; data keeps its collections editor', async () => {
+    skipUnlessLocal();
+    const wsId = await workspaceIdBySlug(app.workspace);
+    await withDb((c) => c.query(`INSERT INTO workspace_modules (workspace_id, module) VALUES ($1, 'acmecrm') ON CONFLICT DO NOTHING`, [wsId]));
+
+    await ownerPage.goto(`/workspaces/${app.workspace}/modules`);
+    const crm = ownerPage.locator('[data-testid="workspace-module"][data-module="acmecrm"]');
+    await expect(crm.getByTestId('fact-version')).toHaveText('0.1.0');
+    await expect(crm.getByTestId('fact-availability').locator('[data-availability]')).toHaveAttribute('data-availability', 'opt-in');
+    await expect(crm.getByTestId('fact-requires')).toHaveText('auth');
+    await crm.getByTestId('module-technical').locator('summary').click();
+    await expect(crm.getByTestId('fact-source').locator('[data-source]')).toHaveAttribute('data-source', 'dir');
+    await expect(crm.getByTestId('fact-contract')).toHaveText('^1.2');
+    await expect(crm.getByTestId('fact-editor')).toHaveCount(0);
+    const contribution = crm.locator('[data-testid="contributes-row"][data-slot="auth.signedIn"]');
+    await expect(contribution).toContainText('auth');
+    await expect(contribution).toContainText('acmecrm-contacts');
+    await expect(crm.locator('[data-testid="error-row"][data-code="crm_duplicate"]')).toBeVisible();
+    await crm.getByTestId('module-limits').locator('summary').click();
+    await expect(crm.locator('[data-testid="limit-row"][data-limit="ACMECRM_CONTACTS_PER_APP"] [data-testid="limit-value"]')).toHaveAttribute('data-value', '1000');
+    // The slot host lists the external module among its contributors.
+    const auth = ownerPage.locator('[data-testid="workspace-module"][data-module="auth"]');
+    await auth.getByTestId('module-technical').locator('summary').click();
+    await expect(auth.locator('[data-testid="slot-row"][data-slot="auth.signedIn"]')).toContainText('acmecrm');
+
+    // The dedicated editor follows the declared capability, not the module name.
+    await ownerPage.goto(modulePath(app, 'data'));
+    await expect(ownerPage.getByTestId('collections-editor')).toBeVisible();
+    await ownerPage.goto(modulePath(app, 'acmecrm'));
+    await expect(ownerPage.getByTestId('collections-editor')).toHaveCount(0);
+    await expect(ownerPage.getByTestId('upstreams-editor')).toHaveCount(0);
+    await expect(ownerPage.locator('[data-name="ACMECRM_API_KEY"] [data-testid="secret-status"]')).toHaveText('not set');
+
+    // The generic form: a list (one per line) and a record of named entries.
+    await ownerPage.getByTestId('field-tags').fill('newsletter\nvip');
+    const fresh = ownerPage.getByTestId('entry-new-fields');
+    await fresh.locator('input[name="cfg.fields[0].$key"]').fill('company');
+    await fresh.locator('input[name="cfg.fields[0].label"]').fill('Company');
+    await fresh.locator('input[name="cfg.fields[0].required"]').check();
+    await ownerPage.getByTestId('config-save').click();
+    await expect(ownerPage.getByTestId('done-notice')).toHaveAttribute('data-done', 'applied');
+    const got = await callTool(mcp.client, 'get_app', { app_id: app.app_id });
+    expect((got.json.modules as Record<string, { config: unknown }>).acmecrm.config).toEqual({
+      tags: ['newsletter', 'vip'],
+      fields: { company: { label: 'Company', required: true } },
+    });
+    await expect(ownerPage.getByTestId('entry-fields')).toHaveCount(1);
+    await expect(ownerPage.getByTestId('entry-key-fields-0')).toHaveValue('company');
+    await expect(ownerPage.getByTestId('field-tags')).toHaveValue('newsletter\nvip');
   });
 
   test('a viewer sees the configuration, the pending change and the secret status — no buttons; a POST is 403', async ({ browser, request }) => {
@@ -443,12 +584,12 @@ test.describe('dashboard Modules tab (M2-02) @local', () => {
       await expect(page.getByTestId('secret-input-HELLO_SIGNATURE')).toHaveCount(0);
       await expect(page.locator('main button')).toHaveCount(0);
 
-      // NSO-347: the workspace Modules page is read-only for every member.
+      // the workspace Modules page is read-only for every member.
       await page.goto(`/workspaces/${app.workspace}/modules`);
       await expect(page.locator('[data-testid="workspace-module"][data-module="hello"]')).toBeVisible();
       // The search is the one control (a GET form, it changes nothing).
       await expect(page.locator('main button:not([data-testid="modules-search-submit"]), main input:not([type="hidden"]):not([type="search"])')).toHaveCount(0);
-      // NSO-346: the opt-in switch on that page is super-admin only.
+      // the opt-in switch on that page is super-admin only.
       const toggle = await page.request.post(`${BASE_URL_WEB}/workspaces/${app.workspace}/modules`, {
         headers: { Origin: BASE_URL_WEB },
         form: { intent: 'workspace-module', module: 'hello', enabled: '1' },

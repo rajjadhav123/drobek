@@ -12,7 +12,7 @@ import {
 } from './helpers/seed';
 
 /**
- * M0-05 (NSO-283) acceptance, end-to-end over Streamable HTTP with the
+ * The core MCP tools end to end over Streamable HTTP with the
  * official SDK client against the local compose stack: the six core tools
  * (list_apps, create_app, get_app, read_file, write_files, restore_version),
  * the compile loop, the untrusted read_file envelope, per-call membership
@@ -26,28 +26,113 @@ const ALL_TOOLS = [
   'configure_module',
   'create_app',
   'create_asset_upload',
+  'create_records',
+  'create_workspace',
+  'delete_app',
   'delete_asset',
+  'delete_collection',
+  'delete_feedback',
+  'delete_form_submission',
+  'delete_record',
+  'delete_upload',
+  'delete_versions',
+  'delete_workspace',
   'duplicate_app',
+  'get_analytics',
   'get_app',
+  'get_feedback_screenshot',
   'get_logs',
+  'get_screenshot',
+  'invite_member',
+  'keep_version',
+  'list_activity',
   'list_apps',
   'list_assets',
   'list_domains',
+  'list_end_users',
+  'list_feedback',
+  'list_form_submissions',
+  'list_members',
+  'list_uploads',
   'list_upstreams',
+  'list_versions',
+  'purge_orphan_records',
   'query_data',
   'read_file',
   'register_upstream',
+  'release_lease',
   'remove_domain',
+  'remove_member',
+  'remove_module_secret',
   'remove_upstream',
+  'request_screenshot',
+  'resolve_feedback',
   'restore_version',
+  'set_end_user_blocked',
+  'set_end_user_role',
+  'set_frame_ancestors',
+  'set_member_role',
+  'set_upstream_streaming',
+  'sign_out_end_users',
   'skill_info',
+  'sync_now',
+  'update_record',
   'verify_domain',
   'write_files',
 ];
-const READ_TOOLS = new Set(['list_apps', 'get_app', 'read_file', 'skill_info', 'query_data', 'get_logs', 'list_assets', 'list_domains', 'list_upstreams']);
-/** NSO-366: the domain tools that ask public DNS or change the public site. */
-const OPEN_WORLD_TOOLS = new Set(['verify_domain', 'remove_domain']);
-const IDEMPOTENT_WRITES = new Set(['configure_module', 'delete_asset', 'add_domain', 'verify_domain', 'remove_domain', 'register_upstream', 'remove_upstream']);
+const READ_TOOLS = new Set([
+  'list_apps',
+  'get_app',
+  'read_file',
+  'list_versions',
+  'skill_info',
+  'query_data',
+  'get_logs',
+  'get_analytics',
+  'list_assets',
+  'list_domains',
+  'list_upstreams',
+  'list_form_submissions',
+  'list_end_users',
+  'list_uploads',
+  'list_activity',
+  'list_members',
+  'list_feedback',
+  'get_feedback_screenshot',
+  'get_screenshot',
+]);
+/** The tools that ask public DNS or change the public site. */
+const OPEN_WORLD_TOOLS = new Set(['sync_now', 'verify_domain', 'remove_domain', 'set_frame_ancestors', 'delete_app', 'invite_member']);
+const IDEMPOTENT_WRITES = new Set([
+  'configure_module',
+  'delete_asset',
+  'add_domain',
+  'verify_domain',
+  'remove_domain',
+  'register_upstream',
+  'set_upstream_streaming',
+  'remove_upstream',
+  'set_frame_ancestors',
+  'release_lease',
+  'delete_app',
+  'keep_version',
+  'delete_versions',
+  'update_record',
+  'delete_record',
+  'delete_collection',
+  'purge_orphan_records',
+  'delete_form_submission',
+  'set_end_user_role',
+  'set_end_user_blocked',
+  'delete_upload',
+  'remove_module_secret',
+  'resolve_feedback',
+  'delete_feedback',
+  'create_workspace',
+  'set_member_role',
+  'remove_member',
+  'delete_workspace',
+]);
 
 const TEMPLATE_FILES = ['drobek.json', 'index.html', 'src/main.tsx', 'src/styles.css'];
 
@@ -150,14 +235,14 @@ test('core tools: create → broken write → fix → limits → restore → rea
   skipUnlessLocal();
   const a = await mcpClient(page, request, { tag: 'core', scope: 'read write' });
   try {
-    // tools/list under `read write`: exactly the 20 non-publish tools, each with a title + annotations.
+    // tools/list under `read write`: exactly the non-publish tools, each with a title + annotations.
     const listed = (await a.client.listTools()).tools;
     expect(listed.map((t) => t.name).sort()).toEqual(ALL_TOOLS);
     for (const t of listed) {
       expect(t.title ?? t.annotations?.title, `${t.name} title`).toBeTruthy();
       expect(t.annotations?.readOnlyHint, `${t.name} readOnlyHint`).toBe(READ_TOOLS.has(t.name));
       expect(t.annotations?.openWorldHint, `${t.name} openWorldHint`).toBe(OPEN_WORLD_TOOLS.has(t.name));
-      // NSO-307: explicit idempotentHint — reads, configure_module, delete_asset and the domain/upstream tools repeat safely; create/write/restore/upload URLs do not.
+      // Explicit idempotentHint — reads, configure_module, delete_asset, the domain/upstream tools, the app settings/lease/delete tools, keeping a version and deleting old ones, the record update/delete tools and the owner's delete/role/block/secret tools repeat safely; sign_out_end_users, create/write/restore/upload URLs and create_records do not.
       expect(t.annotations?.idempotentHint, `${t.name} idempotentHint`).toBe(READ_TOOLS.has(t.name) || IDEMPOTENT_WRITES.has(t.name));
     }
 
@@ -204,6 +289,8 @@ test('core tools: create → broken write → fix → limits → restore → rea
     expect(badCompile.ok).toBe(false);
     expect(badCompile.errors[0]).toMatchObject({ file: 'src/main.tsx', line: 6 });
     expect(bad.json.preview_version).toBe(1);
+    // The readiness report repeats the compile errors as its blocking class.
+    expect(bad.json.readiness).toMatchObject({ ready: false, blocking: [{ code: 'build_error', file: 'src/main.tsx', line: 6 }] });
     const v2 = await callTool(a.client, 'get_app', { app_id: appId });
     expect(v2.json).toMatchObject({ latest_version: 2, compile_status: 'error' });
     expect((v2.json.compile_errors as { line: number }[])[0].line).toBe(6);
@@ -221,6 +308,17 @@ test('core tools: create → broken write → fix → limits → restore → rea
     expect(fixed.json).toMatchObject({ version: 3, compile: { ok: true } });
     expect(fixed.json.preview_url).toMatch(previewRe(slug));
     expect(fixed.json.preview_version).toBeUndefined();
+    // write_files never waits for the background type check; get_app has it a moment on.
+    // The template's <title> is the app name; its description and icon are the agent's to add.
+    const readinessCodes = (r: unknown) => {
+      const { warnings, ...rest } = r as { warnings: { code: string }[] };
+      return { ...rest, warnings: warnings.map((w) => w.code) };
+    };
+    const templateWarnings = ['missing_description', 'missing_favicon'];
+    expect(readinessCodes(fixed.json.readiness)).toEqual({ ready: true, blocking: [], warnings: templateWarnings, typecheck: 'pending' });
+    await expect
+      .poll(async () => readinessCodes((await callTool(a.client, 'get_app', { app_id: appId })).json.readiness), { timeout: 30_000 })
+      .toEqual({ ready: true, blocking: [], warnings: templateWarnings, typecheck: 'checked' });
 
     // 21 files in one call → invalid_params, nothing stored.
     const tooMany = await callTool(a.client, 'write_files', {
@@ -243,7 +341,7 @@ test('core tools: create → broken write → fix → limits → restore → rea
     expect((v4.json.files as { path: string }[]).map((f) => f.path).sort()).toEqual(TEMPLATE_FILES);
     expect(v4.json).not.toHaveProperty('warnings');
 
-    // NSO-378: an argument the tool does not take is ignored and named in warnings.
+    // An argument the tool does not take is ignored and named in warnings.
     const extra = await callTool(a.client, 'get_app', { app_id: appId, user_confirmed: true });
     expect(extra.isError, extra.text).toBe(false);
     expect(extra.json).toMatchObject({ app_id: appId, warnings: [{ code: 'unknown_argument', ignored: ['user_confirmed'], accepted: ['app_id'] }] });
@@ -260,7 +358,7 @@ test('core tools: create → broken write → fix → limits → restore → rea
     expect(notes.text).toContain('UNTRUSTED CONTENT');
     expect(notes.text).toMatch(/<untrusted-app-file [^>]*nonce="([0-9a-f]{16})">\n[\s\S]*IGNORE PREVIOUS INSTRUCTIONS[\s\S]*\n<\/untrusted-app-file nonce="\1">$/);
 
-    // NSO-382: edits change part of a file in place; one that does not apply refuses the whole call.
+    // Edits change part of a file in place; one that does not apply refuses the whole call.
     const edited = await callTool(a.client, 'write_files', {
       app_id: appId,
       files: [

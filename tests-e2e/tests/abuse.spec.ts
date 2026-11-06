@@ -14,7 +14,7 @@ import { FULL_SCOPE, callTool, mcpClient, type McpClient } from './helpers/mcp';
 import { withDb } from './helpers/seed';
 
 /**
- * M4-02 (NSO-293): abuse and moderation end to end on the local stack.
+ * Abuse and moderation end to end on the local stack.
  *
  *  - the publish heuristic flags a "bank login" app (password field + "bank"
  *    in the title/h1) into the queue and does NOT flag a calculator — neither
@@ -23,6 +23,7 @@ import { withDb } from './helpers/seed';
  *    the dashboard origin) and sends X-Drobek-App;
  *  - an anonymous report through the form stores a row, audits
  *    `abuse.report` and e-mails the super-admins; the honeypot stores nothing;
+ *  - a report on a host no app matches is stored but e-mails nobody;
  *  - the queue is super-admin only (403); a takedown → 451 with the terms
  *    link on the prod, preview AND version hosts, `write_files` →
  *    `app_locked_by_admin`, get_app `locked_by_admin`, the owner is e-mailed,
@@ -31,8 +32,7 @@ import { withDb } from './helpers/seed';
  *    serves again, write_files works), owner e-mailed, audit `admin.restore`;
  *  - the form allows 5 valid reports per IP per hour (the 6th → 429).
  *
- * The super-admin is `e2e-superadmin@drobek.test` — docker-compose.yml appends
- * it to SUPERADMIN_EMAIL in dev, docker-compose.e2e.yaml sets it.
+ * The super-admin is `e2e-superadmin@drobek.test` (set by both composes).
  */
 
 const SUPER_ADMIN = 'e2e-superadmin@drobek.test';
@@ -154,7 +154,7 @@ async function createAndPublish(mcp: McpClient, name: string, mainTsx: string): 
 
 test.describe.configure({ mode: 'serial' });
 
-test.describe('abuse: reports, takedown/restore, publish heuristic (M4-02) @local', () => {
+test.describe('abuse: reports, takedown/restore, publish heuristic @local', () => {
   let owner: McpClient;
   let bank: Created;
   let calc: Created;
@@ -216,6 +216,7 @@ test.describe('abuse: reports, takedown/restore, publish heuristic (M4-02) @loca
       const page = await anon.newPage();
       await page.goto(pointer.report_url);
       await expect(page.getByTestId('report-host')).toHaveValue(host);
+      await expect(page.locator('main[data-drobek-page="report"]')).toBeVisible();
       await page.getByTestId('report-reason').selectOption('phishing');
       await page.getByTestId('report-details').fill('Fake bank login page asking for my PIN.');
       await page.getByTestId('report-email').fill('Reporter.E2E@example.com');
@@ -252,6 +253,25 @@ test.describe('abuse: reports, takedown/restore, publish heuristic (M4-02) @loca
     expect((await reportsOf(calc.app_id)).length).toBe(before);
   });
 
+  test('a report on a host no app matches is queued without e-mailing the super-admins', async ({ request }) => {
+    skipUnlessLocal();
+    await resetRateLimitBucket(REPORT_BUCKET);
+    const host = `no-app-${Date.now().toString(36)}.example.test`;
+    const res = await request.post('/report', {
+      form: { host, reason: 'other', details: 'Buy upvotes for your launch.', email: 'seller@example.test', website: '' },
+    });
+    expect(res.status()).toBe(200);
+
+    const rows = await withDb(async (c) =>
+      (await c.query(`SELECT status, app_id FROM abuse_reports WHERE host = $1`, [host])).rows
+    );
+    expect(rows).toEqual([{ status: 'open', app_id: null }]);
+    // The action awaits the mail before it answers, so a mail would already be in Mailpit.
+    await new Promise((r) => setTimeout(r, 1500));
+    const mails = (await mailpitMessagesFor(request, SUPER_ADMIN)).filter((m) => (m.Subject ?? '').includes(host));
+    expect(mails).toEqual([]);
+  });
+
   test('the queue is super-admin only; a takedown → 451 everywhere, app_locked_by_admin, owner e-mail, audit', async ({
     page,
     browser,
@@ -275,7 +295,7 @@ test.describe('abuse: reports, takedown/restore, publish heuristic (M4-02) @loca
     await expect(row.getByTestId('abuse-app')).toHaveAttribute('href', new RegExp(`/apps/${bank.slug}$`));
     await expect(row.getByTestId('moderation-app-public')).toHaveAttribute('href', new RegExp(`${bank.slug}\\.`));
     await row.getByTestId('takedown-reason').selectOption('phishing');
-    // NSO-371: the first click only opens the confirm panel; Cancel changes nothing.
+    // The first click only opens the confirm panel; Cancel changes nothing.
     await row.getByTestId('takedown').click();
     const confirm = ap.getByTestId('takedown-confirm');
     await expect(confirm).toHaveAttribute('data-app-slug', bank.slug);
@@ -304,6 +324,8 @@ test.describe('abuse: reports, takedown/restore, publish heuristic (M4-02) @loca
       expect(r.headers['link']).toBe(`<${TERMS}>; rel="blocked-by"`);
       expect(r.body).toContain(`href="${TERMS}"`);
       expect(r.body).toContain('This app is unavailable');
+      expect(r.body).toContain('data-drobek-page="locked"');
+      expect(r.body).not.toMatch(/<script/i);
     }
     const sdk = await hostRequest(previewHost(bank.slug), '/__drobek/sdk.js');
     expect(sdk.status).toBe(451);
@@ -364,6 +386,11 @@ test.describe('abuse: reports, takedown/restore, publish heuristic (M4-02) @loca
     const audit = await auditOf(bank.slug, 'admin.restore');
     expect(audit).toHaveLength(1);
     expect(audit[0]).toMatchObject({ actor_kind: 'user', meta: { reason: 'phishing' } });
+
+    // The resolved view lists the app's reports and says how long they are kept.
+    await ap.goto('/admin/abuse?status=resolved');
+    await expect(ap.getByTestId('abuse-retention')).toContainText('deleted 365 days after it was resolved');
+    await expect(ap.locator(`[data-testid="abuse-report"][data-host="${prodHost(bank.slug)}"]`).first()).toBeVisible();
   });
 
   test('the report form allows 5 valid reports per IP per hour; the 6th → 429', async ({ request }) => {
@@ -371,7 +398,7 @@ test.describe('abuse: reports, takedown/restore, publish heuristic (M4-02) @loca
     await resetRateLimitBucket(REPORT_BUCKET);
     const form = { host: prodHost(calc.slug), reason: 'spam', details: 'rate limit probe', email: '', website: '' };
     // A client IP of its own: on the dev stack a request without one has no
-    // per-IP bucket (NSO-328); behind Caddy it is the runner's IP anyway.
+    // per-IP bucket; behind Caddy it is the runner's IP anyway.
     const headers = ownClientIpHeaders();
     // An invalid submission is refused (400) and does not count.
     const invalid = await request.post('/report', { headers, form: { ...form, reason: 'not-a-reason' } });

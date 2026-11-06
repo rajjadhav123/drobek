@@ -1,7 +1,6 @@
 /**
- * @drobek/tenancy — U4 workspaces (personal + team), the 3 membership roles +
- * global super-admin override, and Redis-backed invites (PHY-54; PHY-53
- * integration model): heavy logic lives HERE; apps/web in this repo AND the
+ * @drobek/tenancy — workspaces (personal + team), the 3 membership roles +
+ * global super-admin override, and Redis-backed invites: heavy logic lives HERE; apps/web in this repo AND the
  * private drobek-web app register thin route files that re-export the route
  * modules under `@drobek/tenancy/routes/*` — exactly like @drobek/auth.
  */
@@ -56,9 +55,58 @@ export {
   resolveAcceptedRole,
   acceptInvite,
   acceptInviteUrl,
+  listPendingInvites,
+  revokeInvite,
+  inviteMember,
+  normalizeInviteEmail,
+  defaultMemberInviteDeps,
   type InviteRecord,
   type AcceptInviteResult,
+  type PendingInvite,
+  type InviteMemberResult,
+  type MemberInviteDeps,
 } from './invites.server.js';
+export {
+  MembershipError,
+  assertMemberRemovable,
+  changeMemberRole,
+  findWorkspaceMember,
+  removeMember,
+  type MembershipActor,
+  type MembershipErrorCode,
+  type RemoveResult,
+  type RoleChangeResult,
+} from './members.server.js';
+export {
+  DeletionError,
+  accountDeletionPlan,
+  assertWorkspaceDeletable,
+  deleteAccount,
+  deleteWorkspace,
+  workspaceDeletionSummary,
+  type AccountDeletionPlan,
+  type AccountWorkspace,
+  type AppDeletionHooks,
+  type DeletedAccount,
+  type DeletedWorkspace,
+  type DeletionErrorCode,
+  type WorkspaceDeleteActor,
+  type WorkspaceDeletionSummary,
+} from './deletion.server.js';
+export {
+  ACCOUNT_DELETE_OTP_SCOPE,
+  checkAccountDeleteCode,
+  sendAccountDeleteCode,
+  type AccountDeleteCodeResult,
+} from './account-code.server.js';
+export {
+  EMAIL_CHANGE_OTP_SCOPE,
+  confirmEmailChange,
+  emailChangeCodeScope,
+  requestEmailChange,
+  type EmailChangeConfirmResult,
+  type EmailChangeRequestResult,
+} from './email-change.server.js';
 export {
   renderInviteEmail,
   sendInviteEmail,

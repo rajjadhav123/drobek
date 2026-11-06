@@ -10,7 +10,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('sendInviteEmail — the operator transport (NSO-361)', () => {
+describe('sendInviteEmail — the operator transport', () => {
   it('EMAIL_TRANSPORT=resend: the workspace invite goes out through the Resend API', async () => {
     vi.stubEnv('EMAIL_TRANSPORT', 'resend');
     vi.stubEnv('RESEND_API_KEY', KEY);
@@ -33,6 +33,9 @@ describe('sendInviteEmail — the operator transport (NSO-361)', () => {
     expect(acceptUrl).toBe('https://apps.example.org/invite/tok');
     const mail = renderInviteEmail({ workspaceName: 'Acme', role: 'editor', acceptUrl }, env);
     expect(mail.html).toContain(`<a href="${acceptUrl}"`);
+    expect(mail.html).toContain('data-drobek-email="header"');
+    expect(mail.html).toContain('data-drobek-email="button"');
+    expect(mail.html).toContain('data-drobek-email="footer"');
     expect(mail.html).toContain('Sent by the drobek server at apps.example.org');
     expect(mail.text).toContain('on the drobek server at apps.example.org as editor');
     expect(mail.text).toContain(`Accept the invitation: ${acceptUrl}`);

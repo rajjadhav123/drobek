@@ -176,6 +176,97 @@
       "when": 1790525800000,
       "tag": "0029_gallery_likes",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1790681537145,
+      "tag": "0030_module_jobs",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1790686066663,
+      "tag": "0031_version_typecheck",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1790869000706,
+      "tag": "0032_access_token_lineage",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1790943594501,
+      "tag": "0033_app_purge",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1790947732244,
+      "tag": "0034_workspace_account_delete",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1790947800000,
+      "tag": "0035_render_signal",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1790947900000,
+      "tag": "0036_app_versions_creator_idx",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1790948000000,
+      "tag": "0037_app_versions_kept",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1790948100000,
+      "tag": "0038_upstreams_allow_streaming",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1790948200000,
+      "tag": "0039_feedback",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1790948300000,
+      "tag": "0040_app_traffic",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1790948400000,
+      "tag": "0041_feedback_screenshots",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1790948500000,
+      "tag": "0042_app_screenshots",
+      "breakpoints": true
     }
   ]
 }

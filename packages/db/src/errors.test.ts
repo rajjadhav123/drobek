@@ -2,7 +2,13 @@ import { PGlite } from '@electric-sql/pglite';
 import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/pglite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { dbErrorForLog, isUniqueViolation, pgErrorCode } from './errors.js';
+import {
+  dbErrorForLog,
+  isForeignKeyViolation,
+  isQueryTimeout,
+  isUniqueViolation,
+  pgErrorCode,
+} from './errors.js';
 
 const EMAIL = 'bob.secret@corp.example';
 
@@ -24,6 +30,8 @@ beforeAll(async () => {
   db = drizzle(pg);
   await pg.exec('create table people (id text primary key, email text not null constraint people_email_unique unique, n int)');
   await db.execute(sql`insert into people (id, email, n) values ('a', ${EMAIL}, 1)`);
+  await pg.exec('create table pets (id text primary key, owner text not null references people (id))');
+  await pg.exec("insert into pets (id, owner) values ('p', 'a')");
 });
 
 afterAll(async () => {
@@ -35,6 +43,14 @@ describe('real driver errors (PGlite through drizzle)', () => {
     const err = await failing(sql`insert into people (id, email, n) values ('b', ${EMAIL}, 2)`);
     expect(pgErrorCode(err)).toBe('23505');
     expect(isUniqueViolation(err)).toBe(true);
+    expect(isForeignKeyViolation(err)).toBe(false);
+  });
+
+  it('reads SQLSTATE 23503 of a foreign-key violation', async () => {
+    const err = await failing(sql`delete from people where id = 'a'`);
+    expect(pgErrorCode(err)).toBe('23503');
+    expect(isForeignKeyViolation(err)).toBe(true);
+    expect(isUniqueViolation(err)).toBe(false);
   });
 
   it('drizzle ≥ 0.44 wraps the driver error: no code on the wrapper, the bound values in its message', async () => {
@@ -63,6 +79,18 @@ describe('real driver errors (PGlite through drizzle)', () => {
     expect(isUniqueViolation(err)).toBe(false);
     expect(dbErrorForLog(err)).toBe('db error 22P02');
     expect(dbErrorForLog(err, { stack: true })).not.toContain(EMAIL);
+  });
+
+  it('recognises a query cut off by statement_timeout (57014) or lock_timeout (55P03)', async () => {
+    const raise = (code: string) => failing(sql.raw(`do $$ begin raise exception 'cut off' using errcode = '${code}'; end $$`));
+    const canceled = await raise('query_canceled');
+    expect(pgErrorCode(canceled)).toBe('57014');
+    expect(isQueryTimeout(canceled)).toBe(true);
+    const lock = await raise('lock_not_available');
+    expect(pgErrorCode(lock)).toBe('55P03');
+    expect(isQueryTimeout(lock)).toBe(true);
+    expect(dbErrorForLog(lock)).toBe('db error 55P03');
+    expect(isQueryTimeout(await failing(sql`insert into people (id, email, n) values ('b', ${EMAIL}, 2)`))).toBe(false);
   });
 });
 
@@ -98,6 +126,13 @@ describe('driver / drizzle shapes', () => {
     expect(text.split('\n')[0]).toBe('db error 23505 (constraint apps_slug_unique, table apps)');
     expect(text).not.toContain(EMAIL);
     expect(text).not.toContain('Failed query');
+  });
+
+  it('a postgres.js timeout under a DrizzleQueryError is a query timeout; a connect timeout is not', () => {
+    expect(isQueryTimeout(drizzleWrapped(postgresJs('57014')))).toBe(true);
+    expect(isQueryTimeout(drizzleWrapped(postgresJs('55P03')))).toBe(true);
+    expect(isQueryTimeout(drizzleWrapped(Object.assign(new Error('write CONNECT_TIMEOUT'), { code: 'CONNECT_TIMEOUT' })))).toBe(false);
+    expect(isQueryTimeout(new Error('statement timeout'))).toBe(false);
   });
 
   it('reads a bare postgres.js error (drizzle ≤ 0.43)', () => {

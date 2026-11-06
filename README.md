@@ -7,18 +7,35 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![Image](https://img.shields.io/badge/image-ghcr.io%2Ffreema%2Fdrobek-2496ed)](https://github.com/freema/drobek/pkgs/container/drobek)
 
-> Open-source hosting for small web apps your own AI agent builds.
+> Open-source vibe coding hosting: your AI agent builds the web app, drobek
+> compiles, previews and publishes it.
 
 Bring Claude, Claude Code, Cursor or Codex. Your agent connects over MCP,
 writes the app directly into a workspace and gets compile feedback and a
 live preview. You decide when to publish. Platform modules supply sign-in,
-data, forms, e-mail, uploads and external APIs; a dashboard gives you control
-over the app, its users and its secrets.
+data, forms, e-mail, uploads, external APIs and scheduled imports; a
+dashboard gives you control over the app, its users and its secrets.
+Built something as a Claude artifact? Your agent moves its files over
+unchanged and hands you a preview.
+
+An open-source, self-hostable alternative to Lovable, Bolt.new and v0 for
+people who already have an agent: drobek has no chat of its own, the agent
+you use does the building, and drobek compiles, versions, previews and
+hosts what it writes.
 
 **[Try drobek.app](https://drobek.app/login)** ·
 **[Self-host](#self-host-quickstart)** ·
 **[Gallery](https://www.drobek.app/gallery)** ·
 **[Docs](https://www.drobek.app/docs)**
+
+[![Watch the 33-second drobek demo on YouTube](./docs/assets/demo-poster.png)](https://youtu.be/TGG5SZ091hg)
+
+The [proxy module in 35 seconds](https://youtu.be/EeUG2dwL4qI): your agent
+registers an outside API, an admin confirms who can call it, and the key
+you type into the dashboard never reaches the app or the agent.
+
+MCP Registry name: [`io.github.freema/drobek`](./server.json). The hosted
+Streamable HTTP endpoint is `https://drobek.app/mcp` and uses OAuth 2.1.
 
 ## Choose where to run it
 
@@ -34,12 +51,17 @@ connect to either instance.
 
 ## See what people build
 
+- [Drobek Tycoon](https://drobek-tycoon.drobek.app/) — a playable hosting-company simulator with three levels.
+- [Pokédex](https://pokedex.drobek.app/) — PokéAPI search and stats through drobek's proxy module, with a live request log.
+- [Pixel Wall](https://pixel-zed.drobek.app/) — a shared 64 × 40 canvas backed by auth, data and other platform modules.
 - [Pixel Crumbs](https://pixel-crumbs.drobek.app/) — a browser pixel-art and animation editor.
 - [Drobek Skok](https://drobek-skok.drobek.app/) — a pixel platformer with a leaderboard.
 - [Pekárna Drobek](https://pek-rna-drobek.drobek.app/) — a small bakery's demo website.
 
 These are public apps on drobek.app. [Browse the gallery](https://www.drobek.app/gallery)
 for more examples.
+
+[![Drobek Tycoon running on drobek](./docs/assets/drobek-tycoon.jpg)](https://drobek-tycoon.drobek.app/)
 
 ## Build your first app
 
@@ -270,7 +292,8 @@ clients: `NODE_EXTRA_CA_CERTS=drobek-root.crt`). App hosts are
 carries the port.
 <!-- quickstart:end -->
 
-Backups (`task backup` / `task restore`), upgrades (`task selfhost:upgrade`),
+Backups (`task backup`, `task backup:verify`, `task restore`), upgrades
+(`task selfhost:upgrade`), rotating `DROBEK_MASTER_KEY` (`task selfhost:rekey`),
 the three TLS paths, custom domains, abuse handling and every setting:
 [`docs/SELF-HOSTING.md`](./docs/SELF-HOSTING.md).
 
@@ -293,15 +316,26 @@ to, with your role in each.
 - **Scripts / CI:** a personal `drk_…` API key from `/me/api-keys` as
   `Authorization: Bearer drk_…`.
 
-The agent gets twenty-four tools — `list_apps`, `create_app`, `duplicate_app`, `get_app`,
-`read_file`, `write_files`, `restore_version`, `publish`,
-`set_gallery_listing`, `skill_info`, `configure_module`, `query_data`,
-`get_logs`, for video, audio, images and fonts `create_asset_upload`,
+The agent gets these tools — `list_apps`, `create_app`, `duplicate_app`, `get_app`,
+`read_file`, `write_files`, `restore_version`, for the version history
+`list_versions`, `keep_version`, `delete_versions`, `publish`,
+`set_gallery_listing`, for the app's settings and lifecycle `unpublish`,
+`set_visibility`, `set_frame_ancestors`, `release_lease`, `delete_app`,
+`skill_info`, `configure_module`, `query_data`, for the app's stored data
+`create_records`, `update_record`, `delete_record`, `delete_collection`,
+`purge_orphan_records`, `get_logs`, for visitor numbers `get_analytics`, for video, audio, images and fonts `create_asset_upload`,
 `list_assets`, `delete_asset` (an upload URL — the file never passes through
-the model), and for custom domains `list_domains`, `add_domain`,
+the model), for the owner's module tabs `list_form_submissions`,
+`delete_form_submission`, `list_end_users`, `set_end_user_role`,
+`set_end_user_blocked`, `sign_out_end_users`, `list_uploads`,
+`delete_upload`, `remove_module_secret` and `list_activity`, for the notes members leave with the preview's Feedback button `list_feedback`, `get_feedback_screenshot` (a screenshot attached to a note, as an image), `resolve_feedback` and `delete_feedback`, to see what the user sees `request_screenshot` (a Capture bar on the open preview) and `get_screenshot`, and for custom domains `list_domains`, `add_domain`,
 `verify_domain`, `set_primary_domain`, `remove_domain`, and for the proxy
 module's external APIs `list_upstreams`, `register_upstream`,
-`remove_upstream` (a super-admin also gets `set_workspace_publishing`). The full agent contract (scopes,
+`set_upstream_streaming`, `remove_upstream`, `sync_now` for the sync module's scheduled imports, and
+for workspaces `create_workspace`, `list_members`, `invite_member`,
+`set_member_role`, `remove_member` and `delete_workspace` (a super-admin also
+gets `set_workspace_publishing`, `set_workspace_module`, `takedown_app`,
+`restore_app` and `set_gallery_hidden`). The full agent contract (scopes,
 the briefing, skills, `/llms.txt`) is [`docs/AGENT.md`](./docs/AGENT.md); a
 running server serves it at `/llms.txt`, `/llms-full.txt` and
 `/build-with-your-agent`. To teach an agent the loop without the plugin:
@@ -328,8 +362,9 @@ task dev          # or: docker compose up -d --build
 | redis 7 | 6391 | `redis-cli ping` |
 | mailpit (dev SMTP sink) | [8025](http://localhost:8025) | the login codes land here |
 
-The dev stack runs every built-in module plus the example
-`drobek-module-hello`. Sign in at [localhost:3041](http://localhost:3041)
+The dev stack runs every built-in module plus the examples
+`drobek-module-hello` and `drobek-module-acme-crm` (opt-in, installed into
+`./.modules` by `task dev`). Sign in at [localhost:3041](http://localhost:3041)
 (the code is in Mailpit), then point your agent at
 `http://localhost:3041/mcp`.
 
@@ -418,9 +453,30 @@ build the production image, start it with `docker-compose.e2e.yaml` (project
 `drobek-e2e`, its own loopback ports, so it runs next to the dev stack) behind
 Caddy with `tls internal` on `https://localhost:8443` and
 `https://<slug>--preview.apps.localhost:8443`, let it migrate a fresh DB, then
-run `@smoke` + `@local` and tear everything down. `DROBEK_IMAGE=…` skips the
-build, `E2E_KEEP=1` keeps the stack, extra args go to Playwright
-(`task e2e:image -- tests/mcp-loop.spec.ts`).
+run `@smoke` + `@local` (phase 1), recreate drobek with
+`EMAIL_TRANSPORT=relay` and `PUBLISH_APPROVAL=approval` and run the specs that
+need them (phase 2), and tear everything down. A skip guard
+(`scripts/e2e-skip-guard.mjs`) then fails the run when a test of the suite ran
+in neither phase. The image runs `NODE_ENV=production`, which ignores the dev
+stack's shortcuts, so the e2e stack brings production-shaped stand-ins: the
+mock IdP (`tests-e2e/mock-oidc.mjs`) behind Caddy over https as the server's
+`AUTH_OIDC_ISSUER`, a DNS server (`tests-e2e/dns-mock.mjs`) as
+`DOMAINS_DNS_SERVERS` that answers from the same Redis keys as the dev DNS
+mock, and drobek's own port on `127.0.0.1:3451` for what only Caddy sends (the
+TLS ask, a client `X-Real-IP`). `DROBEK_IMAGE=…` skips the build, `E2E_KEEP=1`
+keeps the stack, extra args replace the phases with one Playwright run
+(`task e2e:image -- tests/mcp-loop.spec.ts`; `E2E_PHASE=2` runs it against the
+phase-2 configuration).
+
+Both stacks install two external modules the way an operator does:
+`examples/drobek-module-acme-crm` and the operator-only test fixture
+`tests-e2e/fixtures/drobek-module-ops-probe` (`task module:example` and
+`task module:fixture` for the dev stack, `scripts/e2e-image.sh` for the image
+flow). The fixture is the error reporter of both (`ERROR_REPORTER=capture`:
+reports land on the e2e's `proxy-echo`, where the specs read them back) and
+the dev stack's e-mail transport (`EMAIL_TRANSPORT=relay`: every message goes
+to Mailpit over its HTTP API); the image flow keeps the built-in SMTP in its
+first phase and switches to the relay in the second.
 
 ## Versions and upgrades
 
@@ -431,7 +487,8 @@ immutable image `ghcr.io/freema/drobek:vX.Y.Z`, a
 [`CHANGELOG.md`](./CHANGELOG.md); `latest` and `previous` move with each
 release ([`docs/SELF-HOSTING.md` → Image tags](./docs/SELF-HOSTING.md#image-tags)).
 Migrations only go forward and run as their own step of
-`task selfhost:upgrade`; a rollback is the previous image plus, when the
+`task selfhost:upgrade`; an image older than the database refuses to start
+and names the release to run, and a rollback is the previous image plus, when the
 release migrated the database, the backup taken before it
 ([Upgrades and rollback](./docs/SELF-HOSTING.md#upgrades-and-rollback)).
 Modules declare the contract range they need, and the server refuses to start
@@ -455,7 +512,8 @@ it under the name module code imports, `@drobek/modules`
 [`docs/MODULES.md` → Writing a module](./docs/MODULES.md#writing-a-module)
 walks through the contract, publishing and installing;
 [`examples/drobek-module-hello`](./examples/drobek-module-hello) is a working
-one, and [Published modules](./docs/MODULES.md#published-modules) lists the
+one, [`examples/drobek-module-acme-crm`](./examples/drobek-module-acme-crm)
+an opt-in one installed without an image, and [Published modules](./docs/MODULES.md#published-modules) lists the
 modules others can install.
 
 ## Contributing

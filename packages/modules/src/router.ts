@@ -1,5 +1,5 @@
 /**
- * ModuleRouter (M1-01): the route table of one module and the request
+ * ModuleRouter: the route table of one module and the request
  * pipeline every module route goes through, in this order —
  *
  *   1. match method + path (404 / 405);
@@ -156,7 +156,7 @@ export interface PipelineRequest {
 
 export interface PipelineResult {
   status: number;
-  headers: Record<string, string>;
+  headers: Record<string, string | string[]>;
   /** A Node Readable is streamed by the adapter (and destroyed unread for HEAD). */
   body: Buffer | string | Readable | null;
 }
@@ -188,7 +188,7 @@ function isResponse(v: unknown): v is ModuleResponse {
   return typeof v === 'object' && v !== null && (v as ModuleResponse).__drobekResponse === true;
 }
 
-function json(status: number, body: unknown, headers: Record<string, string> = {}): PipelineResult {
+function json(status: number, body: unknown, headers: Record<string, string | string[]> = {}): PipelineResult {
   return {
     status,
     headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers },
@@ -264,8 +264,8 @@ async function readRequestBody(req: PipelineRequest, limit: number, types: Reado
 /**
  * The counter key of a route rate limit, or null = skip it: a per-IP key (an
  * `ip` limit, or `principal` for an anonymous caller) needs a resolved client
- * IP — without one there is no bucket rather than a shared `unknown` one
- * (NSO-328); the handler's own per-app / per-principal limits still apply.
+ * IP — without one there is no bucket rather than a shared `unknown` one;
+ * the handler's own per-app / per-principal limits still apply.
  */
 function rateKey(per: 'ip' | 'app' | 'principal', req: PipelineRequest, principal: Principal, label: string): string | null {
   if (per === 'app') return 'app';

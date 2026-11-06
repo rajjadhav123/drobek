@@ -1,5 +1,5 @@
 /**
- * @drobek/modules — the platform module contract and runtime (M1-01).
+ * @drobek/modules — the platform module contract and runtime.
  *
  * A module is PLATFORM code the operator installs (`DROBEK_MODULES`): server
  * routes under `/__drobek/v1/<module>/…` on the app hosts, a slice of the
@@ -7,112 +7,15 @@
  * sets with `configure_module`, and a skill the agent reads with `skill_info`.
  * App code is never executed by the server — only modules are.
  *
- * Module authors: `defineModule`, `z`, `respond`, `ModuleError` (+ types,
- * including `DB`, `Logger` and `SdkCore`, so a module needs no other drobek
- * package); tests: `@drobek/modules/testing`. The contract is docs/MODULES.md.
+ * This entry is the in-repo surface: the public contract (public.ts, what
+ * the npm package publishes) plus the runtime, registry and loader the
+ * server wires together. Module authors use the contract and
+ * `@drobek/modules/testing`; the contract is docs/MODULES.md.
  */
-export { z } from 'zod';
-export type { DB } from '@drobek/db';
-export type { Logger } from '@drobek/core';
-export type { SdkCore } from '@drobek/sdk';
-export {
-  MODULE_CONTRACT_VERSION,
-  MODULE_ERROR_CODE_RE,
-  MODULE_NAME_RE,
-  SLOT_NAME_RE,
-  RECORDS_IMPORT_MAX_ROWS,
-  defineModule,
-  isDefinedModule,
-  respond,
-  type AccessDecision,
-  type AnyModule,
-  normalizeConfirmItems,
-  type ConfirmContext,
-  type ConfirmItem,
-  type ConfirmRole,
-  type ConfirmedContext,
-  type ComposedModuleParts,
-  type DrobekModule,
-  type EmailKind,
-  type EmailMessage,
-  type EmailRecipient,
-  type EndUser,
-  type EndUserAuthority,
-  type EndUserCallbackApp,
-  type EndUserCallbackInput,
-  type EndUserCallbackResult,
-  type EndUserListQuery,
-  type EndUserPage,
-  type EndUserRecord,
-  type FilesAuthority,
-  type OwnerFile,
-  type OwnerFilesPage,
-  type OwnerSubmission,
-  type OwnerView,
-  type SubmissionsAuthority,
-  type SubmissionsPage,
-  type SubmissionsQuery,
-  type HookApp,
-  type Limits,
-  type MailAuthority,
-  type MailEnvelope,
-  type MailPrepareInput,
-  type ModuleAvailability,
-  type ModuleComposeInput,
-  type ModuleContext,
-  type ModuleDashboard,
-  type ModuleDashboardEditor,
-  type ModuleErrorDoc,
-  type ModuleHooks,
-  type ModuleAppView,
-  type ModuleLimit,
-  type ModuleMigrations,
-  type ModuleRequest,
-  type ModuleResponse,
-  type ModuleRouter,
-  type ModuleSdk,
-  type ModuleSecretDoc,
-  type ModuleServices,
-  type ModuleSkill,
-  type ModuleSlot,
-  type Principal,
-  type RateLimitResult,
-  type RecordsAuthority,
-  type RecordsCollection,
-  type RecordsPage,
-  type RecordsQuery,
-  type RecordsView,
-  type RouteHandler,
-  type RouteOptions,
-  type RouteRateLimit,
-  type Rule,
-  type UploadedFile,
-} from './contract.js';
-export {
-  AUTH_PROVIDER_ID_RE,
-  AUTH_RESERVED_CONFIG_KEYS,
-  EMAIL_PROVIDER_ID,
-  authIdentitySchema,
-  authProviderSchema,
-  authSignedInObserverSchema,
-  defineAuthProvider,
-  defineSignInObserver,
-  type AuthIdentity,
-  type AuthProvider,
-  type AuthProviderBeginInput,
-  type AuthProviderBeginResult,
-  type AuthProviderCallbackInput,
-  type AuthProviderSecretDoc,
-  type AuthProviderSecrets,
-  type AuthSignInEvent,
-  type AuthSignedInObserver,
-} from './auth-provider.js';
-export { CORE_ERROR_CODES, MODULE_ERROR_CODES, ModuleError, isModuleError, moduleNotEnabled, skillHint, issuePaths, type ModuleErrorBody, type ModuleErrorCode } from './errors.js';
-export { RULE_TOKENS, decideAccess, isValidRule, parseRule, ruleIsPublic } from './rules.js';
-/** Per-client-IP bucket keys for a module's own per-IP limits (null = no resolved IP → skip it; NSO-328). */
-export { perIpLimitKey } from '@drobek/core';
-/** Byte sniffing shared with app assets (NSO-358): a module decides a stored file's type from its bytes. */
-export { hasControlBytes, looksLikeSvg, sniffSignature, type SniffedType } from '@drobek/core';
+export * from './public.js';
+export { selectEmailTransport } from './email-transport-slot.js';
+export { selectErrorReporter } from './error-reporter-slot.js';
+export { ModuleLoadError } from './errors.js';
 export { mergePatch, jsonEqual } from './merge-patch.js';
 export { Lru, jsonKey, stableJson } from './memo.js';
 export {
@@ -139,17 +42,27 @@ export {
   endUserCookiesSecure,
   endUserEpochKey,
   endUserSessionKey,
+  forgetEndUserSessions,
   loadEndUserSession,
   parseEndUserSession,
   readEndUserToken,
   renewEndUserSession,
   revokeEndUserSessions,
   type EndUserRedis,
+  type EndUserScanRedis,
   type CurrentEndUser,
   type EndUserSession,
   type PrincipalResolver,
 } from './principal.js';
 export { SECRET_NAME_RE, SECRET_MAX_BYTES, SecretStoreError, deleteModuleSecret, getModuleSecret, secretsSet, secretsStatus, setModuleSecret } from './secrets.server.js';
+export {
+  previousMasterKeyConfigError,
+  rekeyReport,
+  rekeySecrets,
+  storedSecretKeysCheck,
+  type RekeyCounts,
+  type SecretKeysVerdict,
+} from './secret-keys.server.js';
 export { readConfigRow, type ConfigRow, type PendingChange } from './configs.server.js';
 export { PENDING_MAIL_WINDOW_MS, pendingMail, pendingMailKey, type PendingMail, type PendingMailModule } from './pending-mail.js';
 export {
@@ -192,8 +105,8 @@ export {
 export { MAX_FILE_HEAD_BYTES, multipartBoundary, parseMultipart, streamMultipartFile } from './multipart.js';
 export { SDK_HEADER, DEFAULT_MAX_BODY_BYTES, isReadable, type PipelineRequest, type PipelineResult } from './router.js';
 export { csvChunks } from './csv-stream.js';
+export { endModuleStreams, moduleStreamsEnding, onModuleStreamsEnd, resetModuleStreamsForTests } from './streams.js';
 export {
-  ModuleLoadError,
   RESERVED_MODULE_NAMES,
   checkErrorCodes,
   checkModuleSet,
@@ -207,17 +120,21 @@ export {
   recordsAuthorityOf,
   submissionsAuthorityOf,
   filesAuthorityOf,
+  syncAuthorityOf,
+  upstreamsAuthorityOf,
+  isAppFacing,
   loadModules,
   loadModuleSet,
   packageNameFor,
   parseModuleList,
+  type AppFacingModule,
   type LoadedModules,
   type ModuleOrigin,
   type ModuleSource,
   type SlotContribution,
 } from './registry.js';
 export { DEFAULT_MODULES_DIR } from './dir-modules.js';
-// NSO-340: the module configs of a duplicated gallery app, proposed through the copy's confirmation flow.
+// The module configs of a duplicated gallery app, proposed through the copy's confirmation flow.
 export {
   NOT_COPIED_MODULES,
   configForCopy,
@@ -242,10 +159,15 @@ export {
   type BoundFiles,
   type BoundRecords,
   type BoundSubmissions,
+  type BoundSync,
+  type BoundWebhooks,
+  type RunActor,
   type ConfigureInput,
   type ConfigureResult,
   type DecisionInput,
   type EmailTransport,
+  type JobAppRow,
+  type JobRunInput,
   type ModuleDashboardView,
   type PendingView,
   type PlatformMailParts,
@@ -259,7 +181,27 @@ export {
   type RateLimiter,
   type RuntimeDeps,
   type SkillInfo,
+  type SkillJob,
   type SkillListItem,
   type WorkspaceModuleSource,
   type WorkspaceModuleState,
 } from './runtime.js';
+export {
+  DEFAULT_MODULE_JOBS_CONCURRENCY,
+  DEFAULT_MODULE_JOBS_TIMEOUT_MS,
+  MODULE_JOBS_TICK_MS,
+  ModuleJobScheduler,
+  jobBackoffMs,
+  jobDueAt,
+  jobStateKey,
+  memoryJobStateStore,
+  moduleJobsSettingsFromEnv,
+  redisJobStateStore,
+  startModuleJobs,
+  type JobLease,
+  type JobState,
+  type JobStateStore,
+  type ModuleJobFailureRecord,
+  type ModuleJobSchedulerOptions,
+  type ModuleJobsSettings,
+} from './jobs.js';

@@ -15,7 +15,7 @@ const ev = (action: string, subjectType: string | null, subject: string | null, 
   meta,
 });
 
-describe('activitySummary (NSO-371)', () => {
+describe('activitySummary', () => {
   it('reads the events the review named as sentences', () => {
     expect(activitySummary(ev('app.publish', 'app', 'pokedex', { version: 3, previousVersion: 2, assets: 0 }))).toBe(
       'Published version 3 (replacing version 2)'
@@ -27,11 +27,106 @@ describe('activitySummary (NSO-371)', () => {
     expect(
       activitySummary(ev('proxy.upstream.create', 'upstream', 'up_1', { name: 'github', authType: 'bearer', methods: ['GET'], pathPrefixes: ['/'] }))
     ).toBe('Registered the proxy upstream github');
+    expect(activitySummary(ev('proxy.upstream.update', 'upstream', 'up_1', { name: 'anthropic', allowStreaming: true }))).toBe(
+      'Turned streaming on for the proxy upstream anthropic'
+    );
+    expect(activitySummary(ev('proxy.upstream.update', 'upstream', 'up_1', { name: 'anthropic', allowStreaming: false }))).toBe(
+      'Turned streaming off for the proxy upstream anthropic'
+    );
     expect(activitySummary(ev('app.version.restore', 'app', 'x', { version: 7, restoredFrom: 4 }))).toBe(
       'Restored the files of version 4 as version 7'
     );
+    expect(activitySummary(ev('app.versions.prune', 'app', 'x', { appId: 'a', versions: 12, from: 1, to: 14, keep: 200 }))).toBe(
+      'The history retention deleted 12 old versions (versions 1–14)'
+    );
+    expect(activitySummary(ev('app.versions.prune', 'app', 'x', { versions: 1, from: 3, to: 3 }))).toBe(
+      'The history retention deleted 1 old version (version 3)'
+    );
+    expect(activitySummary(ev('app.versions.delete', 'app', 'x', { count: 30, from: 3, to: 41, failedOnly: false }))).toBe(
+      'Deleted 30 old versions (versions 3–41)'
+    );
+    expect(activitySummary(ev('app.versions.delete', 'app', 'x', { count: 1, from: 5, to: 5, failedOnly: true }))).toBe(
+      'Deleted 1 failed build (version 5)'
+    );
+    expect(activitySummary(ev('app.version.keep', 'app', 'x', { version: 12 }))).toBe(
+      'Kept version 12 — the history clean-up leaves it alone'
+    );
+    expect(activitySummary(ev('app.version.unkeep', 'app', 'x', { version: 12 }))).toBe('Stopped keeping version 12');
+    expect(activityRefs(ev('app.version.keep', 'app', 'x', { version: 12 }))).toContainEqual({ kind: 'version', slug: 'x', number: 12 });
+    expect(activitySummary(ev('app.feedback.create', 'app', 'x', { feedback: 'fb_1', version: 4 }))).toBe(
+      'Left a feedback note on the preview of version 4'
+    );
+    expect(activitySummary(ev('app.feedback.create', 'app', 'x', { feedback: 'fb_1' }))).toBe('Left a feedback note on the preview');
+    expect(activitySummary(ev('app.feedback.create', 'app', 'x', { feedback: 'fb_1', version: 4, label: 'button "Send"' }))).toBe(
+      'Left a feedback note on the preview of version 4 about button "Send"'
+    );
+    expect(activitySummary(ev('app.feedback.create', 'app', 'x', { feedback: 'fb_1', version: 2, screenshot: true }))).toBe(
+      'Left a feedback note on the preview of version 2 with a screenshot'
+    );
+    expect(activityRefs(ev('app.feedback.create', 'app', 'x', { version: 4 }))).toContainEqual({ kind: 'version', slug: 'x', number: 4 });
+    expect(activitySummary(ev('app.feedback.resolve', 'app', 'x', { feedback: 'fb_1' }))).toBe('Resolved a feedback note');
+    expect(activitySummary(ev('app.feedback.reopen', 'app', 'x', { feedback: 'fb_1' }))).toBe('Reopened a feedback note');
+    expect(activitySummary(ev('app.feedback.delete', 'app', 'x', { feedback: 'fb_1' }))).toBe('Deleted a feedback note');
+    expect(activitySummary(ev('app.screenshot.request', 'app', 'x', { request: 'ss_1', version: 3 }))).toBe('Asked the preview of version 3 for a screenshot');
+    expect(activitySummary(ev('app.screenshot.capture', 'app', 'x', { request: 'ss_1', version: 3, browser: 'chrome' }))).toBe(
+      'Sent a screenshot of the preview of version 3 to the agent that asked for it'
+    );
+    expect(activitySummary(ev('app.screenshot.decline', 'app', 'x', { request: 'ss_1' }))).toBe('Declined to send a screenshot of the preview (Not now)');
+    expect(activityRefs(ev('app.screenshot.capture', 'app', 'x', { version: 3 }))).toContainEqual({ kind: 'version', slug: 'x', number: 3 });
     expect(activitySummary(ev('domain.add', 'domain', 'shop.example.com', { app: 'x' }))).toBe('Added the custom domain shop.example.com');
     expect(activitySummary(ev('app.gallery_unlisted', 'app', 'x', { reason: 'takedown' }))).toContain('taken down');
+    expect(activitySummary(ev('app.purge', 'app', 'x', { appId: 'app_0' }))).toBe('Deleted the app’s versions and data for good');
+  });
+
+  it('reads the member changes', () => {
+    expect(activitySummary(ev('member.remove', 'member', 'u_1', { role: 'editor' }))).toBe('Removed a member (editor) from the workspace');
+    expect(activitySummary(ev('member.leave', 'member', 'u_1', { role: 'viewer' }))).toBe('A member (viewer) left the workspace');
+    expect(activitySummary(ev('member.invite_revoke', 'member', null, { role: 'editor' }))).toBe('Revoked a pending invite for the editor role');
+    expect(activitySummary(ev('member.leave', 'member', 'u_1', { role: 'editor', reason: 'account_deleted' }))).toBe(
+      'A member (editor) deleted their account and left the workspace'
+    );
+    expect(activitySummary(ev('member.role_change', 'member', 'u_1', { from: 'editor', to: 'viewer' }))).toBe(
+      'Changed a member’s role from editor to viewer'
+    );
+  });
+
+  it('reads a workspace and an account deletion', () => {
+    expect(activitySummary(ev('workspace.delete', 'workspace', 'acme', { apps: 2, members: 3 }))).toBe('Deleted the workspace /acme with 2 apps');
+    expect(activitySummary(ev('workspace.delete', 'workspace', 'solo', { apps: 1, members: 1, with_account: true }))).toBe(
+      'Deleted the workspace /solo with 1 app together with the account'
+    );
+    expect(activitySummary(ev('workspace.delete', 'workspace', null, { apps: 0, members: 1, with_account: true }))).toBe(
+      'Deleted the personal workspace with 0 apps together with the account'
+    );
+    expect(activitySummary(ev('account.delete', 'account', 'u_1', { workspaces_deleted: 1, workspaces_left: 0 }))).toBe('Deleted the account');
+    expect(activityRefs(ev('workspace.delete', 'workspace', 'acme', {}))).toEqual([]);
+    expect(activityRefs(ev('account.delete', 'account', 'u_1', {}))).toEqual([]);
+  });
+
+  it('reads a sign-in e-mail change, with the super-admin rights it moved', () => {
+    expect(activitySummary(ev('account.email_change', 'account', 'u_1', null))).toBe('Changed the sign-in e-mail');
+    expect(activitySummary(ev('account.email_change', 'account', 'u_1', { super_admin: 'gained' }))).toBe(
+      'Changed the sign-in e-mail to an address with super-admin rights'
+    );
+    expect(activitySummary(ev('account.email_change', 'account', 'u_1', { super_admin: 'lost' }))).toBe(
+      'Changed the sign-in e-mail; the new address has no super-admin rights'
+    );
+    expect(activityRefs(ev('account.email_change', 'account', 'u_1', {}))).toEqual([]);
+  });
+
+  it('reads a scheduled import run and a resume', () => {
+    const run = (meta: unknown) => activitySummary(ev('sync.run', 'app', 'league', meta));
+    expect(run({ module: 'sync', source: 'players', by: 'schedule', status: 'ok', records: 3 })).toBe('The scheduled import players wrote 3 records');
+    expect(run({ module: 'sync', source: 'players', by: 'web', status: 'ok', records: 1 })).toBe('Ran the import players now — it wrote 1 record');
+    expect(run({ module: 'sync', source: 'players', by: 'schedule', status: 'failed', error: 'the upstream answered HTTP 401' })).toBe(
+      'The scheduled import players failed: the upstream answered HTTP 401'
+    );
+    expect(run({ module: 'sync', source: 'players', by: 'schedule', status: 'failed', error: 'the upstream answered HTTP 500', paused: true })).toBe(
+      'The scheduled import players failed: the upstream answered HTTP 500 — the import is paused'
+    );
+    expect(activitySummary(ev('sync.resume', 'app', 'league', { module: 'sync', source: 'players' }))).toBe(
+      'Resumed the scheduled import players after failed runs'
+    );
   });
 
   it('tells a duplicates switch apart from listing and a description change', () => {
@@ -64,7 +159,7 @@ describe('activitySummary (NSO-371)', () => {
   });
 });
 
-describe('activityRefs + resolveActivityRefs (NSO-371)', () => {
+describe('activityRefs + resolveActivityRefs', () => {
   const now = new Date('2026-09-20T12:00:00Z');
   const known: ActivityKnown = {
     workspaceSlug: 'smoke',
@@ -122,6 +217,7 @@ describe('activityRefs + resolveActivityRefs (NSO-371)', () => {
     expect(links(ev('app.create', 'app', 'reused'))).toEqual([{ label: 'reused', href: null, note: 'app deleted' }]);
     expect(links(ev('domain.add', 'domain', 'a.example.com', { app: 'pokedex', app_id: 'app_other' }))[0].href).toBeNull();
     expect(links(ev('app.slug_release', 'app', 'pokedex', { appId: 'app_0' }))).toEqual([]);
+    expect(links(ev('app.purge', 'app', 'pokedex', { appId: 'app_0' }))).toEqual([]);
   });
 
   it('links members and account pages only where the viewer may open them', () => {
@@ -132,7 +228,7 @@ describe('activityRefs + resolveActivityRefs (NSO-371)', () => {
   });
 });
 
-describe('activityDetails (NSO-371)', () => {
+describe('activityDetails', () => {
   it('redacts values under credential-like keys, keeps flags and names', () => {
     const out = activityDetails({
       module: 'email',

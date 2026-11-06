@@ -1,5 +1,5 @@
 /**
- * get_logs (M1-07) — the stored half, over a RESOLVED app id (the MCP tool
+ * get_logs — the stored half, over a RESOLVED app id (the MCP tool
  * authorizes the caller for the app first):
  *
  *  - recordCompile       — one `app_compiles` row per compile a write ran
@@ -7,15 +7,16 @@
  *                          pruned to 30 days / the newest 200 per app;
  *  - (module request counters live in module-stats.server.ts — Redis, flushed
  *    into `module_request_stats` lazily and by queryRequestLog);
- *  - queryRuntimeLog / queryCompileLog / queryRequestLog — the three kinds.
+ *  - queryRuntimeLog / queryCompileLog / queryRequestLog — the three kinds;
+ *  - queryRenderCounts   — one version's page loads and browser errors.
  *
  * Every read is bounded to the retention window (30 days) and ≤ 100 entries.
  * Reads never delete: the periodic prune (prune.server.ts) keeps every table
- * inside its retention, also for apps nobody inspects (NSO-327).
+ * inside its retention, also for apps nobody inspects.
  */
-import { and, desc, eq, gte, lt, sql } from 'drizzle-orm';
+import { and, count, desc, eq, gte, lt, ne, sql } from 'drizzle-orm';
 import { getRedis } from '@drobek/core';
-import { appCompiles, appDailyStats, appErrors, getDb, moduleRequestStats } from '@drobek/db';
+import { appCompiles, appDailyStats, appErrors, appVersionLoads, getDb, moduleRequestStats } from '@drobek/db';
 import { COMPILE_HISTORY_KEEP, LOGS_RETENTION_DAYS } from './limits.js';
 import {
   COMPILE_LOG_LIMIT,
@@ -26,6 +27,7 @@ import {
   runtimeEntries,
   type CompileEntry,
   type DayFailingPaths,
+  type RenderCounts,
   type RequestsEntry,
   type RuntimeEntry,
 } from './logs.js';
@@ -102,6 +104,9 @@ export async function queryRuntimeLog(appId: string, since?: Date | string | nul
       url: appErrors.url,
       createdAt: appErrors.createdAt,
       ts: appErrors.ts,
+      module: appErrors.module,
+      job: appErrors.job,
+      versionNumber: appErrors.versionNumber,
     })
     .from(appErrors)
     .where(and(eq(appErrors.appId, appId), gte(appErrors.createdAt, from)))
@@ -110,6 +115,33 @@ export async function queryRuntimeLog(appId: string, since?: Date | string | nul
   const stacks = new Map<string, string | null>();
   for (const r of rows) if (!stacks.has(r.dedupKey)) stacks.set(r.dedupKey, r.stack);
   return runtimeEntries(dedupErrors(rows).errors, stacks);
+}
+
+/**
+ * The render signal of one version: its page loads and the browser errors
+ * its pages reported inside the retention window (module job failures are no
+ * page's and never count).
+ */
+export async function queryRenderCounts(appId: string, version: number, now: Date = new Date()): Promise<RenderCounts> {
+  const db = getDb();
+  const [loads, errors] = await Promise.all([
+    db
+      .select({ pageLoads: appVersionLoads.pageLoads })
+      .from(appVersionLoads)
+      .where(and(eq(appVersionLoads.appId, appId), eq(appVersionLoads.versionNumber, version))),
+    db
+      .select({ n: count() })
+      .from(appErrors)
+      .where(
+        and(
+          eq(appErrors.appId, appId),
+          eq(appErrors.versionNumber, version),
+          ne(appErrors.type, 'module_job'),
+          gte(appErrors.createdAt, logsWindowStart(null, now))
+        )
+      ),
+  ]);
+  return { page_loads: loads[0]?.pageLoads ?? 0, errors: Number(errors[0]?.n ?? 0) };
 }
 
 /** The last 50 compiles since `since`, newest first. */
@@ -154,10 +186,10 @@ export interface RequestLogOptions {
 /**
  * Mirror the Redis counters of `days` (serving signals + module calls) into
  * app_daily_stats and module_request_stats: ONE pipelined Redis round trip
- * and at most one statement per table, however many days (NSO-327 — the
+ * and at most one statement per table, however many days (the
  * window is up to 31 days). Best-effort: a miss is caught up by the next
  * flush, the counters are cumulative. The same round trip reads the day's
- * failing-path hashes (Redis-only, NSO-380) and answers them.
+ * failing-path hashes (Redis-only) and answers them.
  */
 async function flushRequestDays(appId: string, days: string[], redis: () => RequestLogRedis): Promise<Map<string, DayFailingPaths>> {
   const failing = new Map<string, DayFailingPaths>();

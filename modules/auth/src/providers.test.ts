@@ -1,5 +1,5 @@
 /**
- * Sign-in providers (NSO-348) end to end, without a network: a fixture
+ * Sign-in providers end to end, without a network: a fixture
  * module `authtest` contributes an `auth.provider` (a fake IdP that checks
  * the PKCE verifier) and an `auth.signedIn` observer. The flow runs through
  * the real routes (begin, complete) and the real `endUsers.callback`, with
@@ -37,9 +37,9 @@ vi.mock('@drobek/core', async (importOriginal) => {
   return { ...actual, getRedis: () => fake as unknown as ReturnType<typeof actual.getRedis> };
 });
 
-import auth, { type AuthConfig } from './index.js';
+import auth, { AUTH_CONFIG_DEFAULTS as AUTH_DEFAULTS, type AuthConfig } from './index.js';
 import { COMPLETE_PATH, handoffKey, stateKey } from './flow.js';
-import { connectionOf, notifySignedIn, providerSecrets } from './providers.js';
+import { connectionOf, notifySignedIn, providerLabel, providerSecrets, providersInfo, signInMethods } from './providers.js';
 import { authIdentities, authUsers } from './schema.js';
 import { providerSignIn } from './users.js';
 
@@ -62,6 +62,7 @@ let lastState = '';
 const seenSecrets: (string | null)[] = [];
 
 const testProvider = defineAuthProvider({
+  apiVersion: 2,
   id: 'authtest',
   label: 'Test IdP',
   configSchema: z.strictObject({ issuer: z.url(), clientId: z.string().min(1), prompt: z.string().optional() }),
@@ -89,6 +90,7 @@ const testProvider = defineAuthProvider({
 });
 
 const otherProvider = defineAuthProvider({
+  apiVersion: 2,
   id: 'authtwo',
   label: 'Other IdP',
   configSchema: z.strictObject({}),
@@ -254,6 +256,21 @@ describe('auth providers — slots, config, confirmations', () => {
     expect(composed.configSchema.safeParse({ ...ON, providers: { emailCode: { enabled: true }, saml: { enabled: true } } }).success).toBe(false);
   });
 
+  it('refuses the start with a provider written for auth provider API 1 (no apiVersion, no issuer)', () => {
+    const { apiVersion: _, ...v1 } = otherProvider;
+    const legacy = defineModule<Record<string, never>>({
+      ...fixtureBase,
+      name: 'legacyidp',
+      contributes: { 'auth.provider': { ...v1, id: 'legacyidp', callback: async () => ({ subject: 's', email: 'a@example.com', emailVerified: true }) } },
+    });
+    expect(() => checkModuleSet([auth, fixture, legacy], {})).toThrow(
+      /module "legacyidp": its contribution to the slot "auth\.provider" \(module "auth"\) does not pass the slot's schema — apiVersion: missing — .*declare `apiVersion: 2`/
+    );
+    expect(() => checkModuleSet([auth, { ...legacy, contributes: { 'auth.provider': { ...otherProvider, id: 'legacyidp', apiVersion: 3 } } }], {})).toThrow(
+      /apiVersion: 3 is not an auth provider API this server implements \(2\)/
+    );
+  });
+
   it('a disabled provider may be half-configured; enabling it validates its whole schema', () => {
     const t = ctx();
     const s = t.module.configSchema;
@@ -305,6 +322,31 @@ describe('auth providers — slots, config, confirmations', () => {
     expect(only.body).toEqual({ providers: [{ id: 'authtwo', label: 'Other IdP' }] });
   });
 
+  it("a provider whose configSchema declares `label` shows the app's own label; others keep theirs", () => {
+    const labelled = defineAuthProvider({ ...otherProvider, id: 'company', label: 'Company account', configSchema: z.strictObject({ label: z.string().optional() }) });
+    const config = { ...ON, providers: { ...ON.providers, company: { enabled: true, label: 'Acme' }, authtwo: { enabled: true, label: 'ignored' } } } as unknown as AuthConfig;
+    expect(providerLabel(labelled, config)).toBe('Acme');
+    expect(providerLabel(otherProvider, config)).toBe('Other IdP');
+    expect(providerLabel(labelled, { ...config, providers: { ...config.providers, company: { enabled: true } } })).toBe('Company account');
+    expect(signInMethods(() => [labelled, otherProvider] as never[], config)).toEqual([
+      { id: 'emailCode', label: 'E-mail code' },
+      { id: 'company', label: 'Acme' },
+      { id: 'authtwo', label: 'Other IdP' },
+    ]);
+  });
+
+  it("get_app's info lists each provider of the server, on or off, with the operator's AUTH_<ID>_* names (never a value)", async () => {
+    const config = checkModuleSet([auth, fixture, fixture2], {})[0].configDefaults as AuthConfig;
+    const env = { AUTH_AUTHTEST_ISSUER: 'https://idp.example', AUTH_AUTHTEST_CLIENT_SECRET: 'shh-value', AUTH_AUTHTWO_X: ' ', OTHER: 'x' };
+    const info = providersInfo({ ...config, providers: { ...config.providers, authtest: { enabled: true } } }, env);
+    expect(info).toEqual([
+      { id: 'authtest', enabled: true, serverEnv: ['AUTH_AUTHTEST_CLIENT_SECRET', 'AUTH_AUTHTEST_ISSUER'] },
+      { id: 'authtwo', enabled: false, serverEnv: [] },
+    ]);
+    expect(JSON.stringify(info)).not.toContain('shh-value');
+    expect(await auth.appInfo!({ app: { id: appId, slug: 'team-board', workspaceId }, config: AUTH_DEFAULTS, db, log: capture() })).toEqual({ providers: [] });
+  });
+
   it('the e-mail code turned off → send-code / verify answer provider_not_enabled', async () => {
     const t = ctx({ config: { providers: { emailCode: { enabled: false }, authtest: { enabled: true, ...ISSUER } } } });
     expect(await t.request('POST', '/send-code', { body: { email: 'ana@example.com' } })).toMatchObject({ status: 404, body: { error: 'provider_not_enabled' } });
@@ -339,6 +381,7 @@ describe('auth providers — the full flow', () => {
     expect(res.headers['Referrer-Policy']).toBe('no-referrer');
     expect(res.headers['Set-Cookie']).toMatch(/^drobek_eu=/);
     expect(res.headers['Set-Cookie']).not.toMatch(/Domain=/i);
+    expect(res.setCookies[1]).toBe('drobek_eu_flow=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
 
     const user = await me(t, cookieOf(res));
     expect(user).toMatchObject({ email: 'ana@example.com', role: 'user' });
@@ -410,7 +453,7 @@ describe('auth providers — the full flow', () => {
     await vi.waitFor(() => expect(events.map((e) => e.provider).sort()).toEqual(['copy:email', 'email']));
   });
 
-  it('https: the flow cookie is __Host- (no sibling app host can set it); the names a sibling can plant are never read (NSO-360)', async () => {
+  it('https: the flow cookie is __Host- (no sibling app host can set it); the names a sibling can plant are never read', async () => {
     vi.stubEnv('APPS_URL_SCHEME', 'https');
     const t = ctx();
     const signIn = async () => {
@@ -434,9 +477,11 @@ describe('auth providers — the full flow', () => {
     const res = await complete(t, own.code, `__Host-drobek_eu_flow=${'x'.repeat(43)}; __Host-drobek_eu_flow=${own.token}`);
     expect(res.status).toBe(302);
     expect(res.headers['Set-Cookie']).toMatch(/^__Host-drobek_eu=/);
+    expect(res.setCookies).toHaveLength(2);
+    expect(res.setCookies[1]).toBe('__Host-drobek_eu_flow=; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=0');
   });
 
-  it('a sign-in begun before this release (a v1 state or handoff record) is refused, never finished (NSO-360)', async () => {
+  it('a sign-in begun before this release (a v1 state or handoff record) is refused, never finished', async () => {
     const t = ctx();
     const b = await begin(t);
     const id = b.state.split('.')[0];
@@ -746,7 +791,7 @@ describe('auth providers — accounts and sessions', () => {
   });
 });
 
-describe('auth providers — an identity is (provider, issuer, subject) (NSO-360)', () => {
+describe('auth providers — an identity is (provider, issuer, subject)', () => {
   const ISSUER_B = { issuer: 'https://other-idp.example', clientId: 'drobek-test' };
   const ON_B = { ...ON, providers: { ...ON.providers, authtest: { enabled: true, ...ISSUER_B } } };
   const PROMPT = { ...ON, providers: { ...ON.providers, authtest: { enabled: true, ...ISSUER, prompt: 'login' } } };

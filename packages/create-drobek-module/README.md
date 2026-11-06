@@ -33,6 +33,21 @@ the code imports — `"@drobek/modules": "npm:@freema/drobek-modules@^X.Y.Z"`
 in `devDependencies` — and declares the peer `"@drobek/modules": ">=X.Y.Z"`
 the server's installer checks.
 
+A module can also extend another one through its slots instead of (or
+besides) serving an app: a sign-in method contributes to `auth.provider`,
+an e-mail provider for the whole server (SES, Postmark, a company relay)
+contributes `defineEmailTransport({ id, label, secrets, send })` to
+`email.transport` and is chosen with `EMAIL_TRANSPORT=<id>` — see
+[E-mail transports from modules](https://github.com/freema/drobek/blob/main/docs/MODULES.md#e-mail-transports-from-modules);
+a place for the server's errors (an incident webhook, a log service) contributes
+`defineErrorReporter({ id, label, secrets, report })` to the core-hosted
+`errors.reporter` slot and is chosen with `ERROR_REPORTER=<id>` — see
+[Error reporters from modules](https://github.com/freema/drobek/blob/main/docs/MODULES.md#error-reporters-from-modules).
+A module that does nothing but that serves only the server: it may drop
+`skill`, `routes` and the SDK, keep `configSchema: z.object({})`, and agents
+and app owners never see it —
+[Operator-only modules](https://github.com/freema/drobek/blob/main/docs/MODULES.md#operator-only-modules).
+
 The guide is
 [Writing a module](https://github.com/freema/drobek/blob/main/docs/MODULES.md#writing-a-module).
 Licence: AGPL-3.0-only.

@@ -5,7 +5,7 @@ import { loginViaEmail, skipUnlessLocal, uniqueEmail } from './helpers/auth';
 import { personalWorkspaceOf, publishVersion, seedApp, seedVersion, withDb } from './helpers/seed';
 
 /**
- * NSO-342 acceptance — one dashboard layout:
+ * One dashboard layout:
  *   (1) every workspace and app page has the breadcrumb
  *       `Workspaces › <workspace> › <app> › <section>` (each part a link
  *       except the last), and no "← back" links;
@@ -195,6 +195,11 @@ test('one layout: breadcrumb, app header + tabs on every app page, aligned filte
   await expect(page.getByTestId('footer-version')).toHaveText(`drobek ${version.version}`);
   await expect(page.getByTestId('source-link')).toHaveText('Source (AGPL-3.0)');
   if (/^[0-9a-f]{7,40}$/.test(version.sha)) await expect(page.getByTestId('footer-sha')).toHaveText(version.sha.slice(0, 7));
+  const missing = await page.goto('/no-such-page');
+  expect(missing?.status()).toBe(404);
+  await expect(page.getByRole('heading', { name: 'Page not found' })).toBeVisible();
+  await expect(page.getByTestId('footer-version')).toHaveText(`drobek ${version.version}`);
+  await page.goBack();
   const stars = page.getByTestId('footer-stars');
   if ((await stars.count()) > 0) {
     // Only once the server-side count is known (api.github.com may be unreachable).
@@ -203,7 +208,7 @@ test('one layout: breadcrumb, app header + tabs on every app page, aligned filte
   }
 
   // ── (6) phone width: no horizontal scroll, the breadcrumb wraps ────────────
-  // NSO-371: the app tabs stay one scrollable row with the current tab in
+  // the app tabs stay one scrollable row with the current tab in
   // view; the Files viewer and the version cards stay inside the page.
   const longLine = `<script>const s = "${'x'.repeat(600)}";</script>`;
   await seedVersion({

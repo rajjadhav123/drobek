@@ -1,5 +1,5 @@
 /**
- * The read side (PHY-123): queryAppErrors / queryAppLogs over a RESOLVED app id,
+ * The read side: queryAppErrors / queryAppLogs over a RESOLVED app id,
  * plus the *ByLocator variants the MCP tools call (resolve → query, with the
  * token's workspace as the cross-workspace guard). Shaping is pure (shape.ts).
  */
@@ -44,6 +44,8 @@ export async function queryAppErrors(
       url: appErrors.url,
       createdAt: appErrors.createdAt,
       ts: appErrors.ts,
+      module: appErrors.module,
+      job: appErrors.job,
     })
     .from(appErrors)
     .where(and(eq(appErrors.appId, appId), gte(appErrors.createdAt, from)))

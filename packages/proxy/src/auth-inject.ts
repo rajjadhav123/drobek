@@ -1,5 +1,5 @@
 /**
- * PURE header construction (PHY-59) — unit tested. Builds the header set sent to
+ * PURE header construction — unit tested. Builds the header set sent to
  * the upstream: the client's headers MINUS the ones that must never cross the
  * gateway (hop-by-hop, Host, and — critically — the client's Cookie AND
  * Authorization, so the drobek session and any client credential are NEVER
@@ -50,13 +50,16 @@ const STRIP_TO_UPSTREAM = new Set([
   'x-drobek-sdk',
 ]);
 
+/** Sent when the caller sent no User-Agent. */
+const DEFAULT_USER_AGENT = 'drobek (+https://github.com/freema/drobek)';
+
 /** Browser-only request metadata (`sec-fetch-*`, `sec-ch-ua*`, …) never crosses the gateway. */
 function strippedToUpstream(name: string): boolean {
   return STRIP_TO_UPSTREAM.has(name) || name.startsWith('sec-');
 }
 
 /**
- * Upstream → client: an ALLOW-LIST (NSO-326). The relay answers on the APP's
+ * Upstream → client: an ALLOW-LIST. The relay answers on the APP's
  * origin, so nothing an upstream sends that acts on that origin may pass:
  * `Set-Cookie`, the upstream's CORS grants (`access-control-*`),
  * `Clear-Site-Data`, `Refresh`, `Link` (preload / prefetch), HSTS,
@@ -130,6 +133,9 @@ export function buildForwardHeaders(
   });
   // Ask for the body unencoded (an encoded answer is decoded within the cap anyway).
   out['accept-encoding'] = 'identity';
+  // A call the server makes itself (a sync run, a module job) has no User-Agent;
+  // APIs such as GitHub's refuse a request without one.
+  out['user-agent'] ??= DEFAULT_USER_AGENT;
 
   if (inject.authType === 'bearer') {
     if (!inject.secret) {

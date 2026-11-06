@@ -15,19 +15,14 @@ export type CompileErrorCode =
   /** The build ran longer than `timeoutMs`. */
   | 'timeout'
   /** Waited longer than `queueTimeoutMs` for a compile slot. */
-  | 'busy';
-
-export type CompileWarningCode =
-  | 'html_missing_lang'
-  | 'html_missing_viewport'
-  | 'html_missing_title'
-  | 'missing_favicon'
-  | 'a11y_img_alt'
-  | 'a11y_name'
-  | 'a11y_label';
+  | 'busy'
+  /** Warning: a literal same-app path the version does not have (a 404 in the browser). */
+  | 'missing_reference'
+  /** Warning: a literal URL of another origin the app CSP blocks. */
+  | 'blocked_by_csp';
 
 export interface CompileMessage {
-  code: CompileErrorCode | CompileWarningCode;
+  code: CompileErrorCode;
   text: string;
   /** App-relative path, e.g. `src/main.tsx`. */
   file?: string;
@@ -45,6 +40,7 @@ export interface CompileResult {
   /** Output path (e.g. `main.js`, `main.css`, `assets/logo-HASH.png`) → bytes. */
   outputs: Map<string, Buffer>;
   errors: CompileMessage[];
+  /** esbuild's warnings, then `missing_reference` / `blocked_by_csp` — never a reason to refuse a write. */
   warnings: CompileMessage[];
   /** App paths esbuild actually loaded (always a subset of the input files). */
   inputs: string[];
@@ -55,18 +51,18 @@ export interface CompileOptions {
   /**
    * Inline source map at the end of each JS/CSS bundle. Default true — every
    * version is stored with it; the production hosts split it into a separate
-   * `<file>.map` at serve time (NSO-381, @drobek/serving).
+   * `<file>.map` at serve time (@drobek/serving).
    */
   sourcemap?: boolean;
   minify?: boolean;
   /**
-   * What the bare `drobek` import becomes (M1-01): the server's versioned SDK
+   * What the bare `drobek` import becomes: the server's versioned SDK
    * URL, e.g. `/__drobek/sdk.js?v=3f2a…` (immutable caching). Default
    * `SDK_URL` (unversioned).
    */
   sdkUrl?: string;
   /**
-   * Platform sources an app may import as `drobek/<module>` (M1-02): the
+   * Platform sources an app may import as `drobek/<module>`: the
    * specifier → the source text of a module's `sdk.inline` (e.g. the auth
    * module's `<LoginGate>`). They are compiled INTO the app bundle: their bare
    * imports resolve through the app's `drobek.json` (so a component uses the
@@ -75,12 +71,17 @@ export interface CompileOptions {
    */
   sdkSources?: Record<string, string>;
   /**
-   * The browser error beacon script (M1-07), e.g. `/__drobek/beacon.js?v=…`:
+   * The browser error beacon script, e.g. `/__drobek/beacon.js?v=…`:
    * when set, every JS entry starts with `import "<beaconUrl>";` so the app
    * reports its uncaught errors — unless the app's drobek.json has
    * `"beacon": false`. Unset = nothing is added.
    */
   beaconUrl?: string;
+  /**
+   * App paths served besides the version's files — the app's uploaded
+   * assets (`img/hero.jpg`): a reference to one is not a `missing_reference`.
+   */
+  servedPaths?: Iterable<string>;
 }
 
 export type SourceFiles = Map<string, string | Buffer>;

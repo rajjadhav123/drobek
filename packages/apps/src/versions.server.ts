@@ -1,16 +1,24 @@
 /**
- * Immutable app versions (M0-02). Every write creates a new version whose
+ * Immutable app versions. Every write creates a new version whose
  * files point at content-addressed blobs, so identical content is stored once
  * no matter how many versions (or apps) contain it. Publishing moves one
  * pointer (`apps.published_version_id`); restore copies an old file list into
- * a NEW version, so history is never rewritten.
+ * a NEW version — a version's files never change. Only the history retention
+ * and a member's clean-up delete old versions (version-retention.server.ts);
+ * a member can keep a version so neither does (version-keep.server.ts).
  *
- * NSO-362: publish also freezes the app's assets for the version it puts
+ * Publish also freezes the app's assets for the version it puts
  * live, and restore brings back the assets a version had when it was last
  * live (assets/snapshots.server.ts).
+ *
+ * A new version — a write or a restore — is refused with `rate_limited` past
+ * VERSIONS_PER_APP_HOUR / VERSIONS_PER_USER_HOUR (version-rate.server.ts),
+ * and a write with `limit_exceeded` past the workspace's
+ * WORKSPACE_SOURCE_QUOTA (version-retention.server.ts), before any blob is
+ * stored.
  */
 import { createHash } from 'node:crypto';
-import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNotNull, lt, or, sql, type SQL } from 'drizzle-orm';
 import { AUDIT_ACTIONS, writeAudit, type AuditExecutor } from '@drobek/audit';
 import { normalizeAppPath } from '@drobek/compile';
 import { appVersions, apps, auditLog, blobs, getDb, versionFiles } from '@drobek/db';
@@ -20,12 +28,15 @@ import { lockedByAdminError, screenAfterPublish } from './moderation.server.js';
 import { freezeAssetsForPublish, pruneAssetSnapshots, restoreDraftAssets } from './assets/snapshots.server.js';
 import { assertMayPublish, requestPublishApproval } from './publish-approval.server.js';
 import { notifyOperatorOfPublish, type PublishKind } from './publish-notify.server.js';
+import { assertVersionRateLocked, versionRateLimits, type VersionRateLimits } from './version-rate.server.js';
+import { assertSourceQuotaLocked, fileSizes, missingVersionMessage, versionStorageLimits } from './version-retention.server.js';
 import type {
   Actor,
   CompileStatus,
   VersionDetail,
   VersionFile,
   VersionFileInput,
+  VersionPage,
   VersionSummary,
 } from './types.js';
 
@@ -38,12 +49,16 @@ export interface CreateVersionOptions {
   /** Compile result, when the caller already compiled (write_files does). */
   compile?: { status: CompileStatus; errors?: unknown };
   /**
-   * NSO-382: the version number the new files were derived from (null = the
+   * The version number the new files were derived from (null = the
    * app had none). Set, the write refuses with `version_conflict` when another
    * version landed since; unset, the new version is stored on top of whatever
    * is latest.
    */
   baseVersion?: number | null;
+  /** VERSIONS_PER_APP_HOUR / VERSIONS_PER_USER_HOUR of the app's workspace (versionRateLimitsOf); default: the env. */
+  versionLimits?: VersionRateLimits;
+  /** WORKSPACE_SOURCE_QUOTA of the app's workspace (versionStorageLimitsOf), bytes; default: the env. */
+  sourceQuota?: number;
 }
 
 const VERSION_COLUMNS = {
@@ -56,14 +71,28 @@ const VERSION_COLUMNS = {
   compileStatus: appVersions.compileStatus,
   compileErrors: appVersions.compileErrors,
   createdAt: appVersions.createdAt,
+  keptAt: appVersions.keptAt,
+  keptByUserId: appVersions.keptByUserId,
 };
+
+/** The app's versions `where` selects, newest first, with the app's published pointer. */
+function versionRows(where: SQL | undefined) {
+  return getDb()
+    .select({ ...VERSION_COLUMNS, publishedVersionId: apps.publishedVersionId })
+    .from(appVersions)
+    .innerJoin(apps, eq(apps.id, appVersions.appId))
+    .where(where)
+    .orderBy(desc(appVersions.number));
+}
+
+type VersionRow = Awaited<ReturnType<typeof versionRows>>[number];
 
 function sha256Hex(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
 /** Lock the app row for the rest of the transaction (serializes version numbers). */
-async function lockApp(tx: Tx, appId: string) {
+export async function lockApp(tx: Tx, appId: string) {
   const [app] = await tx
     .select({
       id: apps.id,
@@ -81,7 +110,7 @@ async function lockApp(tx: Tx, appId: string) {
   return app;
 }
 
-/** Lock the app row AND refuse when a super-admin took the app down (NSO-293). */
+/** Lock the app row AND refuse when a super-admin took the app down. */
 async function lockWritableApp(tx: Tx, appId: string) {
   const app = await lockApp(tx, appId);
   if (app.lockedReason !== null) throw lockedByAdminError(app.lockedReason);
@@ -118,9 +147,10 @@ async function audit(
 }
 
 /**
- * Store a new version: blobs upsert → version row → file rows, in one
- * transaction. An upsert of an existing blob refreshes its `created_at` and
- * row-locks it, so a concurrent GC sweep can never delete it underneath us.
+ * Store a new version: rate check → quota check → blobs upsert → version row →
+ * file rows, in one transaction. An upsert of an existing blob refreshes its
+ * `created_at` and row-locks it, so a concurrent GC sweep can never delete it
+ * underneath us.
  */
 export async function createVersion(
   appId: string,
@@ -146,6 +176,8 @@ export async function createVersion(
 
   return getDb().transaction(async (tx) => {
     const app = await lockWritableApp(tx, appId);
+    await assertVersionRateLocked(tx, appId, opts.actor.userId, opts.versionLimits ?? versionRateLimits());
+    await assertSourceQuotaLocked(tx, app.workspaceId, fileSizes(rows), opts.sourceQuota ?? versionStorageLimits().sourceQuota);
     if (bytesBySha.size > 0) {
       await tx
         .insert(blobs)
@@ -179,23 +211,38 @@ export async function createVersion(
   });
 }
 
+/** The id of the newest version that compiled — the one the preview host serves — or null. */
+async function previewVersionId(appId: string): Promise<string | null> {
+  const [row] = await getDb()
+    .select({ id: appVersions.id })
+    .from(appVersions)
+    .where(and(eq(appVersions.appId, appId), eq(appVersions.compileStatus, 'ok')))
+    .orderBy(desc(appVersions.number))
+    .limit(1);
+  return row?.id ?? null;
+}
+
+function summaryOf({ publishedVersionId, ...v }: VersionRow, previewId: string | null): VersionSummary {
+  return {
+    ...v,
+    published: publishedVersionId === v.id,
+    preview: previewId === v.id,
+    kept: v.keptAt !== null,
+  };
+}
+
 /** One version of an app (by number or id) with its file list, or null. */
 export async function getVersion(
   appId: string,
   ref: { number: number } | { id: string }
 ): Promise<VersionDetail | null> {
   const db = getDb();
-  const [row] = await db
-    .select({ ...VERSION_COLUMNS, publishedVersionId: apps.publishedVersionId })
-    .from(appVersions)
-    .innerJoin(apps, eq(apps.id, appVersions.appId))
-    .where(
-      and(
-        eq(appVersions.appId, appId),
-        'number' in ref ? eq(appVersions.number, ref.number) : eq(appVersions.id, ref.id)
-      )
-    )
-    .limit(1);
+  const [[row], previewId] = await Promise.all([
+    versionRows(
+      and(eq(appVersions.appId, appId), 'number' in ref ? eq(appVersions.number, ref.number) : eq(appVersions.id, ref.id))
+    ).limit(1),
+    previewVersionId(appId),
+  ]);
   if (!row) return null;
   const files = await db
     .select({
@@ -207,23 +254,52 @@ export async function getVersion(
     .from(versionFiles)
     .where(eq(versionFiles.versionId, row.id))
     .orderBy(versionFiles.kind, versionFiles.path);
-  const { publishedVersionId, ...version } = row;
-  return { ...version, published: publishedVersionId === row.id, files };
+  return { ...summaryOf(row, previewId), files };
 }
 
-/** The app's versions, newest first (no file lists). */
+/**
+ * One page of the app's versions, newest first (no file lists): at most
+ * `limit` (default 50) versions numbered below `before` (default: from the
+ * newest). `nextBefore` continues with the older ones; null on the last page.
+ */
 export async function listVersions(
   appId: string,
-  opts: { limit?: number } = {}
-): Promise<VersionSummary[]> {
-  const rows = await getDb()
-    .select({ ...VERSION_COLUMNS, publishedVersionId: apps.publishedVersionId })
-    .from(appVersions)
-    .innerJoin(apps, eq(apps.id, appVersions.appId))
-    .where(eq(appVersions.appId, appId))
-    .orderBy(desc(appVersions.number))
-    .limit(opts.limit ?? 50);
-  return rows.map(({ publishedVersionId, ...v }) => ({ ...v, published: publishedVersionId === v.id }));
+  opts: { limit?: number; before?: number } = {}
+): Promise<VersionPage> {
+  const limit = opts.limit !== undefined && Number.isFinite(opts.limit) ? Math.max(1, Math.floor(opts.limit)) : 50;
+  const where =
+    opts.before === undefined || !Number.isFinite(opts.before)
+      ? eq(appVersions.appId, appId)
+      : and(eq(appVersions.appId, appId), lt(appVersions.number, Math.ceil(opts.before)));
+  const [rows, previewId] = await Promise.all([
+    versionRows(where).limit(limit + 1),
+    previewVersionId(appId),
+  ]);
+  const page = rows.slice(0, limit);
+  return {
+    versions: page.map((r) => summaryOf(r, previewId)),
+    nextBefore: rows.length > limit ? page[page.length - 1].number : null,
+  };
+}
+
+/**
+ * The versions that stay put whatever page of the history is shown: the
+ * published one, the preview (newest that compiled) and the kept ones,
+ * newest first, each once with its `published` / `preview` / `kept` flags.
+ */
+export async function pinnedVersions(appId: string): Promise<VersionSummary[]> {
+  const previewId = await previewVersionId(appId);
+  const rows = await versionRows(
+    and(
+      eq(appVersions.appId, appId),
+      or(
+        isNotNull(appVersions.keptAt),
+        eq(appVersions.id, apps.publishedVersionId),
+        ...(previewId ? [eq(appVersions.id, previewId)] : [])
+      )
+    )
+  );
+  return rows.map((r) => summaryOf(r, previewId));
 }
 
 /** The newest version's number (0 when the app has none). */
@@ -270,18 +346,18 @@ export async function readBlobs(sha256s: string[]): Promise<Map<string, Buffer>>
  * Point the app's production host at a version — one atomic pointer move,
  * audited as `app.publish` (with the previous version, so the audit log is
  * the publish history). Only a version that compiled `ok` is publishable.
- * A taken-down app (NSO-293) refuses with `app_locked_by_admin`. After the
+ * A taken-down app refuses with `app_locked_by_admin`. After the
  * pointer moved, the published version goes through the phishing heuristic
  * (`screen: false` skips it).
  *
- * NSO-366: a workspace a super-admin blocked refuses with `publish_blocked`;
+ * A workspace a super-admin blocked refuses with `publish_blocked`;
  * with PUBLISH_APPROVAL=approval one that is not allowed refuses with
  * `publish_not_approved` (nothing moves) and the refusal records an approval
  * request and e-mails the operator (deduped). A publish that went through is
  * e-mailed to the operator per PUBLISH_NOTIFY, without waiting for it.
  *
- * The app's assets are frozen for the version in the same transaction
- * (NSO-362): `assets: 'draft'` — the draft went live (the version the preview
+ * The app's assets are frozen for the version in the same transaction:
+ * `assets: 'draft'` — the draft went live (the version the preview
  * shows, or one that never had a set); `'kept'` — a rollback to a version
  * that serves the set it had when it was last live.
  */
@@ -339,7 +415,7 @@ export async function publish(
         ? 'rollback'
         : 'republish';
     const assets = await freezeAssetsForPublish(tx, appId, version.id);
-    // published_at orders the public gallery (NSO-340); ms precision like its cursor.
+    // published_at orders the public gallery; ms precision like its cursor.
     await tx.update(apps).set({ publishedVersionId: version.id, publishedAt: new Date() }).where(eq(apps.id, appId));
     await pruneAssetSnapshots(tx, appId);
     await audit(tx, app, actor, AUDIT_ACTIONS.appPublish, {
@@ -354,7 +430,7 @@ export async function publish(
   });
   const { kind, ...out } = result;
   void notifyOperatorOfPublish({ appId, version: out.number, kind, actor, env });
-  // NSO-293: the phishing heuristic — flags the app for the super-admin
+  // The phishing heuristic — flags the app for the super-admin
   // queue, never blocks (a scan failure is only logged).
   if (opts.screen !== false) await screenAfterPublish(appId, out.versionId);
   return out;
@@ -362,16 +438,19 @@ export async function publish(
 
 /**
  * Restore = a NEW version with exactly the file list (and compile result) of
- * version `number`. Nothing is rewritten; publishing it is a separate step.
- * NSO-362: when version `number` was published and its asset set is still
+ * version `number`. Nothing is rewritten and no bytes are added (the
+ * workspace's source quota never refuses it); publishing it is a separate
+ * step. A version the retention deleted answers `not_found` saying so.
+ * When version `number` was published and its asset set is still
  * kept, the draft assets are reset to that set too (`assetsRestored`), so
  * the preview — and the next publish — show the version's old assets.
+ * Counts against the version rate like a write (`opts.versionLimits`).
  */
 export async function restore(
   appId: string,
   number: number,
   actor: Actor,
-  opts: { reasoning?: string | null } = {}
+  opts: { reasoning?: string | null; versionLimits?: VersionRateLimits } = {}
 ): Promise<{ id: string; number: number; assetsRestored: boolean }> {
   return getDb().transaction(async (tx) => {
     const app = await lockWritableApp(tx, appId);
@@ -383,7 +462,8 @@ export async function restore(
       })
       .from(appVersions)
       .where(and(eq(appVersions.appId, appId), eq(appVersions.number, number)));
-    if (!source) throw new AppsError('not_found', `Version ${number} does not exist.`);
+    if (!source) throw new AppsError('not_found', await missingVersionMessage(appId, number, { ex: tx }));
+    await assertVersionRateLocked(tx, appId, actor.userId, opts.versionLimits ?? versionRateLimits());
 
     const newNumber = await nextNumber(tx, appId);
     const [version] = await tx
@@ -415,7 +495,7 @@ export async function restore(
 const ZIP_BLOB_BATCH = 32;
 
 /**
- * A version as a ZIP (the dashboard's "download", NSO-288): every source file
+ * A version as a ZIP (the dashboard's "download"): every source file
  * under `<slug>-v<N>/source/`, every compiled output under
  * `<slug>-v<N>/built/`. Streamed — blobs are read in small batches while the
  * archive is written. null when the app has no such version.

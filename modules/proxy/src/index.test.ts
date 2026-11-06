@@ -7,6 +7,7 @@
  */
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { PGlite } from '@electric-sql/pglite';
@@ -23,6 +24,7 @@ import { createCore } from '@drobek/sdk';
 import auth from 'drobek-module-auth';
 import proxy, {
   createProxyModule,
+  proxyHandler,
   proxyAppInfo,
   proxyConfigSchema,
   proxyConfirmRequired,
@@ -50,6 +52,9 @@ let env: NodeJS.ProcessEnv;
 /** Calls to /slow wait until the test resolves this. */
 let releaseSlow: () => void = () => undefined;
 let slowGate: Promise<void> = Promise.resolve();
+/** /sse/hold streams its last event when the test resolves this. */
+let releaseSse: () => void = () => undefined;
+let sseGate: Promise<void> = Promise.resolve();
 
 beforeAll(async () => {
   server = http.createServer((req, res) => {
@@ -61,6 +66,24 @@ beforeAll(async () => {
       });
       return;
     }
+    if (url.pathname === '/sse' || url.pathname === '/sse/hold' || url.pathname === '/sse/drop') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      if (req.method === 'HEAD') {
+        res.end();
+        return;
+      }
+      res.write('data: one\n\n');
+      if (url.pathname === '/sse/hold') {
+        void sseGate.then(() => res.end('data: two\n\n'));
+        return;
+      }
+      if (url.pathname === '/sse/drop') {
+        setTimeout(() => res.destroy(), 20);
+        return;
+      }
+      res.end('data: two\n\n');
+      return;
+    }
     if (url.pathname === '/gzip') {
       res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'gzip', location: 'https://upstream.internal/x' });
       res.end(gzipSync(Buffer.from('{"ok":true}')));
@@ -69,6 +92,11 @@ beforeAll(async () => {
     if (url.pathname === '/redirect') {
       res.writeHead(302, { location: 'http://169.254.169.254/latest/meta-data/' });
       res.end('redirecting');
+      return;
+    }
+    if (url.pathname === '/v1/dir') {
+      res.writeHead(301, { location: `http://127.0.0.1:${port}/v1/dir/` });
+      res.end('moved');
       return;
     }
     if (url.pathname === '/cors') {
@@ -124,7 +152,7 @@ beforeAll(async () => {
   };
   await add(ws1, 'echo', { authType: 'bearer', allowedPathPrefixes: ['/v1', '/redirect', '/cors'] }, SECRET);
   await add(ws1, 'keyed', { authType: 'header', authHeaderName: 'X-Api-Key', allowedMethods: ['GET'] }, HEADER_SECRET);
-  await add(ws1, 'open', {});
+  await add(ws1, 'open', { allowStreaming: true });
   await add(ws2, 'elsewhere', { authType: 'bearer' }, 'ws2-secret-never-used-1234567');
 });
 
@@ -137,7 +165,7 @@ afterAll(async () => {
 
 const mod = () => createProxyModule({ env: () => env });
 
-/** Upstreams of ws1 whose allow-list does NOT name appA (NSO-322 H3), for one test. */
+/** Upstreams of ws1 whose allow-list does NOT name appA, for one test. */
 async function withNarrowUpstreams(fn: () => Promise<void>): Promise<void> {
   const base = `http://127.0.0.1:${port}`;
   const common = { workspaceId: ws1, baseUrl: base, allowedMethods: ['GET'], allowedPathPrefixes: ['/'], authType: 'bearer' as const };
@@ -177,7 +205,7 @@ describe('the module', () => {
     ]);
   });
 
-  it("the skill's React example (an OpenAI call behind <LoginGate>) compiles; the skill is ≤ 150 lines", async () => {
+  it("the skill's React example (a streamed Anthropic call behind <LoginGate>) compiles; the skill is ≤ 150 lines", async () => {
     const { compile } = await import('@drobek/compile');
     const sdk = await buildSdk([auth, proxy]);
     const example = /```tsx\n([\s\S]*?)```/.exec(proxy.skill.markdown)![1];
@@ -202,7 +230,8 @@ describe('the module', () => {
     expect(r.errors).toEqual([]);
     const out = r.outputs.get('main.js')!.toString('utf8');
     expect(out).toContain('function LoginGate(');
-    expect(out).toContain('/v1/chat/completions');
+    expect(out).toContain('/v1/messages');
+    expect(out).toContain('getReader');
     expect(proxy.skill.markdown.split('\n').length).toBeLessThanOrEqual(150);
   });
 
@@ -243,13 +272,13 @@ describe('config + confirmRequired', () => {
     const p = (c: unknown) => proxyConfigSchema.parse(c) as ProxyConfig;
     const none = p({});
     const user = p({ upstreams: { echo: {} } });
-    // Every one needs a workspace ADMIN (NSO-322 H3): only admins register upstreams.
+    // Every one needs a workspace ADMIN: only admins register upstreams.
     const admin = (change: string) => ({ change, confirmRole: 'admin' });
     const secret = new Map([['echo', true]]);
     expect(proxyConfirmRequired(none, user, secret)).toEqual([
       admin('proxy.upstreams.echo: this app may call the workspace upstream "echo" with its secret (callers: "user")'),
     ]);
-    // No secret stored: the text does not claim one (NSO-372).
+    // No secret stored: the text does not claim one.
     expect(proxyConfirmRequired(none, user, new Map([['echo', false]]))).toEqual([
       admin('proxy.upstreams.echo: this app may call the workspace upstream "echo" (callers: "user")'),
     ]);
@@ -264,7 +293,7 @@ describe('config + confirmRequired', () => {
     expect(await t({}).confirm({}, { upstreams: { echo: {} } })).toEqual([
       'proxy.upstreams.echo: this app may call the workspace upstream "echo" with its secret (callers: "user")',
     ]);
-    // A name nobody registered cannot be assigned (it could never be confirmed); removing one still can (NSO-372).
+    // A name nobody registered cannot be assigned (it could never be confirmed); removing one still can.
     await expect(t({}).confirm({}, { upstreams: { ghost: {} } })).rejects.toMatchObject({
       code: 'invalid_params',
       details: { reason: 'upstream_not_registered', upstreams: ['ghost'] },
@@ -275,7 +304,7 @@ describe('config + confirmRequired', () => {
     expect(proxyConfirmRequired(user, none)).toEqual([]);
   });
 
-  it('the record binding `id` (NSO-326): old name-only and new bound shapes both parse; a changed id needs an admin, a dropped one does not', () => {
+  it('the record binding `id`: old name-only and new bound shapes both parse; a changed id needs an admin, a dropped one does not', () => {
     const p = (c: unknown) => proxyConfigSchema.parse(c) as ProxyConfig;
     // Old shape (name only) — still valid, unbound.
     expect(p({ upstreams: { echo: { rules: { call: 'user' } } } }).upstreams.echo.id).toBeUndefined();
@@ -367,7 +396,7 @@ describe('calls', () => {
     expect(p.body).toMatchObject({ error: 'path_not_allowed' });
     const trav = await tt.request('GET', '/echo/v1/%2e%2e/admin', { headers: SDK });
     expect(trav.status).toBe(403);
-    // Double encoding hides nothing (NSO-326): checked on the fully decoded segment.
+    // Double encoding hides nothing: checked on the fully decoded segment.
     const double = await tt.request('GET', '/echo/v1/%252e%252e%252fadmin', { headers: SDK });
     expect(double.status).toBe(403);
     expect(double.body).toMatchObject({ error: 'path_not_allowed' });
@@ -377,11 +406,15 @@ describe('calls', () => {
     expect((pct.body as Echo).path).toBe('/v1/a%25b');
   });
 
-  it('a redirect is returned verbatim, never followed; upstream CORS grants and cookies are dropped, never cached', async () => {
+  it('a same-origin redirect inside the prefixes is followed; any other is 502 upstream_redirect without the foreign host; CORS grants and cookies are dropped, never cached', async () => {
     const tt = t({ upstreams: { echo: {} } });
+    const slash = await tt.request('GET', '/echo/v1/dir', { headers: SDK });
+    expect(slash.status).toBe(200);
+    expect(slash.body).toMatchObject({ path: '/v1/dir/', headers: { authorization: `Bearer ${SECRET}` } });
     const r = await tt.request('GET', '/echo/redirect', { headers: SDK });
-    expect(r.status).toBe(302);
-    // Returned as-is but the ABSOLUTE Location is dropped (NSO-326: it would leak where the upstream points).
+    expect(r.status).toBe(502);
+    expect(r.body).toMatchObject({ error: 'upstream_redirect', details: { location_path: '/latest/meta-data/' } });
+    expect(JSON.stringify(r.body)).not.toContain('169.254');
     expect(Object.keys(r.headers).map((k) => k.toLowerCase())).not.toContain('location');
     const c = await tt.request('GET', '/echo/cors', { headers: SDK });
     expect(c.status).toBe(200);
@@ -392,7 +425,7 @@ describe('calls', () => {
     expect(Object.keys(c.headers).filter((k) => k.toLowerCase() === 'cache-control')).toEqual(['Cache-Control']);
   });
 
-  it("an upstream whose allow-list does not name the app → 403 upstream_not_allowed, nothing forwarded (NSO-322 H3)", async () => {
+  it("an upstream whose allow-list does not name the app → 403 upstream_not_allowed, nothing forwarded", async () => {
     await withNarrowUpstreams(async () => {
       for (const name of ['closed', 'theirs']) {
         const res = await t({ upstreams: { [name]: {} } }).request('GET', `/${name}/x`, { headers: SDK });
@@ -434,7 +467,7 @@ describe('calls', () => {
   });
 });
 
-describe('assignments are bound to the upstream RECORD, not its name (NSO-326)', () => {
+describe('assignments are bound to the upstream RECORD, not its name', () => {
   const idOf = async (name: string, workspaceId = ws1) =>
     (await db.select({ id: upstreams.id }).from(upstreams).where(and(eq(upstreams.workspaceId, workspaceId), eq(upstreams.name, name))))[0].id;
   const storedConfig = async () =>
@@ -522,7 +555,7 @@ describe('assignments are bound to the upstream RECORD, not its name (NSO-326)',
   });
 });
 
-describe('an encoded upstream body is decoded; headers are the allow-list (NSO-326)', () => {
+describe('an encoded upstream body is decoded; headers are the allow-list', () => {
   it('a gzipped JSON answer reaches the app as plain JSON, without Content-Encoding or the absolute Location', async () => {
     const res = await t({ upstreams: { open: {} } }).request('GET', '/open/gzip', { headers: SDK });
     expect(res.status).toBe(200);
@@ -534,7 +567,7 @@ describe('an encoded upstream body is decoded; headers are the allow-list (NSO-3
   });
 });
 
-describe('concurrent calls (NSO-326)', () => {
+describe('concurrent calls', () => {
   it('PROXY_MAX_CONCURRENT_PER_APP: a call over the cap → 429 proxy_busy with Retry-After; the slot frees when a call ends', async () => {
     slowGate = new Promise<void>((resolve) => {
       releaseSlow = resolve;
@@ -556,6 +589,137 @@ describe('concurrent calls (NSO-326)', () => {
     for (const r of await Promise.all(inFlight)) expect(r.status).toBe(200);
     slowGate = Promise.resolve();
     expect((await tt.request('GET', '/open/x', { headers: SDK })).status).toBe(200);
+  });
+});
+
+describe('streamed answers (text/event-stream)', () => {
+  const callerEnv = (n: string) => createProxyModule({ env: () => ({ ...env, PROXY_MAX_CONCURRENT_PER_CALLER: n }) });
+  const tc = (n: string, principal: Principal = USER) =>
+    createModuleTestContext(callerEnv(n), { db, app: { id: appA, slug: 'chat', workspaceId: ws1 }, config: { upstreams: { open: {} } }, principal });
+
+  /** The route handler called directly, so the test holds the streamed body. */
+  async function direct(n: string, path: string, principal: Principal = USER, method = 'GET') {
+    const tt = tc(n, principal);
+    const handler = proxyHandler({ env: () => ({ ...env, PROXY_MAX_CONCURRENT_PER_CALLER: n }) });
+    const req = {
+      method,
+      path: `/open${path}`,
+      params: { upstream: 'open', '*': path.slice(1) },
+      query: {},
+      rawQuery: '',
+      body: undefined,
+      header: (h: string) => (h.toLowerCase() === 'x-drobek-sdk' ? '1' : null),
+      headers: () => ({ 'x-drobek-sdk': '1' }),
+      clientIp: '198.51.100.9',
+      file: async () => {
+        throw new Error('no file');
+      },
+    };
+    const out = (await handler(req as never, tt.ctx)) as { status: number; headers: Record<string, string>; body: unknown };
+    return { tt, out };
+  }
+
+  const settle = () => new Promise((r) => setTimeout(r, 30));
+
+  it('an SSE answer is relayed as a stream (X-Accel-Buffering: no, no-store) and logged with streamed + end_reason when it ends', async () => {
+    const info = vi.fn();
+    const tt = createModuleTestContext(mod(), {
+      db,
+      app: { id: appA, slug: 'chat', workspaceId: ws1 },
+      config: { upstreams: { open: {} } },
+      principal: USER,
+      log: { info, warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as never,
+    });
+    const r = await tt.request('GET', '/open/sse', { headers: SDK });
+    expect(r.status).toBe(200);
+    expect(r.bytes.toString('utf8')).toBe('data: one\n\ndata: two\n\n');
+    expect(r.headers).toMatchObject({ 'content-type': 'text/event-stream', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store' });
+    await settle();
+    expect(info).toHaveBeenCalledWith('proxy call', expect.objectContaining({ status: 200, streamed: true, end_reason: 'end', bytes: 22 }));
+  });
+
+  it("the handler answers a Readable; the caller's slot is held until the stream ends", async () => {
+    sseGate = new Promise<void>((resolve) => {
+      releaseSse = resolve;
+    });
+    const { tt, out } = await direct('1', '/sse/hold');
+    expect(out.body).toBeInstanceOf(Readable);
+    const busy = await tt.request('GET', '/open/x', { headers: SDK });
+    expect(busy.status).toBe(429);
+    expect(busy.body).toMatchObject({ error: 'proxy_busy', message: expect.stringMatching(/this visitor/) });
+    releaseSse();
+    const chunks: Buffer[] = [];
+    for await (const c of out.body as Readable) chunks.push(Buffer.from(c as Uint8Array));
+    expect(Buffer.concat(chunks).toString()).toBe('data: one\n\ndata: two\n\n');
+    await settle();
+    expect((await tt.request('GET', '/open/x', { headers: SDK })).status).toBe(200);
+    sseGate = Promise.resolve();
+  });
+
+  it('the slot is released when the client leaves (the Readable destroyed)', async () => {
+    sseGate = new Promise<void>((resolve) => {
+      releaseSse = resolve;
+    });
+    const { tt, out } = await direct('1', '/sse/hold');
+    expect((await tt.request('GET', '/open/x', { headers: SDK })).status).toBe(429);
+    (out.body as Readable).destroy();
+    await settle();
+    expect((await tt.request('GET', '/open/x', { headers: SDK })).status).toBe(200);
+    releaseSse();
+    sseGate = Promise.resolve();
+  });
+
+  it('the slot is released when the upstream drops the stream', async () => {
+    const { tt, out } = await direct('1', '/sse/drop');
+    const err = await (async () => {
+      for await (const _ of out.body as Readable) {
+        /* drain */
+      }
+    })().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ProxyError);
+    await settle();
+    expect((await tt.request('GET', '/open/x', { headers: SDK })).status).toBe(200);
+  });
+
+  it('an upstream without allowStreaming gets its SSE answer buffered in one piece; the slot is released at once', async () => {
+    await db.update(upstreams).set({ allowStreaming: false }).where(and(eq(upstreams.workspaceId, ws1), eq(upstreams.name, 'open')));
+    try {
+      const { tt, out } = await direct('1', '/sse');
+      expect(out.status).toBe(200);
+      expect(Buffer.isBuffer(out.body)).toBe(true);
+      expect((out.body as Buffer).toString('utf8')).toBe('data: one\n\ndata: two\n\n');
+      expect(out.headers['X-Accel-Buffering']).toBeUndefined();
+      expect((await tt.request('GET', '/open/x', { headers: SDK })).status).toBe(200);
+    } finally {
+      await db.update(upstreams).set({ allowStreaming: true }).where(and(eq(upstreams.workspaceId, ws1), eq(upstreams.name, 'open')));
+    }
+  });
+
+  it('HEAD on an SSE path is not streamed (no body); its slot is released at once', async () => {
+    const { tt, out } = await direct('1', '/sse', USER, 'HEAD');
+    expect(out.status).toBe(200);
+    expect(out.body).toBeNull();
+    expect((await tt.request('GET', '/open/x', { headers: SDK })).status).toBe(200);
+  });
+
+  it('PROXY_MAX_CONCURRENT_PER_CALLER is per caller: another signed-in user and an anonymous IP still get a slot', async () => {
+    sseGate = new Promise<void>((resolve) => {
+      releaseSse = resolve;
+    });
+    const held = await direct('1', '/sse/hold');
+    expect((await held.tt.request('GET', '/open/x', { headers: SDK })).status).toBe(429);
+    expect((await tc('1', ADMIN).request('GET', '/open/x', { headers: SDK })).status).toBe(200);
+    const anon = createModuleTestContext(callerEnv('1'), {
+      db,
+      app: { id: appA, slug: 'chat', workspaceId: ws1 },
+      config: { upstreams: { open: { rules: { call: 'public' } } } },
+      principal: ANON,
+    });
+    expect((await anon.request('GET', '/open/x', { headers: SDK, clientIp: '203.0.113.5' })).status).toBe(200);
+    releaseSse();
+    (held.out.body as Readable).destroy();
+    sseGate = Promise.resolve();
+    await settle();
   });
 });
 
@@ -581,7 +745,7 @@ describe('rate limits', () => {
     expect((await tt.request('GET', '/open/x', { headers: SDK, clientIp: '198.51.100.2' })).status).toBe(200);
   });
 
-  it('a public upstream without a resolved client IP (NSO-328): no shared per-IP bucket, the app-wide limit still applies', async () => {
+  it('a public upstream without a resolved client IP: no shared per-IP bucket, the app-wide limit still applies', async () => {
     const tt = t({ upstreams: { open: { rules: { call: 'public' } } } }, ANON, { PROXY_CALLS_PER_MIN: 15 });
     for (let i = 0; i < 15; i++) {
       expect((await tt.request('GET', '/open/x', { headers: SDK, clientIp: null })).status, `call ${i + 1}`).toBe(200);
@@ -604,10 +768,10 @@ describe('appInfo (get_app / configure_module) and registration', () => {
     const config = proxyConfigSchema.parse({ upstreams: { echo: { rateLimit: 5 }, ghost: { rules: { call: 'admin' } } } });
     const info = await proxyAppInfo({ app: { id: appA, slug: 'chat', workspaceId: ws1 }, config, db, log: console as never });
     expect(info.upstreams).toEqual([
-      { name: 'echo', registered: true, assigned: true, call: 'user', rateLimit: 5, hasSecret: true, allowedMethods: ['GET', 'HEAD', 'POST'], allowedPathPrefixes: ['/v1', '/redirect', '/cors'] },
+      { name: 'echo', registered: true, assigned: true, call: 'user', rateLimit: 5, hasSecret: true, allowedMethods: ['GET', 'HEAD', 'POST'], allowedPathPrefixes: ['/v1', '/redirect', '/cors'], allowStreaming: false },
       { name: 'ghost', registered: false, assigned: true, call: 'admin', hasSecret: false },
-      { name: 'keyed', registered: true, assigned: false, hasSecret: true, allowedMethods: ['GET'], allowedPathPrefixes: ['/'] },
-      { name: 'open', registered: true, assigned: false, hasSecret: false, allowedMethods: ['GET', 'HEAD', 'POST'], allowedPathPrefixes: ['/'] },
+      { name: 'keyed', registered: true, assigned: false, hasSecret: true, allowedMethods: ['GET'], allowedPathPrefixes: ['/'], allowStreaming: false },
+      { name: 'open', registered: true, assigned: false, hasSecret: false, allowedMethods: ['GET', 'HEAD', 'POST'], allowedPathPrefixes: ['/'], allowStreaming: true },
     ]);
     const text = JSON.stringify(info);
     expect(text).not.toContain(SECRET);
@@ -642,5 +806,49 @@ describe('appInfo (get_app / configure_module) and registration', () => {
     });
     expect(view).toMatchObject({ name: 'good', baseUrl: 'https://api.example.com/v1', hasSecret: true });
     expect(JSON.stringify(view)).not.toContain('another-secret-value-xyz');
+  });
+});
+
+describe('the upstreams authority (a module job calls an upstream)', () => {
+  const view = (config: unknown) => ({
+    app: { id: appA, slug: 'chat', workspaceId: ws1 },
+    config: proxyConfigSchema.parse(config),
+    db,
+    log: { debug() {}, info() {}, warn() {}, error() {} },
+    limits: async () => ({}),
+  });
+  const fetchUp = (config: unknown, name: string, request = {}) => mod().upstreams!.fetch(view(config) as never, name, request);
+
+  it('calls an assigned upstream with its secret injected, whatever its call rule (none too)', async () => {
+    const r = await fetchUp({ upstreams: { echo: { rules: { call: 'none' } } } }, 'echo', { path: '/v1/players?season=2026' });
+    expect(r.status).toBe(200);
+    const echoed = JSON.parse(r.body.toString('utf8')) as { method: string; path: string; query: string; headers: Record<string, string> };
+    expect(echoed).toMatchObject({ method: 'GET', path: '/v1/players', query: '?season=2026' });
+    expect(echoed.headers.authorization).toBe(`Bearer ${SECRET}`);
+    expect(echoed.headers.accept).toBe('application/json');
+  });
+
+  it('POST sends the body as JSON', async () => {
+    const r = await fetchUp({ upstreams: { open: {} } }, 'open', { method: 'POST', path: '/q', body: '{"a":1}' });
+    expect(JSON.parse(r.body.toString('utf8'))).toMatchObject({ method: 'POST', body: '{"a":1}', headers: { 'content-type': 'application/json' } });
+  });
+
+  it('refuses what the route refuses: not assigned, another workspace, a path outside the prefixes, a method the job may not use, over the cap', async () => {
+    await expect(fetchUp({ upstreams: {} }, 'echo')).rejects.toMatchObject({ code: 'forbidden', details: { reason: 'upstream_not_assigned' } });
+    await expect(fetchUp({ upstreams: { elsewhere: {} } }, 'elsewhere')).rejects.toMatchObject({ code: 'not_found', details: { reason: 'upstream_not_registered' } });
+    await expect(fetchUp({ upstreams: { echo: {} } }, 'echo', { path: '/v2/x' })).rejects.toMatchObject({ code: 'path_not_allowed' });
+    await expect(fetchUp({ upstreams: { echo: {} } }, 'echo', { method: 'DELETE', path: '/v1' })).rejects.toMatchObject({ code: 'invalid_request' });
+    await expect(fetchUp({ upstreams: { open: {} } }, 'open', { path: '/gzip', maxBytes: 5 })).rejects.toMatchObject({ code: 'upstream_error', message: 'upstream response exceeded the size cap' });
+  });
+
+  it('follows a same-origin redirect like the route; a foreign one is upstream_redirect', async () => {
+    const r = await fetchUp({ upstreams: { echo: {} } }, 'echo', { path: '/v1/dir' });
+    expect(r.status).toBe(200);
+    expect(JSON.parse(r.body.toString('utf8'))).toMatchObject({ path: '/v1/dir/', headers: { authorization: `Bearer ${SECRET}` } });
+    await expect(fetchUp({ upstreams: { echo: {} } }, 'echo', { path: '/redirect' })).rejects.toMatchObject({
+      code: 'upstream_redirect',
+      status: 502,
+      details: { location_path: '/latest/meta-data/' },
+    });
   });
 });

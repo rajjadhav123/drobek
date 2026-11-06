@@ -1,5 +1,5 @@
 /**
- * The server half every app-page tab shares (NSO-288):
+ * The server half every app-page tab shares:
  *
  *  - `loadAppPage` — role gate (requireWorkspaceRole: non-member / unknown
  *    → 404, anonymous → /login) + the live app of THIS workspace (a deleted
@@ -8,27 +8,37 @@
  *    compile state of the newest version, the published version and the
  *    single-writer lease ("an agent of X is working, last write N s ago");
  *  - `appAction` — EVERY app mutation of the dashboard, dispatched on the
- *    form's `intent`: publish, restore, unpublish, unlock, visibility,
- *    frame-ancestors, gallery (NSO-340: list / relist / unlist), delete.
+ *    form's `intent`: publish, restore, keep / unkeep (a version),
+ *    delete-versions (the history clean-up), unpublish, unlock, visibility,
+ *    frame-ancestors, gallery (list / relist / unlist), delete.
  *    The editor gate runs FIRST (a viewer → 403, before the form is even
  *    read); the global origin check
  *    (createOriginCheckMiddleware) already refused cross-origin posts. Each
  *    mutation is a @drobek/apps function (the same ones the MCP tools use),
  *    which writes its audit row; the app hosts' cache is busted right after.
- *    A taken-down app (NSO-293, `apps.locked_reason`) answers publish /
- *    restore / unpublish with 423 `app_locked_by_admin`; the header carries
+ *    A taken-down app (`apps.locked_reason`) answers publish /
+ *    restore / unpublish / delete-versions with 423 `app_locked_by_admin`
+ *    (keeping a version stays allowed); the header carries
  *    `lockedByAdmin` for <LockedByAdminNotice>. A workspace the operator
  *    blocked answers publish with 403 `publish_blocked`, and with
- *    PUBLISH_APPROVAL=approval (NSO-366) an unapproved one with 403
+ *    PUBLISH_APPROVAL=approval an unapproved one with 403
  *    `publish_not_approved`; the header carries `publishApproval` for
  *    <PublishApprovalNotice> and the `request-publish-approval` intent asks
- *    the operator.
+ *    the operator. A restore past the workspace's VERSIONS_PER_APP_HOUR /
+ *    VERSIONS_PER_USER_HOUR answers 429 `rate_limited` with Retry-After.
+ *    Keeping a version past APP_VERSIONS_KEPT_MAX answers 400 with the
+ *    limit's message. `delete-versions` needs `confirmed=1` and the
+ *    `planId` of the plan the confirm panel showed (its POST); it recomputes
+ *    what goes under the app's row lock and deletes nothing (409) when that is
+ *    no longer the plan the member confirmed.
  */
 import { data, redirect, type ActionFunctionArgs, type LoaderFunctionArgs } from 'react-router';
 import { and, desc, eq, inArray, max } from 'drizzle-orm';
 import {
   AppsError,
+  deleteVersions,
   getVersion,
+  keepVersion,
   lockedByAdminError,
   notifyAppChanged,
   previewUrl,
@@ -42,6 +52,8 @@ import {
   setGalleryListing,
   softDeleteApp,
   unpublishApp,
+  versionRateLimitsOf,
+  versionStorageLimitsOf,
   type Actor,
 } from '@drobek/apps';
 import { actorKindForSurface } from '@drobek/audit';
@@ -54,8 +66,10 @@ import { appBasePath } from './app-tabs.js';
 import { compileSummary, safeRedirectTo, shapeLock, type LockView } from './app-view.js';
 import { loadAppForView, type AppDetail } from './apps.server.js';
 import type { LockedByAdminView } from './locked-notice.js';
+import { isConfirmed } from './moderation-confirm.js';
 import type { PublishApprovalView } from './publish-approval-notice.js';
 import { publishApprovalView, requestApprovalAction } from './publish-approval.server.js';
+import { countRanges, parseVersionNumber, withVersionResult } from './version-history.js';
 import { canPublish, type CompileStatusName } from './view.js';
 
 export const APP_PASSWORD_MIN = 8;
@@ -100,11 +114,11 @@ export interface AppHeaderData {
   previewVersion: number | null;
   lock: LockView | null;
   canEdit: boolean;
-  /** NSO-293: set when a super-admin took the app down (the banner; publish/restore are refused). */
+  /** Set when a super-admin took the app down (the banner; publish/restore are refused). */
   lockedByAdmin: LockedByAdminView | null;
-  /** NSO-366: set while the workspace may not publish (blocked, or not approved yet) — the notice; publish is refused. */
+  /** Set while the workspace may not publish (blocked, or not approved yet) — the notice; publish is refused. */
   publishApproval: PublishApprovalView | null;
-  /** NSO-340: the slug of the gallery app this one was duplicated from. */
+  /** The slug of the gallery app this one was duplicated from. */
   duplicatedFrom: string | null;
 }
 
@@ -159,7 +173,7 @@ export async function appHeaderData({ access, app }: AppPage): Promise<AppHeader
 }
 
 /**
- * NSO-342: the header of an app sub-page whose loader resolved the access
+ * The header of an app sub-page whose loader resolved the access
  * itself (Data, Forms, Users, Uploads, Logs, Modules, Domains) — the same
  * app lookup (a deleted app / another workspace's → 404) + appHeaderData.
  */
@@ -174,13 +188,12 @@ interface AppActionError {
   intent: string;
 }
 
-function fail(status: number, intent: string, error: string) {
-  return data<AppActionError>({ error, intent }, { status });
+function fail(status: number, intent: string, error: string, headers?: Record<string, string>) {
+  return data<AppActionError>({ error, intent }, { status, ...(headers ? { headers } : {}) });
 }
 
 function versionNumber(raw: FormDataEntryValue | null): number | null {
-  const n = Number(String(raw ?? '').trim());
-  return Number.isInteger(n) && n > 0 ? n : null;
+  return parseVersionNumber(typeof raw === 'string' ? raw : null);
 }
 
 /**
@@ -189,13 +202,13 @@ function versionNumber(raw: FormDataEntryValue | null): number | null {
  * here from any tab), else to the posting page; `delete` lands on the apps
  * list. Expected failures come back as `{ error, intent }` with 400 (409 when
  * another member's agent holds the lease, 423 when a super-admin took the app
- * down) for the page to show.
+ * down, 429 past the version rate) for the page to show.
  */
 export async function appAction({ request, params }: ActionFunctionArgs) {
   // The editor gate FIRST: a viewer gets 403 before anything is read or changed.
   const { access, app } = await loadAppPage(request, params, 'editor');
   const form = await request.formData();
-  // Pre-NSO-288 forms posted only `versionId` (the publish button).
+  // A form with only `versionId` is the publish button.
   const intent = String(form.get('intent') ?? (form.has('versionId') ? 'publish' : ''));
   const actor: Actor = { userId: access.user.id, kind: actorKindForSurface('web') };
   const base = appBasePath(access.workspace.slug, app.slug);
@@ -206,10 +219,10 @@ export async function appAction({ request, params }: ActionFunctionArgs) {
   const requested = await requestApprovalAction(access, form, { base, fallback: back, appName: app.name ?? app.slug });
   if (requested) return requested;
 
-  // NSO-293: a taken-down app is not published, restored or unpublished from
-  // here (@drobek/apps refuses publish/restore itself; unpublish is checked
-  // here so all three answer the same 423).
-  if (app.lockedReason && (intent === 'publish' || intent === 'restore' || intent === 'unpublish')) {
+  // A taken-down app is not published, restored, unpublished or cleaned up
+  // from here (@drobek/apps refuses publish / restore / delete-versions
+  // itself; unpublish is checked here so all four answer the same 423).
+  if (app.lockedReason && (intent === 'publish' || intent === 'restore' || intent === 'unpublish' || intent === 'delete-versions')) {
     return fail(423, intent, lockedByAdminError(app.lockedReason).message);
   }
 
@@ -244,9 +257,53 @@ export async function appAction({ request, params }: ActionFunctionArgs) {
           const holder = (await emailsOf([lease.holder_user_id])).get(lease.holder_user_id) ?? 'another member';
           return fail(409, intent, `An agent of ${holder} is writing this app right now — unlock it first, then restore.`);
         }
-        const out = await restore(app.id, n, actor, { reasoning: `Restore of version ${n} (dashboard)` });
+        const versionLimits = versionRateLimitsOf(await (await moduleRuntime()).workspaceLimits(access.workspace.id));
+        const out = await restore(app.id, n, actor, { reasoning: `Restore of version ${n} (dashboard)`, versionLimits });
         await changed('version', out.number);
         break;
+      }
+      case 'keep':
+      case 'unkeep': {
+        const n = versionNumber(form.get('version'));
+        if (!n) return fail(400, intent, intent === 'keep' ? 'Pick a version to keep.' : 'Pick a version to stop keeping.');
+        const limits = versionStorageLimitsOf(await (await moduleRuntime()).workspaceLimits(access.workspace.id));
+        const out = await keepVersion(app.id, n, intent === 'keep', actor, { keptMax: limits.keptMax, keep: limits.keep });
+        return redirect(
+          withVersionResult(
+            back,
+            intent === 'keep' ? { keptVersion: String(n) } : { unkeptVersion: String(n), ...(out.prunable ? { prunable: '1' } : {}) }
+          )
+        );
+      }
+      case 'delete-versions': {
+        if (!isConfirmed(form)) {
+          return fail(
+            400,
+            intent,
+            'Nothing was deleted: review the clean-up first. Choose “Review clean-up”, check what goes and what stays, then confirm.'
+          );
+        }
+        const upTo = versionNumber(form.get('upTo'));
+        if (!upTo) return fail(400, intent, 'Enter a version number to clean up to, e.g. 12.');
+        const planId = String(form.get('planId') ?? '');
+        if (!planId) {
+          return fail(
+            400,
+            intent,
+            'Nothing was deleted: review the clean-up first. Choose “Review clean-up”, check what goes and what stays, then confirm.'
+          );
+        }
+        const failedOnly = form.get('failedOnly') === '1';
+        const out = await deleteVersions(app.id, upTo, { failedOnly, expectedPlanId: planId }, actor);
+        const stayed = Object.values(out.skipped).reduce((n, ranges) => n + countRanges(ranges ?? []), 0);
+        return redirect(
+          withVersionResult(base, {
+            deletedCount: String(out.count),
+            ...(out.deleted.length > 0 && out.deleted.length <= 50 ? { deletedRanges: out.deleted.join(',') } : {}),
+            ...(failedOnly ? { deletedFailedOnly: '1' } : {}),
+            ...(stayed > 0 ? { stayed: String(stayed) } : {}),
+          })
+        );
       }
       case 'unpublish': {
         await unpublishApp(app.id, actor);
@@ -296,7 +353,7 @@ export async function appAction({ request, params }: ActionFunctionArgs) {
         break;
       }
       case 'gallery': {
-        // NSO-340: "Show in the gallery" + the public description. Listing
+        // "Show in the gallery" + the public description. Listing
         // needs a published app (@drobek/apps refuses otherwise); unchecking
         // unlists and keeps "Allow duplicates" as it was. The same function
         // backs the MCP tool set_gallery_listing.
@@ -330,7 +387,18 @@ export async function appAction({ request, params }: ActionFunctionArgs) {
     // A takedown that landed after the page loaded → 423 like the pre-check.
     if (err instanceof AppsError && err.code === 'app_locked_by_admin') return fail(423, intent, err.message);
     if (err instanceof AppsError && err.code === 'gallery_disabled') return fail(404, intent, err.message);
+    if (err instanceof AppsError && err.code === 'plan_changed') {
+      return fail(
+        409,
+        intent,
+        'Nothing was deleted: the versions this clean-up would delete changed after you reviewed it (a version was written, published, kept or deleted meanwhile). Choose “Review clean-up” again, check the new list, then confirm.'
+      );
+    }
     if (err instanceof AppsError && (err.code === 'publish_not_approved' || err.code === 'publish_blocked')) return fail(403, intent, err.message);
+    if (err instanceof AppsError && err.code === 'rate_limited') {
+      const retry = err.details?.retry_after_seconds;
+      return fail(429, intent, err.message, retry ? { 'Retry-After': String(retry) } : undefined);
+    }
     if (err instanceof AppsError) return fail(400, intent, err.message);
     throw err;
   }

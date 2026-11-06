@@ -1,6 +1,5 @@
 /**
- * The public TypeScript module contract of drobek (M1-01, NSO-287) — semver
- * 1.x. A platform module is an npm package (a built-in under `modules/<name>`,
+ * The public TypeScript module contract of drobek — semver 1.x. A platform module is an npm package (a built-in under `modules/<name>`,
  * a third-party one named `drobek-module-<name>`) whose default export is the
  * result of `defineModule()`. The OPERATOR installs modules and lists them in
  * `DROBEK_MODULES`; they are trusted server-side dependencies of the same
@@ -13,13 +12,19 @@
  * `configSchema` (set by agents through `configure_module`, risky changes held
  * for the owner's confirmation by `confirmRequired`), the names of the secrets
  * it can use (values only ever entered in the dashboard), limits, and a SKILL:
- * the agent-facing documentation `skill_info` returns.
+ * the agent-facing documentation `skill_info` returns. A module with no app
+ * surface — only contributions to operator slots (`errors.reporter`,
+ * `email.transport`), server jobs, hooks, limits, migrations — may leave the
+ * skill out: it is operator-only, never shown to agents or app owners.
  *
- * Contract 1.1 adds: `contract` (the contract versions a module works
- * with), `errors` (its own error codes), typed `slots` other modules
- * contribute to (`contributes`, read with `services.contributions()`),
- * `availability`, `dashboard.editor` and `hooks.onAppDelete` — all
- * optional, so a 1.0 module loads unchanged.
+ * Contract 1.1 adds `contract`, `errors`, typed `slots` (`contributes`,
+ * `services.contributions()`), `availability`, `dashboard.editor` and
+ * `hooks.onAppDelete`. Contract 1.2 adds `jobs` (scheduled work), a route
+ * context's `pendingConfig`, and a per-app job context's `upstreams.fetch`,
+ * `records.import` and audit. Contract 1.3 adds `secretsFor` (secrets that
+ * follow the app's config), the `webhooks` authority, a route context's
+ * `records.create` and a route's `passwordGate: 'skip'`. Every addition is
+ * optional, so an older module loads unchanged.
  *
  * Everything a handler needs arrives in a per-request, APP-SCOPED
  * ModuleContext: the caller (principal from the `drobek_eu` end-user cookie),
@@ -38,13 +43,16 @@ import type { ZodType } from 'zod';
  * e.g. `'^1.1'`); the server refuses to start a module whose range this
  * version does not satisfy.
  */
-export const MODULE_CONTRACT_VERSION = '1.1.0';
+export const MODULE_CONTRACT_VERSION = '1.3.0';
 
 /** Module names: lowercase, URL-, JS-property- and env-safe. */
 export const MODULE_NAME_RE = /^[a-z][a-z0-9]{1,30}$/;
 
 /** Error codes a module declares in `errors`: lowercase snake case, 3–41 characters. */
 export const MODULE_ERROR_CODE_RE = /^[a-z][a-z0-9_]{2,40}$/;
+
+/** Job names: lowercase snake case, 2–40 characters, unique within the module. */
+export const JOB_NAME_RE = /^[a-z][a-z0-9_]{1,39}$/;
 
 /** Slot names: `<host module name>.<camelCase name>`, e.g. `auth.provider`. */
 export const SLOT_NAME_RE = /^[a-z][a-z0-9]*\.[a-z][a-zA-Z0-9]*$/;
@@ -53,7 +61,7 @@ export const SLOT_NAME_RE = /^[a-z][a-z0-9]*\.[a-z][a-zA-Z0-9]*$/;
 
 /**
  * Who is calling a module route, resolved by core from the host-only
- * `drobek_eu` end-user session cookie of the app host (§5.0). The platform
+ * `drobek_eu` end-user session cookie of the app host. The platform
  * module `auth` signs end users in (e-mail code):
  *  - `anon` — no (valid) session;
  *  - `user` — an end user signed in to THIS app; `role: 'admin'` marks the
@@ -72,7 +80,7 @@ export interface EndUser {
   role: 'user' | 'admin';
   /**
    * How the session signed in: `email` (the e-mail code) or an auth
-   * provider's id (NSO-348). Absent = `email` (a session from before
+   * provider's id. Absent = `email` (a session from before
    * providers existed). Never part of the principal a module sees.
    */
   provider?: string;
@@ -118,7 +126,7 @@ export interface ModuleSkill {
   markdown: string;
 }
 
-/** A limit the module enforces — its env name is the operator's knob (§5.7). */
+/** A limit the module enforces — its env name is the operator's knob. */
 export interface ModuleLimit {
   /** Env var name, e.g. `FORMS_PER_APP_PER_DAY` (UPPER_SNAKE). */
   env: string;
@@ -228,6 +236,12 @@ export interface ModuleSlot<T = unknown> {
   unique?: string;
   /** What a contribution does, for module authors and the dashboard. */
   description: string;
+  /**
+   * The contributions configure the server, not apps (e.g. where its errors
+   * or its mail go): a module whose only contributions go to such slots may
+   * leave out its skill (an operator-only module). Default false.
+   */
+  operatorOnly?: boolean;
 }
 
 /**
@@ -250,6 +264,102 @@ export interface ModuleDashboard {
    * `data`'s) or `upstreams` (an `upstreams` config shaped like `proxy`'s).
    */
   editor?: ModuleDashboardEditor;
+  /**
+   * The module's name for people, e.g. `'Scheduled imports'`: the dashboard
+   * shows "Scheduled imports (sync)". The module's `name` stays its
+   * identifier everywhere (URLs, the config key, MCP, skill_info). One line,
+   * at most 60 characters.
+   */
+  title?: string;
+  /**
+   * One line for the app's owner, shown in the dashboard under the title
+   * instead of `skill.useWhen` (which is written for agents). At most 200
+   * characters.
+   */
+  description?: string;
+}
+
+/**
+ * Where the dashboard's config form takes the choices of a string field from
+ * (the JSON Schema keyword `x-drobek-choices`, see ConfigFieldMeta):
+ *
+ *  - `upstreams` — the upstreams registered in the app's workspace, those
+ *    assigned to the app first (the config of the module declaring
+ *    `dashboard.editor: 'upstreams'`);
+ *  - `collections` — the app's data collections (the config of the module
+ *    declaring `dashboard.editor: 'collections'`);
+ *  - `intervals` — intervals from 5 minutes to a day (`'5m'` … `'24h'`), none
+ *    shorter than the module limit `x-drobek-min-interval` names;
+ *  - `forms` — the app's forms: those with stored submissions or settings
+ *    (the module declaring the `submissions` authority).
+ *
+ * On a record's `propertyNames` (the name of an entry) the choices are
+ * suggestions for a new entry's name instead: names no entry uses yet, and
+ * any other name can still be typed.
+ */
+export type ConfigChoices = 'upstreams' | 'collections' | 'intervals' | 'forms';
+
+/** A principal of a rule as the config form's checkboxes offer it (nothing checked is `none`). */
+export type ConfigRulePrincipal = 'public' | 'user' | 'owner' | 'admin';
+
+/** The unit a number field is stored in (`x-drobek-unit`): `bytes` is entered in MB. */
+export type ConfigUnit = 'bytes';
+
+/**
+ * What the dashboard's config form reads from a field of a module's
+ * `configSchema` — set with zod's `.meta()`, e.g.
+ * `z.string().meta({ title: 'Upstream', 'x-drobek-choices': 'upstreams' } satisfies ConfigFieldMeta)`.
+ * Presentation only: configure_module and the configSchema validate the
+ * same with or without it, and a value outside the choices stays valid.
+ */
+export interface ConfigFieldMeta {
+  /** The field's label (without one: the key, humanized). */
+  title?: string;
+  /** Shown under the field. */
+  description?: string;
+  /**
+   * A string field becomes a select of these choices (see ConfigChoices). A
+   * current value that is not among them stays selectable, marked; with no
+   * choice at all the form says what to set up first, and where.
+   */
+  'x-drobek-choices'?: ConfigChoices;
+  /**
+   * With `'x-drobek-choices': 'intervals'`: the env name of one of the
+   * module's `limits` that holds the shortest interval in minutes (the
+   * workspace's value applies), e.g. `'SYNC_MIN_INTERVAL_MIN'`.
+   */
+  'x-drobek-min-interval'?: string;
+  /**
+   * A rule string field (`public`, `user`, `owner`, `admin` or `none`,
+   * alternatives joined with `|`) becomes one checkbox per principal —
+   * Anyone, Signed-in users, Record owner, App admins; nothing checked is
+   * `none`. `true` offers all four, a list only those (a principal the
+   * current rule names is offered too, so a save never drops it).
+   */
+  'x-drobek-rule'?: true | readonly ConfigRulePrincipal[];
+  /**
+   * A number field stored in this unit is entered in a unit people read:
+   * `bytes` in MB (1 MB = 1,048,576 bytes). The saved value stays in bytes.
+   */
+  'x-drobek-unit'?: ConfigUnit;
+  /**
+   * The env name of one of the module's `limits` that applies while the
+   * field is empty, e.g. `'FILES_MAX_BYTES'`: the form shows the
+   * workspace's value as what an empty field means.
+   */
+  'x-drobek-default-limit'?: string;
+  /**
+   * The form does not show the field and carries its current value through
+   * a save — for a key the dashboard sets with a control of its own (a
+   * pause button). configure_module sets it as before.
+   */
+  'x-drobek-hidden'?: boolean;
+  /**
+   * On an object: the keys the form shows first, in this order; the other
+   * keys follow in the schema's order (e.g. an `enabled` switch before the
+   * fields it turns on).
+   */
+  'x-drobek-order'?: readonly string[];
 }
 
 /**
@@ -277,7 +387,7 @@ export interface EndUserAuthority<Config = unknown> {
     contributions<T = unknown>(slot: string): T[];
   }): Promise<EndUser | null>;
 
-  // ── the owner's view (the dashboard Users tab, M2-03) — optional ──
+  // ── the owner's view (the dashboard Users tab) — optional ──
   // Core calls these only after it authorized a drobek account for the app
   // (the workspace role; changes are editor+). Unknown user → null / a
   // ModuleError `not_found`.
@@ -298,7 +408,7 @@ export interface EndUserAuthority<Config = unknown> {
   setDisabled?(view: OwnerView<Config>, id: string, disabled: boolean): Promise<EndUserRecord | null>;
 
   /**
-   * The IdP callback of the end-user sign-in providers (NSO-348): core routes
+   * The IdP callback of the end-user sign-in providers: core routes
    * `GET|POST /__drobek/auth/callback/:provider` on the DASHBOARD host here —
    * the one redirect URI an IdP client registers for every app. No dashboard
    * session is read and no origin check applies (the IdP redirects or posts
@@ -428,10 +538,12 @@ export interface ConfirmContext {
   app: HookApp;
   /** Read-only use: the configure transaction (the config row is locked). */
   db: DB;
+  /** Limits of the app's workspace (contract 1.2 — core always passes it; optional for 1.1 callers such as a module's own tests). */
+  limits?(): Promise<Limits>;
 }
 
 /**
- * Who may confirm a pending change (NSO-322 H3): `editor` (the default —
+ * Who may confirm a pending change: `editor` (the default —
  * editors, workspace admins, super-admins) or `admin` (workspace admins and
  * super-admins only), e.g. a change that spends a secret an admin registered.
  */
@@ -545,15 +657,32 @@ export interface RecordsAuthority<Config = unknown> {
   /** The CSV export of a collection (filter + sort applied): the header line, then one line per record (no line breaks). */
   csv(view: RecordsView<Config>, query: Omit<RecordsQuery, 'limit' | 'cursor'>): AsyncIterable<string>;
 
-  // ── owner edits (the dashboard Data tab, M2-03, editor+) — optional ──
+  // ── owner edits (the dashboard Data tab and the MCP data tools, editor+) — optional ──
 
   /**
    * Replace a record's own fields (`_…` keys are ignored), validated like any
    * write (schema, the per-record and per-app quotas); `_owner` and
-   * `_created_at` stay. null when the record does not exist. A bad record →
-   * ModuleError `validation_failed` (details: the fields).
+   * `_created_at` stay. With `merge`, `fields` are merged onto the stored
+   * ones instead (a shallow merge, like the SDK's update). null when the
+   * record does not exist. A bad record → ModuleError `validation_failed`
+   * (details: the fields).
    */
-  update?(view: RecordsView<Config>, collection: string, id: string, fields: Record<string, unknown>): Promise<Record<string, unknown> | null>;
+  update?(
+    view: RecordsView<Config>,
+    collection: string,
+    id: string,
+    fields: Record<string, unknown>,
+    opts?: RecordsUpdateOptions
+  ): Promise<Record<string, unknown> | null>;
+  /**
+   * Store new records (no owner; `_…` keys are ignored) in a declared
+   * collection as a whole — ONE transaction, every record checked against
+   * the collection's schema, the per-record size and the app's quotas first;
+   * any failure stores nothing (a bad record → ModuleError
+   * `validation_failed`, `details.index` names it). Returns the stored
+   * records in the given order.
+   */
+  create?(view: RecordsView<Config>, collection: string, records: Record<string, unknown>[]): Promise<Record<string, unknown>[]>;
   /**
    * Import CSV text into a collection as new records (no owner): the header
    * names the fields. All or nothing — ONE transaction; too many rows
@@ -580,6 +709,37 @@ export interface RecordsAuthority<Config = unknown> {
    * (the owner deletes a declared one with dropCollection).
    */
   purgeOrphan?(view: RecordsView<Config>, collection: string): Promise<{ records: number }>;
+  /**
+   * Contract 1.2: write a batch of records into a declared
+   * collection as a whole — ONE transaction, every record checked against
+   * the collection's schema and the quotas first; any failure stores
+   * nothing. `replace`: the collection holds exactly these records
+   * afterwards; `upsert`: a record whose `key` field equals a stored
+   * record's replaces that record's fields, the others are added, the rest
+   * stay. Records have no owner. A bad record → ModuleError
+   * `validation_failed` (`details.index` names it).
+   */
+  importRecords?(view: RecordsView<Config>, collection: string, records: Record<string, unknown>[], opts: RecordsImportOptions): Promise<RecordsImportResult>;
+}
+
+/** How `update` changes a record. */
+export interface RecordsUpdateOptions {
+  /** true: merge the fields onto the stored ones; false (default): replace them. */
+  merge?: boolean;
+}
+
+/** How `importRecords` writes a batch. */
+export interface RecordsImportOptions {
+  mode: 'replace' | 'upsert';
+  /** The field that identifies a record (required for `upsert`; its values are strings or numbers, unique in the batch). */
+  key?: string;
+}
+
+/** What `importRecords` changed. */
+export interface RecordsImportResult {
+  inserted: number;
+  updated: number;
+  deleted: number;
 }
 
 /** The most rows (without the header) one CSV import may carry. */
@@ -664,6 +824,149 @@ export interface FilesAuthority<Config = unknown> {
   remove(view: OwnerView<Config>, id: string): Promise<boolean>;
 }
 
+// ── the upstreams authority (proxy) — contract 1.2 ──────────────────────────
+
+/** One call a job makes to an upstream assigned to its app. */
+export interface UpstreamRequest {
+  /** Default `GET`. The upstream's allowed methods still apply. */
+  method?: 'GET' | 'POST';
+  /** Path (and `?query`) below the upstream's base URL; default `/`. Its allowed path prefixes still apply. */
+  path?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  /** A lower response cap than the operator's (never a higher one). */
+  maxBytes?: number;
+}
+
+/** The upstream's answer (any status — check it). */
+export interface UpstreamResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: Buffer;
+}
+
+/**
+ * The module that owns the app's calls to its workspace's upstreams (the
+ * built-in `proxy`) makes one for a module JOB (never for an app request):
+ * the same checks as its route minus the caller's rule — the upstream is
+ * assigned to the app in `view.config` and confirmed for it, the secret is
+ * injected server-side, the SSRF guard, the allow-lists and the size cap
+ * apply. A refusal → ModuleError (`forbidden`, `not_found`, `upstream_error`,
+ * `ssrf_blocked`, `proxy_busy`, …) with a secret-free message.
+ */
+export interface UpstreamsAuthority<Config = unknown> {
+  fetch(view: OwnerView<Config>, name: string, request: UpstreamRequest): Promise<UpstreamResponse>;
+}
+
+// ── the sync authority (sync) — contract 1.2 ────────────────────────────────
+
+/** One source of the module that imports data on a schedule, as the owner sees it. */
+export interface SyncSourceState {
+  name: string;
+  upstream: string;
+  path: string;
+  collection: string;
+  mode: 'replace' | 'upsert';
+  /** The interval in force (the config's, raised to the operator's minimum). */
+  every: string;
+  /**
+   * Why it does not run on schedule: `owner` (the config says `paused: true`),
+   * `failures` (too many failed runs in a row), `limit` (past the app's source
+   * limit), or null.
+   */
+  paused: 'owner' | 'failures' | 'limit' | null;
+  /** Failed runs since the last success. */
+  failures: number;
+  last_run_at: string | null;
+  last_status: 'ok' | 'failed' | null;
+  last_records: number | null;
+  last_error: string | null;
+  last_success_at: string | null;
+  /** When the next scheduled run is due (null while paused). */
+  next_run_at: string | null;
+}
+
+/** One run of a source (newest first in `runs`). */
+export interface SyncRun {
+  source: string;
+  trigger: 'schedule' | 'manual';
+  started_at: string;
+  duration_ms: number;
+  status: 'ok' | 'failed';
+  /** Records the collection holds from this run (ok), null when it failed. */
+  records: number | null;
+  inserted?: number;
+  updated?: number;
+  deleted?: number;
+  /** Why it failed (secret-free), null when ok. */
+  error: string | null;
+}
+
+/**
+ * The module that imports data into the app on a schedule (the built-in
+ * `sync`) answers the OWNER — the dashboard and MCP (`sync_now`, get_logs
+ * `sync`): core calls it only after it authorized a drobek account for the
+ * app. Unknown source → ModuleError `not_found`.
+ */
+export interface SyncAuthority<Config = unknown> {
+  sources(view: OwnerView<Config>): Promise<SyncSourceState[]>;
+  /** The latest runs (newest first; `source` narrows, `since` bounds, at most `limit`, ≤ 100). */
+  runs(view: OwnerView<Config>, query: { source?: string; since?: Date; limit?: number }): Promise<SyncRun[]>;
+  /** Run one source now (a paused one too); `ctx` is a per-app job context whose audit names the person. */
+  runNow(ctx: AppJobContext<Config>, source: string): Promise<SyncRun>;
+  /** Clear a pause after failures (the next run is due at once); false when it was not paused so. */
+  resume(view: OwnerView<Config>, source: string): Promise<boolean>;
+}
+
+// ── the webhooks authority (webhooks) ───────────────────────────────────────
+
+/** One endpoint of the module that receives webhooks, as the owner sees it. */
+export interface WebhookEndpointState {
+  name: string;
+  /** The address a sending service posts to (the app's production host). */
+  url: string;
+  collection: string;
+  /** How a delivery is verified, e.g. `hmac-sha256` (the module's own scheme names). */
+  verify: string;
+  /** Deliveries carry a signature (false: a shared token only). */
+  signed: boolean;
+  /** The name of the app's module secret the endpoint verifies with (its value is never shown). */
+  secret: string;
+  enabled: boolean;
+  last_delivery_at: string | null;
+  last_status: WebhookDeliveryStatus | null;
+}
+
+/** What happened to one delivery. */
+export type WebhookDeliveryStatus = 'accepted' | 'rejected_signature' | 'duplicate' | 'too_large' | 'rate_limited' | 'collection_error';
+
+/** One delivery (newest first in `deliveries`) — never its body. */
+export interface WebhookDelivery {
+  endpoint: string;
+  status: WebhookDeliveryStatus;
+  /** The HTTP status the sender got. */
+  http_status: number;
+  /** Body size in bytes. */
+  bytes: number;
+  /** A short code of why it was not accepted (`bad_signature`, `secret_not_set`, `quota_exceeded`, …), null when accepted. */
+  reason: string | null;
+  /** The stored record's `_id` (accepted), else null. */
+  record_id: string | null;
+  received_at: string;
+}
+
+/**
+ * The module that receives webhooks into the app's collections (the built-in
+ * `webhooks`) answers the OWNER — the dashboard and MCP (get_logs
+ * `webhooks`): core calls it only after it authorized a drobek account for
+ * the app.
+ */
+export interface WebhooksAuthority<Config = unknown> {
+  endpoints(view: OwnerView<Config>): Promise<WebhookEndpointState[]>;
+  /** The latest deliveries (newest first; `endpoint` narrows, `since` bounds, at most `limit`, ≤ 100). */
+  deliveries(view: OwnerView<Config>, query: { endpoint?: string; since?: Date; limit?: number }): Promise<WebhookDelivery[]>;
+}
+
 // ── per-app info (get_app / configure_module) ────────────────────────────────
 
 /** One app as a module sees it outside a request: its effective config + services. */
@@ -672,6 +975,143 @@ export interface ModuleAppView<Config = unknown> {
   config: Config;
   db: DB;
   log: Logger;
+}
+
+// ── scheduled jobs (contract 1.2) ───────────────────────────────────────────
+
+/**
+ * How often a job runs: milliseconds, or a whole count with a unit — `'30s'`,
+ * `'5m'`, `'1h'`, `'1d'`. Between JOB_MIN_INTERVAL_MS (1 minute) and
+ * JOB_MAX_INTERVAL_MS (30 days).
+ */
+export type JobInterval = number | `${number}${'s' | 'm' | 'h' | 'd'}`;
+
+/** What every job run gets. */
+export interface JobContextBase extends ModuleServices {
+  module: string;
+  /** The job's name. */
+  job: string;
+  /**
+   * Aborted when the run exceeds the operator's MODULE_JOBS_TIMEOUT_MS or the
+   * server shuts down: pass it to `fetch` and stop early. A run that ignores
+   * it counts as failed at the timeout all the same.
+   */
+  signal: AbortSignal;
+  /** When the last successful run of this job (for this app) started, or null. */
+  lastSuccessAt: Date | null;
+}
+
+/** What a `scope: 'server'` job gets: the module's apps to iterate and the server-wide limits. */
+export interface ServerJobContext<Config = unknown> extends JobContextBase {
+  /** The server's default limits (env / catalogue defaults — no workspace is known). */
+  limits(): Promise<Limits>;
+  /**
+   * The live apps (not deleted, not taken down) that have a stored config of
+   * this module and whose workspace has it on, each with its effective
+   * config. Stop early by leaving the loop.
+   */
+  apps(): AsyncIterable<ModuleAppView<Config>>;
+}
+
+/** What a `scope: 'app'` job gets — scoped to ONE app, like a route's ModuleContext without a caller. */
+export interface AppJobContext<Config = unknown> extends JobContextBase {
+  app: HookApp;
+  /** This app's effective config. */
+  config: Config;
+  /** The config once the owner confirms its pending change, or null. Never act on it: it is not in force. */
+  pendingConfig: Config | null;
+  /** Limits of this app's workspace. */
+  limits(): Promise<Limits>;
+  /** Fixed-window counter namespaced to this module + app (the same buckets its routes use). */
+  rateLimit(bucket: string, key: string, max: number, windowMs: number): Promise<RateLimitResult>;
+  secrets: {
+    /** The plaintext of this app's declared secret `name` for this module, or null. */
+    get(name: string): Promise<string | null>;
+  };
+  /**
+   * Call an upstream assigned to THIS app (the proxy config, a
+   * workspace admin confirmed it) through the module that declares
+   * `upstreams` — the secret is injected server-side, never seen here.
+   * ModuleError `unavailable` when no such module is on for the workspace.
+   */
+  upstreams: {
+    fetch(name: string, request?: UpstreamRequest): Promise<UpstreamResponse>;
+  };
+  /**
+   * Write a batch of records into one of THIS app's declared
+   * collections through the records authority (`importRecords`: all or
+   * nothing, schema + quotas checked). ModuleError `unavailable` when the
+   * records module cannot.
+   */
+  records: {
+    import(collection: string, records: Record<string, unknown>[], opts: RecordsImportOptions): Promise<RecordsImportResult>;
+  };
+  /**
+   * Append an audit row for this app (the action is prefixed with the module
+   * name). A scheduled run has no person behind it: actor kind `user` without
+   * a user (the Activity page shows "system"), `meta.by: 'schedule'`; a run a
+   * person started (the sync authority's `runNow`) names them.
+   */
+  audit(action: string, meta?: Record<string, unknown>): Promise<void>;
+}
+
+/** A job core runs once per interval for the whole server (one replica at a time). */
+export interface ServerJob<Config = unknown> {
+  /** `JOB_NAME_RE`, unique within the module. */
+  name: string;
+  /** One line for operators and agents (skill_info). */
+  description?: string;
+  scope?: 'server';
+  every: JobInterval;
+  run(ctx: ServerJobContext<Config>): Promise<void> | void;
+}
+
+/**
+ * A job core runs for EACH app that has a stored config of the module and
+ * the module on for its workspace, each app on its own interval — fixed, or
+ * read from the app's config (`every(config, app)`; null or undefined = not
+ * for this app now).
+ */
+export interface AppJob<Config = unknown> {
+  /** `JOB_NAME_RE`, unique within the module. */
+  name: string;
+  /** One line for operators and agents (skill_info). */
+  description?: string;
+  scope: 'app';
+  every: JobInterval | ((config: Config, app: HookApp) => JobInterval | null | undefined);
+  run(ctx: AppJobContext<Config>): Promise<void> | void;
+}
+
+/**
+ * Scheduled work of a module (contract 1.2). Core runs each job on its
+ * interval under a Redis lease (once across replicas), at most
+ * MODULE_JOBS_CONCURRENCY runs per process, each cut off at
+ * MODULE_JOBS_TIMEOUT_MS. A failed run is logged (a per-app job's also in the
+ * app's get_logs `runtime`) and retried with backoff; it never affects the
+ * server's start or its requests. A job is the module's own trusted code —
+ * the server still never runs app code.
+ */
+export type ModuleJob<Config = unknown> = ServerJob<Config> | AppJob<Config>;
+
+const INTERVAL_RE = /^(\d+)(s|m|h|d)$/;
+const UNIT_MS = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 } as const;
+/** The shortest interval a job runs at. */
+export const JOB_MIN_INTERVAL_MS = 60_000;
+/** The longest interval a job runs at. */
+export const JOB_MAX_INTERVAL_MS = 30 * 86_400_000;
+
+/**
+ * A JobInterval in milliseconds, or null when the value is not one (a number
+ * that is not a positive integer, any other string). Not range-checked — see
+ * JOB_MIN_INTERVAL_MS / JOB_MAX_INTERVAL_MS.
+ */
+export function parseJobInterval(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0 ? value : null;
+  if (typeof value !== 'string') return null;
+  const m = INTERVAL_RE.exec(value.trim());
+  if (!m) return null;
+  const ms = Number(m[1]) * UNIT_MS[m[2] as keyof typeof UNIT_MS];
+  return Number.isSafeInteger(ms) && ms > 0 ? ms : null;
 }
 
 // ── the module ───────────────────────────────────────────────────────────────
@@ -687,6 +1127,7 @@ export interface DrobekModule<Config = unknown> {
    * server refuses to start; missing → a start-up warning.
    */
   contract?: string;
+  /** The agent-facing documentation (skill_info, the briefing). A module without one is an OperatorModule. */
   skill: ModuleSkill;
   /**
    * Per-app configuration (zod). Validates every configure_module call and
@@ -725,6 +1166,16 @@ export interface DrobekModule<Config = unknown> {
    */
   onConfirmed?(before: Config, after: Config, context: ConfirmedContext): void | Promise<void>;
   secrets?: ModuleSecretDoc[];
+  /**
+   * Secrets that follow the app's config, in addition to `secrets`: the
+   * names this app's effective config uses (e.g. one signing secret per
+   * webhook endpoint). Core calls it with the effective config wherever it
+   * lists or reads the app's secrets — the dashboard, get_app,
+   * configure_module's `secrets_missing`, `ctx.secrets.get`,
+   * remove_module_secret. Names that are not UPPER_SNAKE are ignored; a
+   * throw counts as none.
+   */
+  secretsFor?(config: Config): ModuleSecretDoc[];
   rules?: RuleSurface;
   limits?: ModuleLimit[];
   /** Register the HTTP routes (called once at startup). */
@@ -746,6 +1197,12 @@ export interface DrobekModule<Config = unknown> {
   submissions?: SubmissionsAuthority<Config>;
   /** Only the module that stores end-user uploads (files): the owner's view for the dashboard. */
   files?: FilesAuthority<Config>;
+  /** Contract 1.2 — only the module that owns the app's upstream calls (proxy): a module job's `ctx.upstreams.fetch`. */
+  upstreams?: UpstreamsAuthority<Config>;
+  /** Contract 1.2 — only the module that imports data on a schedule (sync): the owner's view for the dashboard and MCP. */
+  sync?: SyncAuthority<Config>;
+  /** Only the module that receives webhooks into the app's collections (webhooks): the owner's view for the dashboard and MCP. */
+  webhooks?: WebhooksAuthority<Config>;
   /**
    * Secret-free facts about this module's state for ONE app, shown to the
    * app's agents: get_app's `modules.<name>.info` and configure_module's
@@ -790,11 +1247,32 @@ export interface DrobekModule<Config = unknown> {
   availability?: ModuleAvailability;
   /** How the dashboard presents the module. */
   dashboard?: ModuleDashboard;
+  /**
+   * Scheduled jobs (contract 1.2) — see ModuleJob. A module with jobs
+   * declares `contract: '^1.2'`: a 1.1 server ignores the field.
+   */
+  jobs?: ModuleJob<Config>[];
 }
 
-/** A module of any config type (what the registry holds). */
+/**
+ * A module without a skill: operator-only. Allowed only with no app surface —
+ * no routes, sdk, app config (configSchema fields, salvageConfig,
+ * confirmRequired, onConfirmed), secrets, rules, errors, owner authority,
+ * appInfo, opt-in availability, dashboard.editor, `scope: 'app'` job, compose
+ * or slot that is not `operatorOnly` — and with contributions to
+ * `operatorOnly` slots only (`errors.reporter`, `email.transport`); the
+ * registry refuses anything else at start. It is left out of skill_info, the
+ * briefing, llms.txt, configure_module and the app's Modules tab;
+ * /api/version and the super-admin's workspace Modules page mark it
+ * `operatorOnly`.
+ */
+export interface OperatorModule<Config = unknown> extends Omit<DrobekModule<Config>, 'skill'> {
+  skill?: undefined;
+}
+
+/** A module of any config type, with or without a skill (what the registry holds). */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type AnyModule = DrobekModule<any>;
+export type AnyModule = DrobekModule<any> | OperatorModule<any>;
 
 const BRAND = Symbol.for('drobek.module');
 
@@ -808,8 +1286,11 @@ export type ComposedModuleParts<Config = unknown> = Partial<
   Pick<DrobekModule<Config>, 'configSchema' | 'configDefaults' | 'salvageConfig' | 'confirmRequired' | 'secrets'>
 >;
 
-/** Declare a module (typed identity + a brand the registry checks). */
-export function defineModule<Config>(module: DrobekModule<Config>): DrobekModule<Config> {
+/** Declare a module (typed identity + a brand the registry checks): with a skill a DrobekModule, without one an OperatorModule. */
+export function defineModule<Config>(module: DrobekModule<Config>): DrobekModule<Config>;
+export function defineModule<Config>(module: OperatorModule<Config>): OperatorModule<Config>;
+export function defineModule<Config>(module: DrobekModule<Config> | OperatorModule<Config>): DrobekModule<Config> | OperatorModule<Config>;
+export function defineModule<Config>(module: DrobekModule<Config> | OperatorModule<Config>): DrobekModule<Config> | OperatorModule<Config> {
   return Object.freeze({ ...module, [BRAND]: MODULE_CONTRACT_VERSION });
 }
 
@@ -831,7 +1312,7 @@ export interface RateLimitResult {
   retryAfterSec: number;
 }
 
-/** Who an e-mail may go to — never an arbitrary address (§5.4). */
+/** Who an e-mail may go to — never an arbitrary address. */
 export type EmailRecipient =
   /** The addresses at this dotted path of THIS module's app config (owner-confirmed). */
   | { config: string }
@@ -893,6 +1374,21 @@ export interface ModuleContext<Config = unknown> extends ModuleServices {
    * about something the agent configured but the owner has not confirmed.
    */
   pendingConfig?: Config | null;
+  /**
+   * This app's effective config as stored NOW. `config` is read once per
+   * request; a response that stays open (an event stream) reads this again
+   * before it sends what the config decides. Throws once the app is no
+   * longer served (deleted, taken down): the response ends. Absent on
+   * servers before it existed: fall back to `config`.
+   */
+  currentConfig?(): Promise<Config>;
+  /**
+   * The caller as of NOW (the session read again: signed out, blocked or
+   * expired → anon). A response that stays open checks it again before it
+   * sends what the caller may see. Absent on servers before it existed:
+   * fall back to `principal`.
+   */
+  currentPrincipal?(): Promise<Principal>;
   rules: {
     /** Evaluate `rule` for the caller; `ownerId` = the record's owner (for `owner`). */
     decide(rule: Rule, ownerId?: string | null): AccessDecision;
@@ -907,6 +1403,16 @@ export interface ModuleContext<Config = unknown> extends ModuleServices {
   };
   /** Append an audit row for this app (actor derived by the server). */
   audit(action: string, meta?: Record<string, unknown>): Promise<void>;
+  /**
+   * Store new records (no owner) in one of THIS app's declared collections
+   * through the records authority (`create`: the collection's schema, the
+   * per-record size and the app's quotas apply; the end-user rules do not —
+   * the module authorized the caller itself). All or nothing. ModuleError
+   * `unavailable` when no records module is on for the workspace.
+   */
+  records: {
+    create(collection: string, records: Record<string, unknown>[]): Promise<Record<string, unknown>[]>;
+  };
   email: {
     /**
      * Send to allowed recipients only (never an arbitrary address). Resolves
@@ -920,7 +1426,7 @@ export interface ModuleContext<Config = unknown> extends ModuleServices {
     /**
      * Sign-in codes (`{ signInAddress }`) this app may send per hour under the
      * operator-wide budget (EMAIL_SIGNIN_APP_HOURLY_SHARE of the sign-in
-     * budget) — a module's own per-app cap must not exceed it (NSO-322 H2).
+     * budget) — a module's own per-app cap must not exceed it.
      * Undefined when core runs no e-mail guard (tests).
      */
     signInShare?: number;
@@ -984,10 +1490,11 @@ export interface ModuleResponse {
   status: number;
   /** JSON-serialisable value, a string/Buffer sent as-is, or a Node `Readable` streamed as-is (e.g. a file). */
   body: unknown;
-  headers: Record<string, string>;
+  /** A list value sends the header once per item (e.g. several `Set-Cookie`). */
+  headers: Record<string, string | string[]>;
 }
 
-export function respond(status: number, body: unknown = null, headers: Record<string, string> = {}): ModuleResponse {
+export function respond(status: number, body: unknown = null, headers: Record<string, string | string[]> = {}): ModuleResponse {
   return { __drobekResponse: true, status, body, headers };
 }
 
@@ -1005,7 +1512,7 @@ export interface RouteRateLimit {
   /**
    * What the counter keys on (default `ip`; `principal` = the signed-in user,
    * the IP for an anonymous caller). A request without a resolved client IP
-   * skips an IP-keyed limit — no shared bucket (NSO-328).
+   * skips an IP-keyed limit — no shared bucket.
    */
   per?: 'ip' | 'app' | 'principal';
 }
@@ -1043,6 +1550,13 @@ export interface RouteOptions<Config = unknown, Body = unknown, Query = Record<s
    * endpoints a browser calls without custom headers (e.g. navigator.sendBeacon).
    */
   csrf?: 'sdk-header' | 'same-origin';
+  /**
+   * `skip`: the app's password gate does not apply to this route — for a
+   * route that authenticates the caller itself (a signed webhook from
+   * another server, which cannot unlock the app). Default: a
+   * password-protected app answers 401 `password_required` until unlocked.
+   */
+  passwordGate?: 'skip';
 }
 
 export interface ModuleRouter<Config = unknown> {

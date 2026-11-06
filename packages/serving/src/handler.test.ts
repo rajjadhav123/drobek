@@ -8,7 +8,7 @@ import { Readable } from 'node:stream';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { AppHostTarget } from '@drobek/apps';
 import { APP_CSP, appCsp } from './csp.js';
-import { BEACON_PATH, handleAppRequest, type AppRequest, type HandlerDeps } from './handler.js';
+import { BEACON_PATH, VERSION_TIMING_METRIC, handleAppRequest, type AppRequest, type HandlerDeps } from './handler.js';
 import type { StoredFile } from './manifest.js';
 import { UNLOCK_PATH } from './pages.js';
 import { APP_ACCESS_COOKIE, hashAppPassword, mintAppAccessToken } from './password.js';
@@ -195,6 +195,20 @@ describe('which version a host serves', () => {
     expect((await handleAppRequest(req(prod('nope')), deps)).status).toBe(404);
     expect((await handleAppRequest(req(null), deps)).status).toBe(404);
   });
+
+  it('an HTML page names the version it was served from in Server-Timing (also on a 304); other files do not', async () => {
+    expect(VERSION_TIMING_METRIC).toBe('drobek-version');
+    const timing = (r: { headers: Record<string, string | string[]> }) => r.headers['Server-Timing'];
+    expect(timing(await handleAppRequest(req(preview('shop')), deps))).toBe('drobek-version;desc="2"');
+    expect(timing(await handleAppRequest(req(prod('shop')), deps))).toBe('drobek-version;desc="1"');
+    expect(timing(await handleAppRequest(req(ver('shop', 1), '/some/spa/route'), deps))).toBe('drobek-version;desc="1"');
+    const page = await handleAppRequest(req(preview('shop')), deps);
+    const again = await handleAppRequest(req(preview('shop'), '/', { headers: { 'If-None-Match': String(page.headers.ETag) } }), deps);
+    expect(again.status).toBe(304);
+    expect(timing(again)).toBe('drobek-version;desc="2"');
+    expect(timing(await handleAppRequest(req(preview('shop'), '/main.js'), deps))).toBeUndefined();
+    expect(timing(await handleAppRequest(req(preview('shop'), '/nope.png'), deps))).toBeUndefined();
+  });
 });
 
 describe('which file a path serves', () => {
@@ -227,7 +241,7 @@ describe('caching', () => {
     const first = await handleAppRequest(req(preview('shop'), '/main.js'), deps);
     expect(first.headers.ETag).toBe(`"${sha(MAIN_JS)}"`);
     const second = await handleAppRequest(
-      req(preview('shop'), '/main.js', { headers: { 'If-None-Match': first.headers.ETag } }),
+      req(preview('shop'), '/main.js', { headers: { 'If-None-Match': String(first.headers.ETag) } }),
       deps
     );
     expect(second.status).toBe(304);
@@ -267,7 +281,7 @@ describe('caching', () => {
   });
 });
 
-describe('source maps on the production hosts (NSO-381)', () => {
+describe('source maps on the production hosts', () => {
   const MAP = JSON.stringify({ version: 3, sources: ['src/main.tsx'], sourcesContent: ['secret-free source'], mappings: 'AAAA' });
   const B64 = Buffer.from(MAP).toString('base64');
   const CODE = 'import "/__drobek/beacon.js?v=0123456789abcdef";\nconsole.log("hi");\n';
@@ -322,7 +336,7 @@ describe('source maps on the production hosts (NSO-381)', () => {
         'Content-Security-Policy': APP_CSP,
         'X-Drobek-App': 'mapped',
       });
-      const again = await handleAppRequest(req(t, '/main.js.map', { headers: { 'If-None-Match': map.headers.ETag } }), deps);
+      const again = await handleAppRequest(req(t, '/main.js.map', { headers: { 'If-None-Match': String(map.headers.ETag) } }), deps);
       expect(again.status).toBe(304);
       expect(again.body).toBeNull();
       const head = await handleAppRequest(req(t, '/main.js.map', { method: 'HEAD' }), deps);
@@ -335,7 +349,7 @@ describe('source maps on the production hosts (NSO-381)', () => {
   it('a browser holding the old inline-map bundle gets the new one; the new ETag revalidates to 304', async () => {
     const stale = await handleAppRequest(req(prod('mapped'), '/main.js', { headers: { 'If-None-Match': `"${sha(BUNDLE)}"` } }), deps);
     expect(stale.status).toBe(200);
-    const fresh = await handleAppRequest(req(prod('mapped'), '/main.js', { headers: { 'If-None-Match': stale.headers.ETag } }), deps);
+    const fresh = await handleAppRequest(req(prod('mapped'), '/main.js', { headers: { 'If-None-Match': String(stale.headers.ETag) } }), deps);
     expect(fresh.status).toBe(304);
     expect(fresh.body).toBeNull();
     expect((await handleAppRequest(req(prod('mapped'), '/main.js', { query: 'v=0123abcd' }), deps)).headers['Cache-Control']).toBe(
@@ -380,7 +394,7 @@ describe('headers on every response (snapshot)', () => {
   const PREVIEW_SECURITY = {
     'Content-Security-Policy': APP_CSP,
     'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'no-referrer',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
     'X-Robots-Tag': 'noindex',
   };
 
@@ -392,6 +406,7 @@ describe('headers on every response (snapshot)', () => {
       'Content-Type': 'text/html; charset=utf-8',
       ETag: `"${sha(INDEX_V2)}"`,
       'Cache-Control': 'public, max-age=0, must-revalidate',
+      'Server-Timing': 'drobek-version;desc="2"',
       'Content-Length': String(Buffer.byteLength(INDEX_V2)),
     });
   });
@@ -401,11 +416,12 @@ describe('headers on every response (snapshot)', () => {
     expect(r.headers).toEqual({
       'Content-Security-Policy': APP_CSP,
       'X-Content-Type-Options': 'nosniff',
-      'Referrer-Policy': 'no-referrer',
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
       'X-Drobek-App': 'shop',
       'Content-Type': 'text/html; charset=utf-8',
       ETag: `"${sha(INDEX_V1)}"`,
       'Cache-Control': 'public, max-age=0, must-revalidate',
+      'Server-Timing': 'drobek-version;desc="1"',
       'Content-Length': String(Buffer.byteLength(INDEX_V1)),
     });
   });
@@ -451,7 +467,7 @@ describe('headers on every response (snapshot)', () => {
     expect(r.headers['Content-Security-Policy']).toBe(APP_CSP);
   });
 
-  it('NSO-342: the dashboard origin may always frame the app (thumbnail), next to an override', async () => {
+  it('the dashboard origin may always frame the app (thumbnail), next to an override', async () => {
     const withDash = { ...deps, dashboardOrigin: 'https://drobek.example.com' };
     store.bust('shop');
     model.get('shop')!.app.frameAncestors = null;
@@ -555,7 +571,7 @@ describe('password gate', () => {
     const right = await unlock({ password: 'open sesame', next: '/reports?q=1' });
     expect(right.status).toBe(303);
     expect(right.headers.Location).toBe('/reports?q=1');
-    const setCookie = right.headers['Set-Cookie'];
+    const setCookie = String(right.headers['Set-Cookie']);
     expect(setCookie).toMatch(new RegExp(`^${APP_ACCESS_COOKIE}=[^;]+; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=43200$`));
     expect(setCookie.toLowerCase()).not.toContain('domain');
 
@@ -575,7 +591,7 @@ describe('password gate', () => {
     );
     expect(right.status).toBe(303);
     expect(right.headers['Set-Cookie']).toMatch(/^drobek_app_access=[^;]+; Path=\/; HttpOnly; SameSite=Lax; Max-Age=43200$/);
-    const value = right.headers['Set-Cookie'].split(';')[0].split('=').slice(1).join('=');
+    const value = String(right.headers['Set-Cookie']).split(';')[0].split('=').slice(1).join('=');
     const open = await handleAppRequest(req(prod('vault'), '/', { headers: { Cookie: `drobek_app_access=${value}` } }), d);
     expect(open.status).toBe(200);
     const prefixed = await handleAppRequest(
@@ -640,7 +656,7 @@ describe('password gate', () => {
   });
 });
 
-describe('platform paths (/__drobek/*, M1-01)', () => {
+describe('platform paths (/__drobek/*)', () => {
   function withPlatform(): { d: HandlerDeps; seen: { path: string; method: string; app: string; body: string | null }[] } {
     const seen: { path: string; method: string; app: string; body: string | null }[] = [];
     const d: HandlerDeps = {
@@ -658,7 +674,7 @@ describe('platform paths (/__drobek/*, M1-01)', () => {
     const { d, seen } = withPlatform();
     const r = await handleAppRequest(req(preview('shop'), '/__drobek/v1/hello/wave', { method: 'POST', body: '{"name":"a"}' }), d);
     expect(r.status).toBe(200);
-    // A module CSP is only ever a SECOND policy next to the app's (NSO-325).
+    // A module CSP is only ever a SECOND policy next to the app's.
     expect(r.headers['Content-Security-Policy']).toBe(`${APP_CSP}, bogus`);
     expect(r.headers['X-Content-Type-Options']).toBe('nosniff');
     expect(seen).toEqual([{ path: '/__drobek/v1/hello/wave', method: 'POST', app: 'app_shop', body: '{"name":"a"}' }]);
@@ -666,7 +682,7 @@ describe('platform paths (/__drobek/*, M1-01)', () => {
     expect((await handleAppRequest(req(prod('draft'), '/__drobek/sdk.js'), d)).status).toBe(200);
   });
 
-  it('NSO-325: a module CSP (e.g. `sandbox` on served files) is added after the app CSP, whatever its casing; other security headers stay the app\'s', async () => {
+  it('a module CSP (e.g. `sandbox` on served files) is added after the app CSP, whatever its casing; other security headers stay the app\'s', async () => {
     const d: HandlerDeps = {
       ...deps,
       platform: async () => ({
@@ -679,7 +695,7 @@ describe('platform paths (/__drobek/*, M1-01)', () => {
     expect(r.headers['Content-Security-Policy']).toBe(`${APP_CSP}, sandbox`);
     expect(Object.keys(r.headers).filter((k) => k.toLowerCase() === 'content-security-policy')).toEqual(['Content-Security-Policy']);
     expect(r.headers['X-Content-Type-Options']).toBe('nosniff');
-    expect(r.headers['Referrer-Policy']).toBe('no-referrer');
+    expect(r.headers['Referrer-Policy']).toBe('strict-origin-when-cross-origin');
     // Without a module CSP the app CSP stands alone.
     const plain = await handleAppRequest(req(prod('shop'), '/__drobek/v1/files/abc12345'), { ...deps, platform: async () => ({ status: 200, headers: {}, body: 'x' }) });
     expect(plain.headers['Content-Security-Policy']).toBe(APP_CSP);
@@ -703,6 +719,17 @@ describe('platform paths (/__drobek/*, M1-01)', () => {
     expect(open.status).toBe(200);
   });
 
+  it('a platform route that authenticates the caller itself passes the password gate; nothing else does', async () => {
+    const { d, seen } = withPlatform();
+    const gated: HandlerDeps = { ...d, platformSkipsGate: (method, path) => method === 'POST' && path === '/__drobek/v1/webhooks/payments' };
+    const hook = await handleAppRequest(req(prod('vault'), '/__drobek/v1/webhooks/payments', { method: 'POST' }), gated);
+    expect(hook.status).toBe(200);
+    expect(seen.map((s) => s.path)).toEqual(['/__drobek/v1/webhooks/payments']);
+    expect((await handleAppRequest(req(prod('vault'), '/__drobek/v1/webhooks/payments'), gated)).status).toBe(401);
+    expect((await handleAppRequest(req(prod('vault'), '/__drobek/v1/hello', { method: 'POST' }), gated)).status).toBe(401);
+    expect((await handleAppRequest(req(prod('vault'), '/index.html'), gated)).status).toBe(401);
+  });
+
   it('the unlock POST stays the password gate; without a platform handler the paths are plain files', async () => {
     const { d, seen } = withPlatform();
     expect((await handleAppRequest(req(prod('shop'), UNLOCK_PATH, { method: 'POST', form: { password: 'x' } }), d)).status).toBe(303);
@@ -712,7 +739,7 @@ describe('platform paths (/__drobek/*, M1-01)', () => {
   });
 });
 
-describe('the browser error beacon (/__drobek/v1/_beacon, M1-07)', () => {
+describe('the browser error beacon (/__drobek/v1/_beacon)', () => {
   function withBeacon(): { d: HandlerDeps; beacons: string[]; platform: string[]; signals: string[] } {
     const beacons: string[] = [];
     const platform: string[] = [];
@@ -724,8 +751,8 @@ describe('the browser error beacon (/__drobek/v1/_beacon, M1-07)', () => {
         platform.push(r.path);
         return { status: 200, headers: {}, body: '{}' };
       },
-      beacon: async (_r, app) => {
-        beacons.push(app.id);
+      beacon: async (_r, app, version) => {
+        beacons.push(version ? `${app.id}@${version.number}` : app.id);
         return { status: 204, headers: { 'Cache-Control': 'no-store', 'Content-Security-Policy': 'bogus' }, body: null };
       },
     };
@@ -737,7 +764,10 @@ describe('the browser error beacon (/__drobek/v1/_beacon, M1-07)', () => {
     const r = await handleAppRequest(req(preview('shop'), BEACON_PATH, { method: 'POST', body: '{}' }), d);
     expect(r.status).toBe(204);
     expect(r.headers['Content-Security-Policy']).not.toBe('bogus');
-    expect(beacons).toEqual(['app_shop']);
+    // With the version the host serves now (the page may not say its own).
+    expect(beacons).toEqual(['app_shop@2']);
+    await handleAppRequest(req(prod('shop'), BEACON_PATH, { method: 'POST', body: '{}' }), d);
+    expect(beacons).toEqual(['app_shop@2', 'app_shop@1']);
     expect(platform).toEqual([]);
     expect(signals).toEqual([]);
     // an app with no compiled version still reports (the page may be a cached one)
@@ -757,11 +787,11 @@ describe('the browser error beacon (/__drobek/v1/_beacon, M1-07)', () => {
       d
     );
     expect(open.status).toBe(204);
-    expect(beacons).toEqual(['app_vault']);
+    expect(beacons).toEqual(['app_vault@1']);
   });
 });
 
-describe('custom domains (M3-01)', () => {
+describe('custom domains', () => {
   const custom = (slug: string, hostname = 'shop.firma.cz'): AppHostTarget => ({ kind: 'custom', slug, hostname });
 
   it('a verified custom domain serves the PUBLISHED version, indexable, like the production host', async () => {
@@ -801,7 +831,7 @@ describe('custom domains (M3-01)', () => {
   });
 });
 
-describe('abuse: report pointer, takedown 451, X-Drobek-App (M4-02)', () => {
+describe('abuse: report pointer, takedown 451, X-Drobek-App', () => {
   const REPORT = '/.well-known/drobek-report';
   const withReport = (d: HandlerDeps): HandlerDeps => ({
     ...d,
@@ -915,7 +945,7 @@ describe('abuse: report pointer, takedown 451, X-Drobek-App (M4-02)', () => {
   });
 });
 
-describe('unknown hosts: negative cache (NSO-315)', () => {
+describe('unknown hosts: negative cache', () => {
   it('a repeated unknown slug is ONE lookup for every host of it, until the 30 s TTL ends', async () => {
     let now = 1_000;
     const s = new ServeStore({ loaders, now: () => now });
@@ -997,7 +1027,7 @@ describe('unknown hosts: negative cache (NSO-315)', () => {
   });
 });
 
-describe('unknown hosts: per-IP limit (NSO-315)', () => {
+describe('unknown hosts: per-IP limit', () => {
   function limited(limit = 3) {
     const counts = new Map<string, number>();
     const keys: string[] = [];
@@ -1023,7 +1053,7 @@ describe('unknown hosts: per-IP limit (NSO-315)', () => {
     expect(r.headers).toEqual({
       'Content-Security-Policy': APP_CSP,
       'X-Content-Type-Options': 'nosniff',
-      'Referrer-Policy': 'no-referrer',
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
       'Content-Type': 'text/plain; charset=utf-8',
       'Cache-Control': 'no-store',
       'Retry-After': '60',
@@ -1051,7 +1081,7 @@ describe('unknown hosts: per-IP limit (NSO-315)', () => {
     expect((await handleAppRequest(req(null), d)).status).toBe(429);
   });
 
-  it('NSO-309: a client without a recognised IP is never counted (no shared bucket)', async () => {
+  it('a client without a recognised IP is never counted (no shared bucket)', async () => {
     const { d, keys } = limited(1);
     for (let i = 0; i < 5; i++) {
       const r = await handleAppRequest({ ...req(prod(`anon-${i}`)), clientIp: null }, d);
@@ -1094,9 +1124,113 @@ describe('unknown hosts: per-IP limit (NSO-315)', () => {
     for (let i = 0; i < 5; i++) await handleAppRequest(req(prod('shop'), `/missing-${i}.png`), d);
     expect(keys).toEqual([]);
   });
+
+  it('a version host without its version counts like an unknown host (429 past the budget, X-Drobek-App set)', async () => {
+    const { d, keys } = limited(3);
+    for (const n of [100, 101, 3]) {
+      const r = await handleAppRequest(req(ver('shop', n)), d);
+      expect(r.status).toBe(404);
+      expect(text(r.body)).toContain('does not exist or did not compile');
+    }
+    const r = await handleAppRequest(req(ver('shop', 102)), d);
+    expect(r.status).toBe(429);
+    expect(text(r.body)).toBe('Too Many Requests');
+    expect(r.headers['X-Drobek-App']).toBe('shop');
+    expect(keys).toEqual(Array(4).fill('203.0.113.9'));
+  });
+
+  it('versions that exist are never counted', async () => {
+    const { d, keys } = limited(1);
+    for (let i = 0; i < 5; i++) {
+      expect((await handleAppRequest(req(ver('shop', 1)), d)).status).toBe(200);
+      expect((await handleAppRequest(req(ver('shop', 2), '/missing.png'), d)).status).toBe(404);
+    }
+    expect(keys).toEqual([]);
+  });
+
+  it('while throttled: no lookup for version numbers the cache does not know; cached versions are still served', async () => {
+    const { d } = limited(1);
+    expect((await handleAppRequest(req(ver('shop', 1)), d)).status).toBe(200);
+    expect((await handleAppRequest(req(ver('shop', 50)), d)).status).toBe(404);
+    expect((await handleAppRequest(req(ver('shop', 51)), d)).status).toBe(429);
+    const before = calls.resolve;
+    for (const n of [52, 53, 50, 2]) expect((await handleAppRequest(req(ver('shop', n)), d)).status, `v${n}`).toBe(429);
+    expect(calls.resolve).toBe(before);
+    expect((await handleAppRequest(req(ver('shop', 1)), d)).status).toBe(200);
+    expect(calls.resolve).toBe(before);
+    // The app's other hosts follow the slug, as before.
+    expect((await handleAppRequest(req(prod('shop')), d)).status).toBe(200);
+  });
+
+  it('a missing version of a password app is counted too, behind the same password page', async () => {
+    const { d, keys } = limited(1);
+    expect((await handleAppRequest(req(ver('vault', 1)), d)).status).toBe(401);
+    const r = await handleAppRequest(req(ver('vault', 7)), d);
+    expect(r.status).toBe(401);
+    expect(text(r.body)).not.toContain('does not exist');
+    expect((await handleAppRequest(req(ver('vault', 8)), d)).status).toBe(429);
+    expect((await handleAppRequest(req(ver('vault', 1)), d)).status).toBe(401);
+    expect(keys).toHaveLength(2);
+  });
 });
 
-describe('app assets at /<name> (NSO-358)', () => {
+describe('version hosts: bounded host cache', () => {
+  it('a missing version is one lookup per number until the 30 s negative TTL ends', async () => {
+    let now = 1_000;
+    const s = new ServeStore({ loaders, now: () => now });
+    const d = { ...deps, store: s };
+    for (let i = 0; i < 3; i++) expect((await handleAppRequest(req(ver('shop', 9)), d)).status).toBe(404);
+    expect(calls.resolve).toBe(1);
+    now += 30_001;
+    expect((await handleAppRequest(req(ver('shop', 9)), d)).status).toBe(404);
+    expect(calls.resolve).toBe(2);
+  });
+
+  it('a flood of version numbers never evicts the hosts a live app serves', async () => {
+    const s = new ServeStore({ loaders, negativeMaxEntries: 5 });
+    const d = { ...deps, store: s };
+    for (const t of [prod('shop'), preview('shop'), ver('shop', 1)]) await handleAppRequest(req(t), d);
+    for (let n = 1_000; n < 1_200; n++) await handleAppRequest(req(ver('shop', n)), d);
+    const before = calls.resolve;
+    for (const t of [prod('shop'), preview('shop'), ver('shop', 1)]) expect((await handleAppRequest(req(t), d)).status).toBe(200);
+    expect(calls.resolve).toBe(before);
+    // Bounded: only the newest misses are remembered.
+    await handleAppRequest(req(ver('shop', 1_199)), d);
+    expect(calls.resolve).toBe(before);
+    await handleAppRequest(req(ver('shop', 1_000)), d);
+    expect(calls.resolve).toBe(before + 1);
+  });
+
+  it('the positive cache is capped over every host of every app (LRU)', async () => {
+    const s = new ServeStore({ loaders, maxCachedHosts: 3 });
+    const d = { ...deps, store: s };
+    for (const t of [prod('shop'), ver('shop', 1), ver('shop', 2), preview('draft')]) await handleAppRequest(req(t), d);
+    expect(calls.resolve).toBe(4);
+    for (const t of [ver('shop', 1), ver('shop', 2), preview('draft')]) await handleAppRequest(req(t), d);
+    expect(calls.resolve).toBe(4);
+    await handleAppRequest(req(prod('shop')), d);
+    expect(calls.resolve).toBe(5);
+  });
+
+  it('a new version is served on its host right after the bust that announces it', async () => {
+    const d = { ...deps, store };
+    expect((await handleAppRequest(req(ver('shop', 4)), d)).status).toBe(404);
+    model.get('shop')!.versions.set(4, version('v_4', true, '<h1>v4</h1>'));
+    expect((await handleAppRequest(req(ver('shop', 4)), d)).status).toBe(404);
+    store.bust('shop');
+    expect(text((await handleAppRequest(req(ver('shop', 4)), d)).body)).toContain('<h1>v4</h1>');
+  });
+
+  it('the report pointer of a version host looks up the app, not version N', async () => {
+    for (let n = 500; n < 510; n++) {
+      const r = await handleAppRequest(req(ver('shop', n), '/.well-known/drobek-report'), deps);
+      expect(JSON.parse(text(r.body)).app).toBe('shop');
+    }
+    expect(calls.resolve).toBe(1);
+  });
+});
+
+describe('app assets at /<name>', () => {
   const FILM = Buffer.concat([Buffer.from('....ftypisom'), Buffer.alloc(988, 7)]); // 1000 bytes
   const LOGO = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>');
   const UPDATED = new Date('2026-09-20T10:00:00.123Z');
@@ -1237,7 +1371,7 @@ describe('app assets at /<name> (NSO-358)', () => {
     expect((await handleAppRequest(req(prod('shop'), '/media/film.mp4'), assetDeps())).status).toBe(404);
   });
 
-  it('NSO-362: production and custom hosts look assets up in the published version’s frozen set, preview in the draft, a version host in its set or the draft', async () => {
+  it('production and custom hosts look assets up in the published version’s frozen set, preview in the draft, a version host in its set or the draft', async () => {
     const scopes: unknown[] = [];
     const d = assetDeps();
     const find = d.assets!.find;
@@ -1256,7 +1390,7 @@ describe('app assets at /<name> (NSO-358)', () => {
   });
 });
 
-describe('serving signals: counts and failing paths (NSO-380)', () => {
+describe('serving signals: counts and failing paths', () => {
   function withSignals(status: number): { d: HandlerDeps; signals: string[] } {
     const signals: string[] = [];
     const d: HandlerDeps = {
@@ -1291,5 +1425,54 @@ describe('serving signals: counts and failing paths (NSO-380)', () => {
     const { d, signals } = withSignals(502);
     expect((await handleAppRequest(req(preview('shop'), '/__drobek/v1/proxy/x', { query: 'token=abc' }), d)).status).toBe(502);
     expect(signals).toEqual(['app_shop:request', 'app_shop:5xx:/__drobek/v1/proxy/x']);
+  });
+});
+
+describe('page views (app traffic analytics)', () => {
+  type Seen = { appId: string; path: string; host: string | null; userAgent: string | null; referer: string | null; frameOrigins?: readonly string[] };
+  function withViews(): { d: HandlerDeps; views: Seen[] } {
+    const views: Seen[] = [];
+    const d: HandlerDeps = {
+      ...deps,
+      dashboardOrigin: 'https://dash.example.com',
+      galleryFrameAncestors: ['https://gallery.example.net'],
+      pageView: (appId, v) => views.push({ appId, path: v.path, host: v.host, userAgent: v.userAgent, referer: v.referer, frameOrigins: v.frameOrigins }),
+    };
+    return { d, views };
+  }
+  const custom = (slug: string): AppHostTarget => ({ kind: 'custom', slug, hostname: 'shop.example.org' });
+  const ua = { 'user-agent': 'Mozilla/5.0 Firefox/131.0', host: 'shop.apps.example.com', referer: 'https://news.example/x' };
+
+  it('a successful HTML document on the production host or a custom domain is a page view (a 304 too)', async () => {
+    const { d, views } = withViews();
+    expect((await handleAppRequest(req(prod('shop'), '/', { headers: ua }), d)).status).toBe(200);
+    expect((await handleAppRequest(req(prod('shop'), '/some/route', { headers: ua, query: 'q=1' }), d)).status).toBe(200);
+    expect((await handleAppRequest(req(custom('shop'), '/', { headers: { ...ua, host: 'shop.example.org' } }), d)).status).toBe(200);
+    const etag = (await handleAppRequest(req(prod('shop')), { ...deps })).headers.ETag as string;
+    expect((await handleAppRequest(req(prod('shop'), '/', { headers: { ...ua, 'if-none-match': etag } }), d)).status).toBe(304);
+    expect(views.map((v) => [v.appId, v.path, v.host])).toEqual([
+      ['app_shop', '/', 'shop.apps.example.com'],
+      ['app_shop', '/some/route', 'shop.apps.example.com'],
+      ['app_shop', '/', 'shop.example.org'],
+      ['app_shop', '/', 'shop.apps.example.com'],
+    ]);
+    expect(views[0]).toMatchObject({
+      userAgent: 'Mozilla/5.0 Firefox/131.0',
+      referer: 'https://news.example/x',
+      frameOrigins: ['https://dash.example.com', 'https://gallery.example.net'],
+    });
+  });
+
+  it('never counts preview or version hosts, other files, HEAD, a missing page or a locked one', async () => {
+    const { d, views } = withViews();
+    await handleAppRequest(req(preview('shop'), '/', { headers: ua }), d);
+    await handleAppRequest(req(ver('shop', 2), '/', { headers: ua }), d);
+    await handleAppRequest(req(prod('shop'), '/main.js', { headers: ua }), d);
+    await handleAppRequest(req(prod('shop'), '/', { headers: ua, method: 'HEAD' }), d);
+    await handleAppRequest(req(prod('shop'), '/favicon.ico', { headers: ua }), d);
+    await handleAppRequest(req(prod('draft'), '/', { headers: ua }), d);
+    expect((await handleAppRequest(req(prod('vault'), '/', { headers: ua }), d)).status).toBe(401);
+    await handleAppRequest(req(prod('shop'), BEACON_PATH, { headers: ua, method: 'POST' }), d);
+    expect(views).toEqual([]);
   });
 });

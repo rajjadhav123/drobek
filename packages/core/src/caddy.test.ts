@@ -1,5 +1,5 @@
 /**
- * Caddyfile generator (M0-07): strict env validation and one snapshot per TLS
+ * Caddyfile generator: strict env validation and one snapshot per TLS
  * mode. The snapshots in __snapshots__/ are also the reference examples that
  * docs/SELF-HOSTING.md points at.
  */
@@ -98,6 +98,24 @@ describe('proxy + secret invariants (every mode)', () => {
     }
   });
 
+  it('relays event streams on the app hosts unbuffered: the app-host sites only import the snippet, nothing buffers or compresses SSE', () => {
+    for (const env of [...modes, { ...PROD, TLS_DNS_PROVIDER: 'cloudflare', TLS_CUSTOM_DOMAINS: '1', TLS_ASK_TOKEN: TOKEN }]) {
+      const out = render(env);
+      expect(out).not.toMatch(/flush_interval|buffer_responses|response_buffers|buffer_requests/);
+      const appSites = out.split(/\n(?=\S)/).filter((b) => /^(\*\.\S+|https:\/\/) \{/.test(b));
+      expect(appSites.length).toBeGreaterThanOrEqual(1);
+      for (const block of appSites) {
+        expect(block).toMatch(/\n\timport drobek(\n|$)/);
+        expect(block).not.toMatch(/\bencode\b|reverse_proxy/);
+      }
+      const start = out.indexOf('(drobek) {');
+      const snippet = out.slice(start, out.indexOf('\n}\n', start));
+      expect(snippet.match(/\bencode zstd gzip\b/g)).toHaveLength(1);
+      expect(snippet).not.toContain('text/event-stream\n');
+      expect(snippet).not.toMatch(/header Content-Type text\/\*/);
+    }
+  });
+
   it('on_demand appears only together with the ask guard', () => {
     for (const env of modes) {
       const out = render(env);
@@ -125,9 +143,22 @@ describe('proxy + secret invariants (every mode)', () => {
   it('APPS_DOMAIN with :443 is the bare host', () => {
     expect(render({ ...PROD, APPS_DOMAIN: 'drobek.app:443', TLS_ASK_TOKEN: TOKEN })).toContain('\n*.drobek.app {\n');
   });
+
+  it('caps request bodies on the dashboard site only (DASHBOARD_MAX_BODY_BYTES), never the paths with their own limits', () => {
+    const cap = (n: number) =>
+      `\t@capped_body {\n\t\tnot path /mcp /mcp/* /api/assets/upload/* /api/screenshots/* /workspaces/*/apps/*/data/* /feedback/new /feedback/new.data\n\t}\n\trequest_body @capped_body {\n\t\tmax_size ${n}\n\t}\n\timport drobek\n}\n`;
+    for (const env of [...modes, { ...PROD, TLS_DNS_PROVIDER: 'cloudflare', TLS_CUSTOM_DOMAINS: '1', TLS_ASK_TOKEN: TOKEN }]) {
+      const out = render(env);
+      expect(out.match(/request_body/g)).toHaveLength(1);
+      const dashboard = out.slice(out.indexOf('# Dashboard, OAuth and MCP'), out.indexOf('# Every app host'));
+      expect(dashboard).toContain(cap(1048576));
+    }
+    expect(render({ ...PROD, TLS_ASK_TOKEN: TOKEN, DASHBOARD_MAX_BODY_BYTES: '2097152' })).toContain(cap(2097152));
+    expect(render({ ...PROD, TLS_ASK_TOKEN: TOKEN, DASHBOARD_MAX_BODY_BYTES: 'lots' })).toContain(cap(1048576));
+  });
 });
 
-describe('custom domains (M3-01): the on-demand catch-all behind the ask', () => {
+describe('custom domains: the on-demand catch-all behind the ask', () => {
   const CATCH_ALL = '\nhttps:// {\n\ttls {\n\t\ton_demand\n\t}\n\timport drobek\n}\n';
 
   it('on by default in on-demand mode; TLS_CUSTOM_DOMAINS=0 turns it off', () => {

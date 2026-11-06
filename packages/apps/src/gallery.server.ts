@@ -1,5 +1,5 @@
 /**
- * The public gallery, the stateful half (NSO-340):
+ * The public gallery, the stateful half:
  *
  *  - `setGalleryListing` — an editor+ lists a PUBLISHED app with a short
  *    public description, changes the description, or unlists it. The same
@@ -26,7 +26,7 @@
  * gallery's frame permission (GALLERY_FRAME_ANCESTORS) follows at once.
  */
 import { and, asc, desc, eq, isNotNull, isNull, sql, type SQL } from 'drizzle-orm';
-import { AUDIT_ACTIONS, writeAudit } from '@drobek/audit';
+import { AUDIT_ACTIONS, writeAudit, type AuditActorKind } from '@drobek/audit';
 import { apps, galleryLikes, galleryOpens, getDb, moduleConfigs, workspaces } from '@drobek/db';
 import { AppsError } from './errors.js';
 import { notifyAppChanged } from './events.js';
@@ -168,7 +168,7 @@ export async function setGalleryHidden(
   appId: string,
   hidden: boolean,
   actorUserId: string,
-  opts: { now?: Date } = {}
+  opts: { now?: Date; actorKind?: AuditActorKind } = {}
 ): Promise<{ changed: boolean; slug: string }> {
   const out = await getDb().transaction(async (tx) => {
     const [app] = await tx
@@ -186,7 +186,7 @@ export async function setGalleryHidden(
       {
         workspaceId: app.workspaceId,
         actorUserId,
-        actorKind: 'user',
+        actorKind: opts.actorKind ?? 'user',
         action: hidden ? AUDIT_ACTIONS.appGalleryHidden : AUDIT_ACTIONS.appGalleryUnhidden,
         subjectType: 'app',
         target: app.slug,

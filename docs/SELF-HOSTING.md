@@ -6,13 +6,14 @@ everything to drobek on the internal network. This guide takes a clean
 server to a working instance — dashboard over TLS, an agent connected over
 MCP, a published app — and covers backups, upgrades and every setting.
 
-**Measured:** the whole quickstart below (init → TLS dashboard → user → MCP →
-published app with an uploaded file) took **33 s** in the
-local rehearsal (`task selfhost:rehearsal`, `tls internal`, image already
-built), a backup 7 s, a restore on a second "machine"
-(fresh checkout + `task selfhost:init` + `task restore`) 33 s; the image build
-itself 145 s (a VPS pulls it instead). Local = macOS, Docker Desktop, arm64,
-2026-09-23.
+**Measured:** on a clean Ubuntu 24.04 + Docker host (a fresh GitHub
+`ubuntu-24.04` runner, 2026-09-30) with the released `v0.6.1` image, the
+image pull took 8 s, the whole quickstart below (init → TLS dashboard → user →
+MCP → published app with an uploaded file) **31 s**, a backup 3 s and a
+restore on a second "machine" (fresh checkout + `task selfhost:init` +
+`task restore`) 25 s. The run is the `selfhost-rehearsal.yml` workflow
+(`task selfhost:rehearsal` with `tls internal`), started by hand here; CI
+runs it on every release tag as well ([Image tags](#image-tags)).
 
 ## Quickstart (clean Ubuntu 24.04 + Docker)
 
@@ -179,7 +180,10 @@ app — but a separate registrable domain for the apps is the safer choice.
 
 [`docker-compose.production.yaml`](../docker-compose.production.yaml) runs
 drobek, postgres 17, redis 7 and caddy, all `restart: unless-stopped` with a
-healthcheck each. Only Caddy publishes ports (80, 443, 443/udp —
+healthcheck each. Each container's log (`docker compose logs`, the
+`json-file` driver) rotates: at most `CONTAINER_LOG_MAX_FILES` (5) files of
+`CONTAINER_LOG_MAX_SIZE` (20m), 100 MB per service, so logs cannot fill the
+disk. Only Caddy publishes ports (80, 443, 443/udp —
 `HTTP_PORT` / `HTTPS_PORT` / `PUBLISH_IP` move them); drobek, postgres and
 redis stay on the internal network. Nothing secret is written in the file —
 every value comes from `.env.production` (`--env-file` for interpolation,
@@ -198,7 +202,7 @@ compose file fixes, for drobek: `NODE_ENV=production`,
 `TRUST_PROXY=x-real-ip`, `APPS_URL_SCHEME=https`, `FILES_DIR=/data/files`,
 `ASSETS_DIR=/data/assets`,
 `DATABASE_URL` / `REDIS_URL` of the bundled services, `PUBLIC_ORIGIN`
-defaulting to `PUBLIC_APP_URL`, and `DROBEK_MODULES` defaulting to all six
+defaulting to `PUBLIC_APP_URL`, and `DROBEK_MODULES` defaulting to all nine
 built-ins.
 
 | Variable | Required | What |
@@ -207,23 +211,26 @@ built-ins.
 | `PUBLIC_APP_URL` | yes | `https://<dashboard host>[:<HTTPS_PORT>]` |
 | `APPS_DOMAIN` | yes | apps live on `*.<APPS_DOMAIN>` (`:<port>` when not 443) |
 | `POSTGRES_PASSWORD` | yes, secret | generated; only used when `pg_data` is first created |
-| `DROBEK_MASTER_KEY` | yes, secret | generated, 64 hex; encrypts upstream secrets, signs app cookies — keep it with your backups |
+| `DROBEK_MASTER_KEY` | yes, secret | generated, 64 hex; encrypts upstream and module secrets, signs app cookies — keep it with your backups; [rotate it](#rotating-drobek_master_key) with `DROBEK_MASTER_KEY_PREVIOUS` |
 | `TLS_ASK_TOKEN` | secret | generated; the on-demand TLS `ask` token (drobek + Caddy) |
 | `SMTP_HOST` | yes (smtp) | SMTP server; `SMTP_PORT` (587), `SMTP_SECURE` (0 / 1 = implicit TLS), `SMTP_USER`, `SMTP_PASS`, `EMAIL_FROM` |
 | `EMAIL_TRANSPORT` / `RESEND_API_KEY` | — (`smtp`) / secret | `resend` sends through the Resend API instead of SMTP (then `SMTP_*` is not needed and `RESEND_API_KEY` is) |
-| `SUPERADMIN_EMAIL` | recommended | your sign-in e-mail(s), super-admin over every workspace |
+| `SUPERADMIN_EMAIL` | recommended | your sign-in e-mail(s), super-admin over every workspace; bound to the address, so a user who changes their sign-in e-mail on `/me` gains or loses super-admin with it |
 | `LANDING_URL` | — | your own website: `<PUBLIC_APP_URL>/` answers 301 there instead of the built-in landing page |
 | `DOCS_URL` | — | a website with the drobek docs: the agent docs link `<DOCS_URL>/<page>` instead of the files on GitHub |
 | `DASHBOARD_GITHUB_STARS` | — (on) | `off` = the dashboard footer makes no call to `api.github.com` for the repository's star count |
+| `WHATS_NEW_BANNER` | — (`1`) | `0` = no "drobek was updated · What's new" notice in the dashboard after an update |
 | `TLS_*`, `CADDY_*` | per TLS path | see [TLS](#tls) |
 | `HTTP_PORT`, `HTTPS_PORT`, `PUBLISH_IP` | — | published ports / bind address |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | — | optional Google sign-in |
 | `TLS_CUSTOM_DOMAINS`, `DOMAINS_MAX_PER_APP`, `DOMAINS_DNS_SERVERS`, `DOMAINS_RECHECK_INTERVAL_MS` | — | [custom domains](#custom-domains) (catch-all certificate on by default in on-demand mode; 3 per app) |
-| `TERMS_URL`, `ABUSE_REPORTS_PER_IP_HOUR`, `ABUSE_BRAND_WORDS` | — | [abuse handling](#abuse-and-takedowns) (terms link of the 451 page; 5 reports / IP / hour; publish-heuristic brand words) |
+| `TERMS_URL`, `ABUSE_REPORTS_PER_IP_HOUR`, `ABUSE_BRAND_WORDS`, `ABUSE_REPORTS_RETENTION_DAYS` | — | [abuse handling](#abuse-and-takedowns) (terms link of the 451 page; 5 reports / IP / hour; publish-heuristic brand words; resolved reports are deleted after 365 days) |
 | `GALLERY_ENABLED`, `GALLERY_API_PER_IP_MINUTE`, `GALLERY_OPENS_PER_IP_HOUR`, `GALLERY_LIKES_PER_USER_HOUR`, `GALLERY_FRAME_ANCESTORS`, `DUPLICATES_PER_USER_HOUR` | — (off) | [the public gallery](#public-gallery) (`true` = owners may list published apps; `GET /api/public/gallery`; 60 requests / IP / minute; 60 counted opens / IP / hour; 30 likes / account / hour; your gallery website's origins that may show listed apps as live previews and receive visitors back after a like; 10 copies of gallery apps per person per hour) |
 | `PUBLISH_APPROVAL`, `OPERATOR_EMAIL`, `PUBLISH_NOTIFY` | — (`open`, off) | [publish approval](#publish-approval) (`approval` = a workspace publishes only after a super-admin allowed it; the contact refused users see; `first` / `every` = e-mail the operator about publishes) |
 | `EMAIL_SIGNIN_APP_HOURLY_SHARE` | — (25) | one app's percent of the sign-in e-mail budget — raise it on a single-app server (see [Production compose](#production-compose)) |
 | `EMAIL_WORKSPACE_HOURLY_SHARE` | — (50) | one workspace's percent of each module e-mail budget — raise it to 100 on a single-workspace server |
+| `BACKUP_DIR`, `BACKUP_KEEP`, `BACKUP_MIN_FREE_MB` | — (`backups`, 14, 1024) | [`task backup`](#backup-and-restore): where the archives go, how many stay (0 = all), the space a backup leaves free |
+| `CONTAINER_LOG_MAX_SIZE`, `CONTAINER_LOG_MAX_FILES` | — (`20m`, 5) | each container's log rotates at this size and keeps this many files |
 | limits (`OTP_*`, `COMPILE_*`, `DATA_*`, `FILES_*`, `EMAIL_*`, …) | — | production defaults; every variable is in the [Environment reference](#environment-reference) |
 
 The file is read by `docker compose` and by `docker run --env-file` (the
@@ -254,7 +261,72 @@ JavaScript, JSON, XML, SVG, plain text, fonts, wasm) are compressed: a `206`
 range stays byte-exact, images are left alone, and `text/event-stream` is
 never compressed, so MCP's streamable HTTP and any SSE an app backend proxies
 arrive event by event. With a different proxy in front, compress the same way
-and keep `text/event-stream` out of it.
+and keep `text/event-stream` out of it, and do not buffer it either (nginx:
+`proxy_buffering off` — the proxy module's streamed answers and the preview's
+live-reload stream carry `X-Accel-Buffering: no`, which nginx honours), or an
+LLM answer streamed through the `proxy` module reaches the browser only when it
+is complete and an open preview does not reload after a write.
+
+Request bodies on the dashboard origin are capped at `DASHBOARD_MAX_BODY_BYTES`
+(1 MiB): a bigger body sent to a dashboard page, the sign-in or an OAuth
+endpoint answers `413` — a declared `Content-Length` before anything is read,
+a chunked body as soon as the bytes that arrived pass the cap — and the
+connection closes after the answer. `/mcp` (`MCP_MAX_BODY_BYTES`), the asset
+upload URLs (the asset size), the Data tab's CSV import (a 10 MiB file), the
+feedback note page `/feedback/new` and the preview's screenshot answers
+`/api/screenshots/<id>` (their screenshot, `SCREENSHOT_MAX_BYTES`) keep their
+own limits. The generated Caddyfile refuses the same bodies on the
+dashboard site before they reach drobek (`request_body`, those paths left to
+drobek), so after changing the variable re-run `task selfhost:init` and
+`task tls:reload`. With a different proxy in front, cap the dashboard origin
+the same way or leave it to drobek.
+
+**Stopping and restarting drobek** (an upgrade, `docker compose restart`, a
+host reboot) does not cut the requests it is answering. On `SIGTERM` drobek
+stops accepting connections, closes idle keep-alive connections, ends the MCP
+listen streams (the long-lived `subscriptions/listen` stream an MCP
+2026-07-28 client holds open; the stopping server answers a new `/mcp`
+request 503) and the apps' live data subscriptions
+(`drobek.data.subscribe` reconnects to the restarted server and resumes;
+a new one answers 503 meanwhile), lets requests in flight — a
+`write_files` compile, a token refresh, a page — finish for up to
+`SHUTDOWN_GRACE_MS` (20 s), cuts whatever is still running after that, stops
+its background jobs and exits. The compose file gives the container
+`stop_grace_period: 30s` so Docker does not kill it first; keep it about 10 s
+above `SHUTDOWN_GRACE_MS` when you raise that. A long-lived stream — an LLM
+answer the `proxy` module relays as it arrives — counts as a request in flight:
+a redeploy cuts it after `SHUTDOWN_GRACE_MS`, and the app sees its stream end
+early. An error nothing in drobek
+caught (an uncaught exception or an unhandled promise rejection) stops it the
+same way: the error is logged, sent to the error reporter (`ERROR_REPORTER`)
+and drobek exits with code 1 once the requests in flight drained, so Docker's
+`restart: unless-stopped` starts it again. `/mcp` keeps nothing in the
+process: every request is authenticated and served on its own, so an agent's
+next request after a restart works without reconnecting, and a revoked API
+key or OAuth connection gets 401 on its next request. While drobek stops, a
+new `/mcp` request answers 503 with `Retry-After`, and the
+`subscriptions/listen` streams of MCP 2026-07-28 clients end before the drain
+(the client opens its stream again). Every `/mcp` request leaves one
+`mcp request` log line with the JSON-RPC method, the tool name, the status,
+`duration_ms`, the `protocol` (`2026-07-28`, or `legacy` for a 2025-era
+client) and the user id, never arguments or credentials.
+drobek keeps idle connections open for 125 s, longer than Caddy's 2-minute
+upstream keep-alive, so Caddy never reuses a connection drobek is closing;
+with a different proxy in front, keep its upstream idle timeout below 125 s.
+
+**Database connections.** drobek keeps two Postgres pools of up to
+`DB_POOL_MAX` (20) connections each: one for requests (dashboard, MCP, app
+hosts) and one for its background jobs, opened only while a job runs —
+keep `2 × DB_POOL_MAX` plus a few below Postgres's `max_connections` (100 in
+the bundled database). A request's query that runs past
+`DB_STATEMENT_TIMEOUT_MS` (30 s), or waits past `DB_LOCK_TIMEOUT_MS` (10 s)
+for a row or lock another request holds, is cut off instead of holding a
+connection everyone else waits for: an agent gets `busy` (`reason:
+"database_timeout"`), an app's page or module call and the asset upload URL a 503,
+the dashboard its error page, and the log a `db error 57014` / `55P03` line.
+The background jobs run without the statement timeout and the migrations
+without either. `0` turns a timeout off (the database's own setting, e.g.
+one set on the role, applies).
 
 Platform modules (the backends apps use through `import { drobek } from
 'drobek'`) are enabled with `DROBEK_MODULES` (comma-separated; a
@@ -264,9 +336,9 @@ dependencies, or from `DROBEK_MODULES_DIR` for a module you installed with
 refuses to start on a module it cannot load. Limits come from their env vars
 or, with `LIMITS_PROVIDER_URL` + `LIMITS_PROVIDER_SECRET`, from your own
 signed limits endpoint. The image ships the built-in `auth`, `email`,
-`forms`, `data`, `proxy` and `files`
-(`DROBEK_MODULES=auth,email,forms,data,proxy,files`, the compose default;
-`forms` requires `email`). Proxy upstreams may only use ports 80 and 443
+`forms`, `data`, `proxy`, `files`, `sync` and `oidc`
+(`DROBEK_MODULES=auth,email,forms,data,proxy,files,sync,oidc,webhooks`, the compose default;
+`forms` requires `email`, `sync` requires `proxy` and `data`, `oidc` requires `auth`). Proxy upstreams may only use ports 80 and 443
 (`PROXY_ALLOWED_PORTS`); an upstream on a private address needs its hostname
 on `PROXY_ALLOWED_HOSTS` (keep it empty in production). The old
 `/<ws>/api/proxy/<name>/*` dashboard-host route is gone: an app calls
@@ -328,17 +400,28 @@ limit marked *(plan)* can also come per workspace from the limits provider.
 | `APPS_URL_SCHEME` | `http` for `*.localhost`, else `https` *(compose: https)* | scheme of the app URLs drobek hands out |
 | `APPS_UNKNOWN_HOST_LIMIT` / `APPS_UNKNOWN_HOST_WINDOW_MS` | 60 / 60000 | "no app here" answers per client IP per window, then 429 |
 | `APPS_MODULE_BODY_TIMEOUT_MS` | 120000 | a `/__drobek/*` request (module routes, uploads, the beacon) must deliver its body within it, else 408; raise it with `FILES_MAX_BYTES` for big uploads over slow links |
+| `DASHBOARD_MAX_BODY_BYTES` | 1048576 | the largest request body of the dashboard origin's pages, sign-in and OAuth endpoints — a declared length or a chunked body counted as it arrives; a bigger one answers 413 before it is read further. `/mcp`, the asset upload URLs, the Data tab's CSV import and the feedback note page (its screenshot) keep their own limits. The generated Caddyfile carries the same cap: re-render it after a change ([Production compose](#production-compose)) |
 | `DROBEK_IMAGE_TAG` | `latest` | image tag of the production compose ([Image tags](#image-tags)) |
 | `HTTP_PORT` / `HTTPS_PORT` / `PUBLISH_IP` | 80 / 443 / all | ports and bind address Caddy publishes |
 | `TRUST_PROXY` | auto *(compose: `x-real-ip`)* | which client-IP header is trusted: `x-real-ip` = only Caddy's `X-Real-IP`; unset = `X-Real-IP`, else the rightmost `X-Forwarded-For` hop |
 | `NODE_ENV` | *(compose: production)* | `production` turns on `__Host-` cookies and the fail-closed secret checks, and ignores the dev-only switches below |
 | `PORT` | 3000 | the port drobek listens on inside the container (the dev compose maps `WEB_PORT` to it) |
+| `SHUTDOWN_GRACE_MS` | 20000 | on `SIGTERM` (and after an error nothing caught, which exits with code 1), how long requests in flight may finish before the rest is cut ([Production compose](#production-compose)); keep the container's stop grace period (compose: 30 s) above it |
+
+### Database
+
+| Variable | Default | What |
+| --- | --- | --- |
+| `DB_POOL_MAX` | 20 | connections of each of drobek's two Postgres pools — requests, and the background jobs (open only while a job runs); 1–200. Keep `2 × DB_POOL_MAX` plus a few below Postgres's `max_connections` ([Production compose](#production-compose)) |
+| `DB_STATEMENT_TIMEOUT_MS` | 30000 | a request's query running longer is cut off (Postgres `statement_timeout`; MCP `busy` with `reason: "database_timeout"`, module routes `503 unavailable`). Not for the background jobs or the migrations; `0` = drobek sets none, else 100–3600000 |
+| `DB_LOCK_TIMEOUT_MS` | 10000 | a query of a request or a job waiting longer for a row, table or advisory lock is cut off (Postgres `lock_timeout`), answered like the statement timeout. Not for the migrations; `0` = drobek sets none, else 100–3600000 |
 
 ### Secrets and TLS
 
 | Variable | Default | What |
 | --- | --- | --- |
-| `DROBEK_MASTER_KEY` | — | **required, secret** — 64 hex; encrypts module and upstream secrets, keys the app-access cookie and the forms token. Keep it with your backups |
+| `DROBEK_MASTER_KEY` | — | **required, secret** — 64 hex; encrypts module and upstream secrets, keys the app-access cookie, the forms token, the provider sign-in state and the stored IP hashes. Keep it with your backups. A stored secret that neither this key nor `DROBEK_MASTER_KEY_PREVIOUS` opens stops a production start |
+| `DROBEK_MASTER_KEY_PREVIOUS` | — | secret, only while [rotating the master key](#rotating-drobek_master_key) — the key used before: secrets stored under it still decrypt (new ones use `DROBEK_MASTER_KEY`) until `task selfhost:rekey` re-wraps them; then remove it. Same format as `DROBEK_MASTER_KEY`; a malformed value stops the start |
 | `POSTGRES_PASSWORD` | — | **required, secret** (production compose) — used when `pg_data` is first created |
 | `TLS_ASK_TOKEN` | — | secret, ≥ 32 URL-safe characters — the on-demand TLS `ask` token (drobek + Caddy); unset = every certificate refused |
 | `TLS_INTERNAL` | — | `1` = Caddy's local CA for every site (a test box, `task dev:tls`) |
@@ -352,20 +435,24 @@ limit marked *(plan)* can also come per workspace from the limits provider.
 
 | Variable | Default | What |
 | --- | --- | --- |
-| `SUPERADMIN_EMAIL` | — | comma-separated sign-in addresses with super-admin rights over every workspace (the abuse queue, reports) |
-| `EMAIL_TRANSPORT` | smtp | how all mail goes out (sign-in codes, invites, module mail): `smtp` or `resend`; an unknown value stops the server at start |
+| `SUPERADMIN_EMAIL` | — | comma-separated sign-in addresses with super-admin rights over every workspace (the abuse queue, reports). The rights belong to the address, not the account: a user who changes their sign-in e-mail on `/me` to a listed address becomes super-admin, and one who changes it away from a listed address stops being one |
+| `EMAIL_TRANSPORT` | smtp | how all mail goes out (sign-in codes, invites, module mail): `smtp`, `resend`, or the id of a transport a module in `DROBEK_MODULES` contributes to the `email.transport` slot ([MODULES](MODULES.md#e-mail-transports-from-modules): SES, Postmark, a company relay, …; set the secret env vars the module names). The server refuses to start on an invalid value, an id no active module contributes, or a missing transport secret |
+| `EMAIL_TRANSPORT_TIMEOUT_MS` | 10000 | how long one send through a module transport may take before it is aborted (1000–120000) |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` / `SMTP_USER` / `SMTP_PASS` / `EMAIL_FROM` | — / 587 / 0 / — / — / — | **`SMTP_HOST` required with `smtp`** (production refuses to start without it) — the SMTP server for sign-in codes and module mail (`SMTP_SECURE=1` = implicit TLS); `EMAIL_FROM` is the sender for both transports (`Name <address>`; a bare address is sent under the name `drobek`) |
+| `SMTP_CONNECTION_TIMEOUT_MS` / `SMTP_GREETING_TIMEOUT_MS` / `SMTP_SOCKET_TIMEOUT_MS` | 10000 / 10000 / 30000 | how long an SMTP send waits to connect, for the server's greeting and on a silent socket (1000–120000; the server refuses to start on an invalid value). A hung mail server fails the send after these, and the sign-in form says so |
 | `RESEND_API_KEY` | — | **required with `resend`**, a secret (the server refuses to start without it; it is never logged or shown) — mail goes to `POST https://api.resend.com/emails` with a 10 s timeout; `EMAIL_FROM` must be on a domain verified in Resend |
-| `OTP_IP_SHORT_LIMIT` / `OTP_IP_DAILY_LIMIT` | 5 per 15 min / 20 per 24 h | dashboard sign-in codes sent per client IP |
-| `OTP_EMAIL_HOURLY_LIMIT` / `OTP_EMAIL_COOLDOWN_MS` | 3 per hour / 60000 | codes per address, minimum gap per address |
-| `OTP_GLOBAL_HOURLY_MAX` | 100 | codes per hour server-wide, then sending pauses |
+| `OTP_IP_SHORT_LIMIT` / `OTP_IP_DAILY_LIMIT` | 5 per 15 min / 20 per 24 h | dashboard sign-in code requests per client IP (a request whose e-mail failed counts too); every `OTP_*` limit also holds for the codes that confirm an account deletion or a new sign-in e-mail, counted separately |
+| `OTP_EMAIL_HOURLY_LIMIT` / `OTP_EMAIL_COOLDOWN_MS` | 3 per hour / 60000 | codes sent per address, minimum gap per address. A send that failed costs the address nothing: once mail works again, the next request sends a code |
+| `OTP_GLOBAL_HOURLY_MAX` | 100 | codes sent per hour server-wide, then sending pauses (failed sends do not count) |
 | `OTP_VERIFY_IP_LIMIT` / `OTP_VERIFY_IP_WINDOW_S` | 30 / 900 | code checks per client IP per window (the per-code cap of 5 guesses always applies) |
 | `OTP_LOGIN_DISABLED` | 0 | `1` = kill switch: no sign-in codes are sent |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | — | optional Google sign-in for the dashboard (redirect URI `<PUBLIC_ORIGIN>/auth/google/callback`) |
 | `GOOGLE_AUTH_URL` / `GOOGLE_TOKEN_URL` / `GOOGLE_USERINFO_URL` | Google's endpoints | dev only: point Google sign-in at the mock provider (`task mock:google`) |
 | `OAUTH_DCR_MAX_UNUSED_CLIENTS` | 500 | MCP clients registered by DCR that never got consent, before registration answers 503 |
 | `OAUTH_CIMD_DEV_ORIGINS` | — | dev/test only, ignored in production: origins allowed to serve a Client ID Metadata Document over plain http |
+| `AUTH_OIDC_DEV_ORIGINS` | — | dev/test only, ignored in production: origins the `oidc` module may reach over plain http from a private address (the mock IdP of `task mock:oidc`) |
 | `DASHBOARD_GITHUB_STARS` | on | the dashboard footer shows the source repository's GitHub star count, fetched server-side from `api.github.com` (unauthenticated, 3 s timeout, cached 1 h, never delays a page); `off` = no outbound call, no stars |
+| `WHATS_NEW_BANNER` | 1 | after an update to a new release line (the `major.minor` of `DROBEK_VERSION`), every signed-in person sees a notice "drobek was updated to 0.9 · What's new" above the dashboard until they dismiss it; the dismissal is a cookie per browser and line, and a dev build shows no notice. `/whats-new` (no login) redirects to the GitHub release of the running version, or the releases list for a dev build, whatever this is set to. `0` = no notice |
 
 ### Apps, compiler and serving
 
@@ -374,12 +461,36 @@ limit marked *(plan)* can also come per workspace from the limits provider.
 | `COMPILE_MAX_FILES` / `COMPILE_MAX_FILE_BYTES` / `COMPILE_MAX_TOTAL_BYTES` | 200 / 524288 / 5242880 | per app version |
 | `COMPILE_MAX_IMPORT_DEPTH` | 50 | depth of a relative import chain |
 | `COMPILE_TIMEOUT_MS` / `COMPILE_CONCURRENCY` / `COMPILE_QUEUE_TIMEOUT_MS` | 10000 / 4 / 10000 | per build; builds at once; max queue wait (then `busy`) |
+| `MCP_MAX_BODY_BYTES` | 2 × `COMPILE_MAX_TOTAL_BYTES` (10485760) | the largest `/mcp` request body — one `write_files` call as JSON; a bigger one answers 413 with a JSON-RPC error telling the agent to split the write (the briefing states the value) |
+| `MCP_MAX_SUBSCRIPTIONS` | 256 | the `subscriptions/listen` streams (SSE, MCP 2026-07-28 clients) the server holds open at once; one more answers the JSON-RPC error "Subscription limit reached". drobek sends nothing on them, but each holds a connection, and the shutdown ends them before it drains the requests in flight |
+| `READINESS_MAX_WARNINGS` | 50 | warnings one publish readiness report lists (write_files, publish, the app page); the rest are counted in `warnings_omitted` |
+| `TYPECHECK_WORKERS` / `TYPECHECK_TIMEOUT_MS` / `TYPECHECK_MAX_MEMORY_MB` / `TYPECHECK_MAX_FILES` | 1 / 20000 / 512 / 150 | the background TypeScript check of each stored version (`type_error` readiness warnings): checks at once in worker threads (0 = off), time and heap per check, max .ts/.tsx files per app; a check over a limit gives no type warnings and is logged |
 | `BEACON_RATE_LIMIT` / `BEACON_APP_RATE_LIMIT` / `BEACON_RATE_WINDOW_MS` | 60 / 600 / 60000 | browser error reports per app+IP and per app per window |
 | `BEACON_MAX_EVENTS_PER_APP` / `BEACON_RETENTION_DAYS` / `BEACON_SAMPLE_RATE` | 500 / 30 / 1 | the per-app error buffer (newest N, max age) and sampling |
+| `ANALYTICS_ENABLED` | 1 | app traffic analytics: page views of each app's production address and custom domains, a daily visitor estimate without cookies (a hash with a salt kept only in Redis for the day), bot views, top pages and referrer hosts — the Analytics tab and `get_analytics`; `0` counts nothing and the tab says so |
+| `ANALYTICS_RETENTION_DAYS` | 90 | days of traffic counts kept; an hourly job moves the counters from Redis into Postgres and removes older days |
 | `LOGS_PRUNE_INTERVAL_MS` | 3600000 | how often the server removes `get_logs` rows past their retention for every app (errors past the buffer above, compiles and daily request stats older than 30 days) |
 | `DROBEK_MIGRATE_ON_START` | 1 | `0` = the server does not apply migrations on start (tests, tooling) |
 | `AUDIT_RETENTION_DAYS` | 365 | audit rows older than this are pruned daily |
+| `APP_PURGE_AFTER_DAYS` / `APP_PURGE_INTERVAL_MS` | 30 / 3600000 | a deleted app is deleted for good this many days after the delete — its versions, module data (records, form submissions, end users and their sessions, uploads), domains, assets, logs and statistics; audit rows stay until `AUDIT_RETENTION_DAYS` — and how often the purge runs. Below 30 the app's address is free from the purge on, not after 30 days |
 | `APPS_MAX_PER_WORKSPACE` | 50 | live apps per workspace (deleted ones do not count); `create_app` beyond it answers `limit_exceeded` *(plan)* |
+| `VERSIONS_PER_APP_HOUR` / `VERSIONS_PER_USER_HOUR` | 600 / 1200 | new versions of one app / made by one person (every app and workspace) within the last hour — `write_files`, `create_app`, `restore_version`, `duplicate_app` and the dashboard's Restore and duplicate page together; past either the call answers `rate_limited` with `retry_after_seconds` (the dashboard 429 + `Retry-After`) and nothing is stored *(plan)* |
+| `FEEDBACK_MAX_OPEN_PER_APP` / `FEEDBACK_PER_USER_HOUR` | 500 / 30 | open feedback notes one app may hold (a new note past it is refused until notes are resolved or deleted) / notes one member may leave on the previews within the last hour, in every app (the dashboard answers 429 + `Retry-After`) |
+| `SCREENSHOT_MAX_BYTES` | 1048576 | the largest screenshot a member may attach to a feedback note or send from the preview for `request_screenshot` — the upload (bigger → 413; the note page and the preview shrink a capture, a chosen file or a pasted image below it in the browser first) and the WebP drobek stores after re-encoding it (longer side 1600 px, metadata dropped; the upload itself is never kept). The note page and `/api/screenshots/<id>` have their own request body limit of this plus 64 KiB, in drobek and in the generated Caddyfile |
+| `FEEDBACK_SCREENSHOTS_MAX_PER_APP` / `FEEDBACK_SCREENSHOT_RETENTION_DAYS` | 100 / 30 | feedback notes with a screenshot one app may hold (a new screenshot past it is refused; the note can go without it) / days a resolved note keeps its screenshot — the hourly blob job then deletes the screenshot (not the note) and the blob GC frees its bytes. Screenshots do not count against `WORKSPACE_SOURCE_QUOTA` |
+| `MCP_IMAGE_MAX_BYTES` | 409600 | the largest image an MCP tool returns as an image content block (`get_feedback_screenshot`, `get_screenshot`): a JPEG re-encoded from the stored screenshot with its longer side at most 1280 px, its quality and then its size stepped down until it fits |
+| `SCREENSHOT_REQUEST_TTL_SEC` | 600 | how long a `request_screenshot` request waits for someone on the preview to click Capture or Not now; then `get_screenshot` answers `expired` and the request's one-time upload token is void |
+| `SCREENSHOT_REQUESTS_PER_APP_HOUR` | 20 | `request_screenshot` requests per app in a fixed hour (Redis); past it the tool answers `rate_limited` with `retry_after_seconds` |
+| `SCREENSHOTS_RETENTION_DAYS` | 7 | days a screenshot sent for `request_screenshot` is kept — the hourly blob job then deletes it and the blob GC frees its bytes; it does not count against `WORKSPACE_SOURCE_QUOTA` |
+| `PREVIEW_EVENTS_MAX_PER_APP` / `PREVIEW_EVENTS_MAX_PER_IP` | 50 / 4 | live reload of the preview: event streams (`/__drobek/preview/events`, one per open preview tab) open at once per app / per client IP of an app, counted in each drobek process; past either the stream answers 429 and that tab does not reload by itself |
+| `PREVIEW_EVENTS_MAX_MS` | 3600000 | how long one preview event stream stays open; then the browser reconnects by itself |
+| `BROWSER_ERRORS_PER_IP_MINUTE` | 30 | error reports (`POST /__drobek/preview/errors`) one client IP may send to one app per minute; the rest are dropped silently |
+| `BROWSER_ERRORS_MAX_PER_VERSION` | 200 | distinct browser errors kept per version of an app (`get_logs` kind `browser`); past it new ones are dropped, the counts of kept ones still go up |
+| `BROWSER_ERRORS_TTL_HOURS` | 48 | how long a version's browser errors stay in Redis after the last one arrived |
+| `APP_VERSIONS_KEEP` | 200 | the newest versions of each app the hourly history retention keeps; older versions are deleted — never the published one, the one the preview serves, a version a member keeps, one whose asset set is kept for a rollback or one from the last hour — and the blob GC frees their bytes. `read_file` / `restore_version` of a deleted one answer `not_found` saying so; the dashboard's version history and `get_app` state the number *(plan; while the limits provider does not answer, the retention leaves the workspace alone)* |
+| `APP_VERSIONS_KEPT_MAX` | 20 | versions of one app its members may keep (neither the retention nor a member's clean-up deletes a kept version); keeping one more answers `limit_exceeded` with `limit` / `value`; a lower value leaves the versions already kept alone *(plan)* |
+| `APP_VERSIONS_PAGE` | 20 | versions one page of an app's version history lists |
+| `WORKSPACE_SOURCE_QUOTA` | 1073741824 | bytes of the unique files (sources and build output) the versions of a workspace's live apps may store (1 GiB; deleted apps do not count); a write, `create_app` or gallery copy whose new bytes do not fit answers `limit_exceeded` and nothing is stored; a restore adds no bytes *(plan)* |
 | `ASSETS_DIR` | `/data/assets` *(compose)* | app asset storage (the `assets_data` volume) |
 | `APP_ASSET_MAX_BYTES` / `APP_ASSETS_QUOTA` | 104857600 / 1073741824 | one app asset (100 MiB) / all assets of one app (1 GiB); `asset_too_large` / `asset_quota_exceeded` *(plan)*. An upload must arrive within Node's 300 s request timeout |
 | `APP_ASSET_UPLOADS_PER_HOUR` | 60 | upload URLs (`create_asset_upload`, the Assets tab) per app per hour, then `rate_limited` |
@@ -389,17 +500,25 @@ limit marked *(plan)* can also come per workspace from the limits provider.
 
 | Variable | Default | What |
 | --- | --- | --- |
-| `DROBEK_MODULES` | none *(compose: `auth,email,forms,data,proxy,files`)* | the modules this server runs; `x` loads `drobek-module-x` ([`MODULES.md`](./MODULES.md)) |
+| `DROBEK_MODULES` | none *(compose: `auth,email,forms,data,proxy,files,sync,oidc,webhooks`)* | the modules this server runs; `x` loads `drobek-module-x` ([`MODULES.md`](./MODULES.md)) |
 | `DROBEK_MODULES_ROOT` | the server's directory | where module packages are resolved from when they are not in `DROBEK_MODULES_DIR` |
 | `DROBEK_MODULES_DIR` | `/data/modules` *(compose: the `modules_data` volume; dev: `./.modules`)* | modules the operator installed (`task selfhost:module:add`, dev: `task module:add`): `<dir>/<name>/node_modules/<package>` + `modules.lock.json`; looked up BEFORE the server's dependencies; a module there that the lockfile does not list, or whose files changed, refuses the start ([Third-party modules](#third-party-modules)). Change it only for a [derived image](#derived-image) that bakes its modules elsewhere |
 | `DROBEK_MODULES_UNLOCKED` | — | `1` = load modules from `DROBEK_MODULES_DIR` without the `modules.lock.json` check — for developing a module locally; ignored (with a warning) when `NODE_ENV=production` |
 | `DROBEK_MODULE_<NAME>_DEFAULTS` (e.g. `DROBEK_MODULE_AUTH_DEFAULTS`) | — | server-wide config defaults of the module `<name>`: a JSON merge patch over its defaults (`{"allow":{"domains":["acme.com"]}}`), validated by its schema at start — invalid refuses the start ([`MODULES.md`](./MODULES.md#operator-defaults-drobek_module_name_defaults)) |
 | `MODULE_ENABLED_<NAME>` (e.g. `MODULE_ENABLED_CRM`) | 0 | only for an opt-in module (`availability: 'opt-in'`): `1` enables it on every workspace; unset / `0` = a super-admin enables it per workspace in the dashboard (Workspace → Modules). A limits provider may answer it per workspace (`1` on, `0` off — also over the dashboard switch) ([`MODULES.md`](./MODULES.md#per-workspace-enabling-opt-in-modules)) *(plan)* |
+| `MODULE_JOBS_ENABLED` | 1 | `0` = this process runs no module jobs (e.g. every replica but one); modules declare their scheduled `jobs` ([`MODULES.md`](./MODULES.md#scheduled-jobs-jobs)) |
+| `MODULE_JOBS_CONCURRENCY` | 4 | module job runs in flight per process; a due run past it waits for a later check |
+| `MODULE_JOBS_TIMEOUT_MS` | 300000 | the longest one module job run may take: then it is aborted, counted as failed and retried with backoff |
+| `ERROR_REPORTER` | — | where server errors go besides the log: the id of an error reporter a module in `DROBEK_MODULES` contributes to the `errors.reporter` slot ([MODULES](MODULES.md#error-reporters-from-modules): an incident webhook, a log service, …; set the secret env vars the module names). Empty = log only. The server refuses to start on an invalid value, an id no active module contributes, or a missing reporter secret |
+| `ERROR_REPORTER_TIMEOUT_MS` | 5000 | how long one delivery to the error reporter may take before it is aborted and dropped (100–60000) |
+| `ERROR_REPORTER_MAX_PER_MINUTE` | 60 | reports sent per minute (1–10000); the rest are only logged (one warning per minute), an identical error goes out once per minute |
 | `DROBEK_SKILLS_DIR` | `./skills` (image: `/app/skills`) | the general skills `skill_info` lists |
 | `LIMITS_PROVIDER_URL` / `LIMITS_PROVIDER_SECRET` | — | per-workspace limits from your own HMAC-signed endpoint (secret ≥ 32 characters) |
 | `AUTH_CODES_PER_IP_15MIN` / `AUTH_CODES_PER_IP_DAY` | 5 / 20 | `auth`: sign-in codes per client IP *(plan)* |
 | `AUTH_CODES_PER_EMAIL_HOUR` / `AUTH_CODES_PER_APP_HOUR` | 3 / 100 | `auth`: codes per address, per app *(plan)* |
 | `AUTH_ATTEMPTS_PER_IP_15MIN` / `END_USERS_MAX_PER_APP` | 30 / 1000 | `auth`: send-code, verify and provider begin/complete calls per IP; end users per app *(plan)* |
+| `AUTH_OIDC_ISSUER` / `AUTH_OIDC_CLIENT_ID` / `AUTH_OIDC_CLIENT_SECRET` | — | `oidc`: one company IdP for every app whose `providers.oidc` has no `issuer` (the issuer's host may be private and on any port); the secret is also the fallback of every app's `OIDC_CLIENT_SECRET`. Redirect URI at the IdP: `<PUBLIC_APP_URL>/__drobek/auth/callback/oidc` |
+| `OIDC_DISCOVERY_CACHE_SEC` | 3600 | `oidc`: seconds an IdP's discovery document is cached, server-wide (its keys: 1 hour, an unknown key id refetches them at most once a minute) |
 | `AUTH_PROVIDER_CALLBACKS_PER_IP_15MIN` | 60 | `auth`: sign-in provider callbacks (`/__drobek/auth/callback/<provider>` on the dashboard host) per client IP per 15 min — server-wide, never a plan value (the app is not known yet) |
 | `EMAIL_PER_APP_PER_DAY` / `EMAIL_NOTIFY_ADMINS_PER_DAY` | 50 / 20 | `email`: notification mails per app per day; `notifyAdmins()` per user per day *(plan)* |
 | `EMAIL_GLOBAL_HOURLY_MAX` / `EMAIL_GLOBAL_PAUSE_MINUTES` | 500 / 15 | the operator-wide cap on all module mail (recipients per hour) and the pause length (a fixed window: the class budget restarts after it) |
@@ -410,14 +529,27 @@ limit marked *(plan)* can also come per workspace from the limits provider.
 | `DATA_MAX_DOCS_PER_APP` / `DATA_MAX_DOC_BYTES` / `DATA_MAX_BYTES_PER_APP` | 10000 / 102400 / 52428800 | `data`: records, bytes per record, bytes per app *(plan)* |
 | `DATA_WRITE_RATE_LIMIT` / `DATA_WRITE_RATE_WINDOW_MS` | 120 / 60000 | `data`: writes per app per window *(plan)* |
 | `DATA_WRITES_PER_PRINCIPAL_PER_MIN` | 60 | `data`: writes per minute of one signed-in user (or one visitor IP), checked before the per-app limit *(plan)* |
+| `DATA_SUBSCRIBE_MAX_PER_APP` / `DATA_SUBSCRIBE_MAX_PER_CALLER` | 200 / 4 | `data`: live subscriptions (`drobek.data.subscribe`, a `text/event-stream` each) open at once per app / per signed-in user or visitor IP of an app, counted in each drobek process; over either → `429 limit_exceeded` *(plan)* |
+| `DATA_SUBSCRIBE_MAX_MS` | 3600000 | `data`: how long one live subscription stays open; then the SDK reconnects and resumes it *(plan)* |
+| `DATA_SUBSCRIBE_BACKLOG` | 100 | `data`: changes kept per collection in Redis (1–1000, for 10 minutes after the last write) so a reconnecting subscription gets what it missed; one that missed more loads the list again |
 | `FILES_DIR` | `/data/files` | `files`: upload storage (the `files_data` volume) |
 | `FILES_MAX_BYTES` / `FILES_QUOTA_PER_APP` / `FILES_UPLOAD_RATE_LIMIT` | 10 MiB / 500 MiB / 60 per min | `files` *(plan)* |
 | `FILES_UPLOADS_PER_PRINCIPAL_PER_MIN` | 20 | `files`: uploads per minute of one signed-in user (or one visitor IP), checked before the per-app limit *(plan)* |
 | `FILES_SWEEP_INTERVAL_MS` / `FILES_SWEEP_RETENTION_MS` | 3600000 / 86400000 | `files`: how often the sweep runs; it removes the uploads of apps deleted that long ago, temp uploads untouched that long and blobs that old no app references |
 | `PROXY_ALLOWED_PORTS` / `PROXY_ALLOWED_HOSTS` | 80,443 / empty | `proxy`: upstream ports; hostnames whose private IPs may be reached (keep empty) |
-| `PROXY_CONNECT_TIMEOUT_MS` / `PROXY_MAX_RESPONSE_BYTES` | 8000 / 5242880 | `proxy`: per upstream request (the size cap also holds for a decoded gzip/br body) |
-| `PROXY_MAX_CONCURRENT` / `PROXY_MAX_CONCURRENT_PER_APP` | 32 / 8 | `proxy`: upstream calls in flight on the whole server / per app; over either → `429 proxy_busy` |
+| `PROXY_CONNECT_TIMEOUT_MS` / `PROXY_MAX_RESPONSE_BYTES` | 8000 / 5242880 | `proxy`: how long the TCP / TLS connect to an upstream may take (only the connect, not the answer); the size cap of a buffered answer (also for a decoded gzip/br body) |
+| `PROXY_RESPONSE_TIMEOUT_MS` | 120000 | `proxy`: how long a buffered answer may take (redirects included), and how long a streamed one may take to send its headers |
+| `PROXY_STREAM_IDLE_TIMEOUT_MS` / `PROXY_STREAM_MAX_MS` / `PROXY_STREAM_MAX_BYTES` | 60000 / 300000 / 33554432 | `proxy`: a `text/event-stream` answer of an upstream a workspace admin enabled streaming for is relayed as it arrives; it is cut (with a last SSE `error` event) after this long between two chunks from the upstream, this long in total, or past this many bytes. A client that reads slowly holds its slot up to the total |
+| `PROXY_MAX_CONCURRENT` / `PROXY_MAX_CONCURRENT_PER_APP` / `PROXY_MAX_CONCURRENT_PER_CALLER` | 32 / 8 / 2 | `proxy`: upstream calls in flight on the whole server / per app / per caller of an app (a signed-in end user, or a client IP); an open stream counts until it ends; over any → `429 proxy_busy` |
+| `UPSTREAMS_MAX_PER_WORKSPACE` | 20 | `proxy`: upstreams one workspace may hold (existing ones over a lowered cap stay, deleting always works); `register_upstream` and the Upstreams page beyond it answer `limit_exceeded` *(plan)* |
+| `UPSTREAM_REGISTRATIONS_PER_HOUR` | 20 | `proxy`: upstream registrations per workspace within the last hour, MCP and dashboard together; then `rate_limited` with `retry_after_seconds` |
 | `PROXY_CALLS_PER_MIN` / `PROXY_PUBLIC_CALLS_PER_MIN_PER_IP` | 60 / 10 | `proxy`: calls per app, per IP to `public` upstreams *(plan)* |
+| `SYNC_MIN_INTERVAL_MIN` / `SYNC_MAX_SOURCES_PER_APP` | 5 / 10 | `sync`: the shortest interval of a source (minutes); sources per app — `configure_module` refuses more *(plan)* |
+| `SYNC_MAX_RESPONSE_BYTES` / `SYNC_MAX_RECORDS_PER_RUN` | 5242880 / 1000 | `sync`: bytes of one upstream answer a run reads (`PROXY_MAX_RESPONSE_BYTES` caps it too); records one run imports — more fails the run *(plan)* |
+| `SYNC_RUNS_PER_HOUR_PER_APP` / `SYNC_NOW_PER_MINUTE` | 60 / 2 | `sync`: runs per app per hour (scheduled and by hand); runs by hand (Run now, `sync_now`) of one source per minute *(plan)* |
+| `SYNC_PAUSE_AFTER_FAILURES` | 5 | `sync`: failed runs in a row after which a source pauses until the owner resumes it *(plan)* |
+| `WEBHOOKS_MAX_BODY_BYTES` | 262144 | `webhooks`: bytes of one incoming delivery, at most 1048576; an endpoint's `max_bytes` can only lower it — a larger delivery is refused (413) and listed *(plan)* |
+| `WEBHOOKS_PER_APP_PER_MINUTE` / `WEBHOOKS_MAX_ENDPOINTS_PER_APP` | 120 / 10 | `webhooks`: deliveries per app per minute (429 past it); endpoints per app — `configure_module` refuses more *(plan)* |
 | `HELLO_WAVES_PER_MINUTE` | 30 | the example module `drobek-module-hello` |
 
 ### Custom domains, abuse and the gallery
@@ -433,6 +565,8 @@ limit marked *(plan)* can also come per workspace from the limits provider.
 | `DOCS_URL` | — (the Markdown files in the GitHub repository) | the base of a website with the drobek docs, each page at `<DOCS_URL>/<slug>` (`overview`, `agent`, `modules`, `self-hosting`, `architecture`, `security`, `licensing`) with a Markdown twin at `<DOCS_URL>/<slug>.md`: `/llms.txt` links the `.md` pages, `/llms-full.txt` the agent guide's `.md`, `/build-with-your-agent` and the landing page the agent guide. Not an http(s) URL (or one with a query or fragment) stops the server at start |
 | `ABUSE_REPORTS_PER_IP_HOUR` | 5 | valid abuse reports per client IP per hour |
 | `ABUSE_BRAND_WORDS` | a built-in list | the publish heuristic's brand words (comma-separated) |
+| `ABUSE_REPORTS_RETENTION_DAYS` | 365 | a resolved abuse report is deleted this many days after it was resolved (the daily retention prune); open reports stay |
+| `ADMIN_LIST_PAGE` | 50 | rows per page of the super-admin lists — All workspaces on `/workspaces`, `/admin/abuse` and `/admin/publishing` (1–500; a bad value falls back to 50) |
 | `GALLERY_ENABLED` | off | `true` = the [public gallery](#public-gallery): owners (and, on their explicit yes, their agents) may list published apps; `GET /api/public/gallery` answers. Off = no switch in the dashboard, the endpoint answers 404 |
 | `GALLERY_API_PER_IP_MINUTE` | 60 | requests to `GET /api/public/gallery` per client IP per minute (429 over it) |
 | `GALLERY_OPENS_PER_IP_HOUR` | 60 | visits through a gallery `openUrl` counted per client IP per hour (more still redirect, uncounted) |
@@ -442,6 +576,19 @@ limit marked *(plan)* can also come per workspace from the limits provider.
 | `PUBLISH_APPROVAL` | `open` | `open` = every workspace may publish unless a super-admin blocked it; `approval` = a workspace publishes only after a super-admin allowed it (or when a super-admin is its member) — see [Publish approval](#publish-approval). Any other value, or `approval` without `SUPERADMIN_EMAIL`, stops the server at start |
 | `OPERATOR_EMAIL` | the `SUPERADMIN_EMAIL` addresses | one address: the contact a refused publish names, the recipient of approval requests and publish notifications (without it every super-admin is e-mailed and the first one is shown), and an extra recipient of abuse reports; not one e-mail address = no start |
 | `PUBLISH_NOTIFY` | `off` | e-mail the operator (`OPERATOR_EMAIL`, else every super-admin) about publishes: `first` = the first publish of each app, `every` = every publish, at most one e-mail per app per hour; a super-admin's own publishes are never e-mailed. Any other value stops the server at start |
+
+### Backups and container logs
+
+`task backup` reads the `BACKUP_*` settings from the environment (`task
+backup BACKUP_KEEP=30`), else from `.env.production`; docker compose reads the
+`CONTAINER_LOG_*` ones from `.env.production`. Neither reaches drobek itself.
+
+| Variable | Default | What |
+| --- | --- | --- |
+| `BACKUP_DIR` | `backups` | where `task backup` writes `drobek-<UTC timestamp>.tar.gz` (relative to the checkout) — and its parts while it runs, not `/tmp`; `task backup:verify` checks the newest archive there |
+| `BACKUP_KEEP` | 14 | after a backup that verified, every `drobek-<UTC timestamp>.tar.gz` in `BACKUP_DIR` beyond the newest N is deleted; `0` = keep every archive. A failed backup deletes nothing, and files of any other name are never deleted |
+| `BACKUP_MIN_FREE_MB` | 1024 | the free space a backup leaves on the `BACKUP_DIR` disk: it refuses to start unless twice the data (the database's tables + the four volumes) plus this much is free |
+| `CONTAINER_LOG_MAX_SIZE` / `CONTAINER_LOG_MAX_FILES` | `20m` / 5 | the production compose's `json-file` log of every container rotates at this size (docker's `k`, `m`, `g` units) and keeps this many files |
 
 ### Development and tests only
 
@@ -459,11 +606,17 @@ limit marked *(plan)* can also come per workspace from the limits provider.
 
 ```sh
 task backup
+# · free space in backups
+#   38.2 GiB free, 1.0 GiB needed (twice the data + BACKUP_MIN_FREE_MB)
+# · pg_dump -Fc   · files_data   · assets_data   · modules_data   · caddy_data
+# · verify the archive
+#   5 parts (db.dump 1.1 MiB · files.tar 40.0 KiB · assets.tar 2.1 MiB · modules.tar 10.0 KiB · caddy_data.tar 30.0 KiB) — every size and sha256 matches manifest.json
 # ✓ backups/drobek-20260923T201500Z.tar.gz — 1234567 bytes in 4 s
 #   apps 12 · files 40 · assets 3 · core migrations 20 · image ghcr.io/freema/drobek:v1.2.0 (v1.2.0 abc1234)
+#   BACKUP_KEEP=14: 1 older archive(s) deleted, 1.2 MiB freed
 ```
 
-One archive (mode 600, in `backups/`, override with `BACKUP_DIR=`):
+One archive (mode 600, in `backups/`, override with `BACKUP_DIR`):
 `db.dump` (`pg_dump -Fc` of the whole database — one consistent snapshot),
 `files.tar` (the `files_data` volume), `assets.tar` (the `assets_data`
 volume), `modules.tar` (the `modules_data` volume), `caddy_data.tar`, `SHA256SUMS` and a
@@ -480,9 +633,61 @@ copy the archives off the machine:
 15 3 * * * cd /opt/drobek && task backup >> /var/log/drobek-backup.log 2>&1
 ```
 
+**Disk space.** The parts are written into a hidden directory in
+`BACKUP_DIR` (not `/tmp`) and the archive next to them, so while it runs a
+backup needs about twice the data. Before it writes anything it adds up the
+database's tables and the four volumes and refuses to start unless the
+`BACKUP_DIR` disk has twice that plus `BACKUP_MIN_FREE_MB` (1024) free — the
+volumes usually share that disk, and postgres stops when it is full:
+
+```
+✗ not enough free space in backups for a backup: 3.1 GiB free, 4.6 GiB needed — nothing was written.
+  The backup writes its parts (about 1.8 GiB: database tables 1.2 GiB, volumes 0.6 GiB)
+  and then the archive next to them, so it needs twice that, and leaves BACKUP_MIN_FREE_MB (1024) free.
+  The 14 archive(s) in backups hold 12.0 GiB: copy older ones off the machine and
+  delete them, or set BACKUP_DIR to a bigger disk. A lower BACKUP_KEEP (now 14) keeps fewer from then on.
+```
+
+`task selfhost:upgrade` starts with `task backup`, so a refusal stops the
+upgrade before anything changed.
+
+**Retention.** Before the new archive gets its name, `task backup` checks it
+the way `task backup:verify` does (below). Then it keeps the newest
+`BACKUP_KEEP` (14 — two weeks of the daily cron above) archives named
+`drobek-<UTC timestamp>.tar.gz` in `BACKUP_DIR` and deletes the older ones;
+`BACKUP_KEEP=0` keeps every archive. A backup that fails — no room, a part
+that cannot be read, an archive that does not verify — deletes nothing and
+leaves no partial file behind, and a file of any other name
+(`drobek-before-migration.tar.gz`) is never deleted. The `BACKUP_*` settings
+come from the environment (`task backup BACKUP_KEEP=30`), else from
+`.env.production`.
+
+**Check an archive** without restoring it — the newest in `BACKUP_DIR`, or
+any with `BACKUP=`:
+
+```sh
+task backup:verify
+# · verifying backups/drobek-20260923T201500Z.tar.gz (1.2 MiB)
+# ✓ backups/drobek-20260923T201500Z.tar.gz is intact — 5 parts (db.dump 1.1 MiB · …); every size and sha256 matches manifest.json and SHA256SUMS (0 s)
+#   created 2026-09-23T20:15:00Z, image ghcr.io/freema/drobek:v1.2.0 (v1.2.0 abc1234)
+#   apps 12 · files 40 · assets 3 · core migrations 20
+#   made under DROBEK_MASTER_KEY of .env.production
+```
+
+It reads `manifest.json` and `SHA256SUMS`, checks that both list the same
+parts with the same checksums and that the parts a restore needs are there,
+and streams every part out of the archive to compare its size and sha256 —
+nothing is unpacked to disk, and neither docker nor the stack is needed, so a
+copy on another machine (a checkout with `task`) checks the same way. A
+damaged archive exits 1 naming the first part that does not match. With
+`.env.production` at hand it also says whether its `DROBEK_MASTER_KEY` (or
+`DROBEK_MASTER_KEY_PREVIOUS`) is the archive's — a restore needs that key.
+
 **Not in the archive:** `.env.production` — it holds `DROBEK_MASTER_KEY`,
-without which the restored upstream secrets (proxy module) cannot be
-decrypted. Keep a copy of it somewhere safe, separately from the backups.
+without which the restored upstream and module secrets cannot be
+decrypted. Keep a copy of it somewhere safe, separately from the backups —
+after a [key rotation](#rotating-drobek_master_key), keep the old key with
+the archives made before it.
 Redis is not backed up (sessions, caches, rate-limit counters).
 
 **Restore** into a stack whose database is empty — a new machine, or this one
@@ -499,19 +704,98 @@ task restore BACKUP=backups/drobek-20260923T201500Z.tar.gz
 ```
 
 `task restore` verifies the checksums, refuses a `DROBEK_MASTER_KEY` that does
-not match the backup's fingerprint (`ALLOW_KEY_MISMATCH=1` restores anyway,
-without usable upstream secrets), refuses a **non-empty database** (`FORCE=1`
+not match the backup's fingerprint — unless `DROBEK_MASTER_KEY_PREVIOUS`
+matches it (a backup from before a key rotation: run `task selfhost:rekey`
+after the restore) or `ALLOW_KEY_MISMATCH=1` is set (restores anyway and
+deletes the stored upstream and module secrets before the start, since no
+key opens them — their owners set them again) — refuses a **non-empty database** (`FORCE=1`
 drops and recreates it — back it up first), stops drobek and caddy, restores
 the database, replaces `files_data`, `assets_data` (left empty when the
 archive has no `assets.tar`) and `caddy_data`, and starts the stack
 (`up -d --wait`). Restore with the backup's image version or a newer one
 (`image_version` in `manifest.json`) — a newer image migrates the restored
-database forward on start; an older one does not know its migrations. Point
+database forward on start; an older one refuses to start on it (see
+[Upgrades and rollback](#upgrades-and-rollback)). Point
 the DNS records at the new machine; the restored `caddy_data` carries the
 certificates over. Sessions (dashboard users and apps' end users) live in
 Redis, which is not in the backup: after a restore on a new machine everyone
 signs in again; API keys and OAuth clients are in the database and keep
 working. A `FORCE=1` restore on the same machine leaves Redis as it is.
+
+## Rotating DROBEK_MASTER_KEY
+
+Every stored secret — upstream secrets (proxy module) and module secrets
+(a sign-in provider's client secret, an API key a module injects) — is
+encrypted with a key of its own, and that key is wrapped by
+`DROBEK_MASTER_KEY`; each row records which master key wrapped it. To change
+the master key (it leaked, someone who knew it left, it was copied around),
+drobek keeps reading with the old key while every secret moves to the new one:
+
+```sh
+cd /opt/drobek
+task backup                       # still under the old key — keep that key with this archive
+openssl rand -hex 32              # the new key
+# in .env.production: the old value becomes DROBEK_MASTER_KEY_PREVIOUS, the new one DROBEK_MASTER_KEY
+#   DROBEK_MASTER_KEY_PREVIOUS=<the old key>
+#   DROBEK_MASTER_KEY=<the new key>
+./scripts/selfhost-compose.sh up -d --wait drobek    # recreates drobek with both keys
+task selfhost:rekey
+# upstream_secrets: 3 re-wrapped, 0 already under DROBEK_MASTER_KEY, 0 under an unknown key
+# module_secrets: 5 re-wrapped, 1 already under DROBEK_MASTER_KEY, 0 under an unknown key
+# every stored secret is encrypted under DROBEK_MASTER_KEY — remove DROBEK_MASTER_KEY_PREVIOUS and restart drobek.
+# in .env.production: delete the DROBEK_MASTER_KEY_PREVIOUS line
+./scripts/selfhost-compose.sh up -d --wait drobek
+task backup                       # the first archive under the new key
+```
+
+While `DROBEK_MASTER_KEY_PREVIOUS` is set, secrets stored under it decrypt as
+before and every secret set from then on uses `DROBEK_MASTER_KEY`; each start
+logs how many are still under the previous key. `task selfhost:rekey` (`docker
+compose … run --rm --no-deps -T drobek node dist/server/rekey.js`) wraps each
+secret's own key again under `DROBEK_MASTER_KEY` — no secret value is
+decrypted, and no key or value is printed, only counts. It runs next to the
+serving drobek, and running it again is safe: a second run re-wraps nothing.
+It exits 1 when secrets are left that no key of the server opens.
+
+**What the rotation ends.** What drobek derives from the master key without
+storing it stops matching the new key:
+
+- **password-gated apps** — the unlock cookie (12 hours): visitors enter the
+  password again;
+- **forms** — a page opened before the rotation fails its submission with
+  `invalid_form_token` until it is reloaded (the form token lives 2 hours);
+- **an end user's sign-in through a provider** (the `oidc` module or another
+  `auth.provider`) that is in progress (10 minutes): they start it again;
+- **stored IP hashes** of form submissions and abuse reports: the same address
+  hashes differently afterwards, so entries from before and after the
+  rotation cannot be matched by address;
+- **backups made before the rotation** carry the old key's fingerprint: keep
+  the old key with them. `task restore` accepts such an archive while that key
+  is set as `DROBEK_MASTER_KEY_PREVIOUS`; run `task selfhost:rekey` after it.
+
+Dashboard sessions, end users' sessions, API keys, OAuth tokens and app
+passwords do not depend on the master key and keep working.
+
+**A secret under an unknown key stops the start.** When the database holds
+secrets that neither `DROBEK_MASTER_KEY` nor `DROBEK_MASTER_KEY_PREVIOUS`
+opens — the previous key was removed before `task selfhost:rekey` ran, or the
+`.env.production` belongs to another installation — drobek refuses to start
+instead of failing on each of those secrets later:
+
+```
+drobek refuses to start: 2 stored secrets are encrypted under a key this server does not have (neither DROBEK_MASTER_KEY nor DROBEK_MASTER_KEY_PREVIOUS) (upstream_secrets 1, module_secrets 1).
+  - DROBEK_MASTER_KEY was rotated: set the key used before as DROBEK_MASTER_KEY_PREVIOUS, start drobek, then run `task selfhost:rekey`.
+  - A backup was restored: use the DROBEK_MASTER_KEY it was made with (or set that key as DROBEK_MASTER_KEY_PREVIOUS).
+  - The key is lost: `task selfhost:rekey FORGET_UNKNOWN=1` deletes these secrets; their owners set them again in the dashboard.
+```
+
+`task selfhost:rekey FORGET_UNKNOWN=1` names what it deletes
+(`<workspace>/<upstream>`, `<workspace>/<app> <module>.<NAME>`), so you can
+tell the owners which secret to set again. Outside production
+(`NODE_ENV` other than `production`) the same finding is a warning in the
+log, and the start goes on. `task selfhost:migrate` makes the same check
+before it applies a migration, so an upgrade stops with the old schema in
+place and the image you ran before still starts.
 
 ## Upgrades and rollback
 
@@ -530,12 +814,12 @@ task selfhost:upgrade
 `task selfhost:upgrade` is exactly:
 
 ```sh
-task backup                                                   # the rollback point
+task backup                                                   # the rollback point (refused without room: nothing changes)
 docker compose --env-file .env.production -f docker-compose.production.yaml pull --ignore-buildable
 docker compose --env-file .env.production -f docker-compose.production.yaml pull caddy     # (DNS-01 Caddy: build --pull caddy)
 docker compose --env-file .env.production -f docker-compose.production.yaml up -d --wait postgres redis
 docker compose --env-file .env.production -f docker-compose.production.yaml stop drobek
-task selfhost:migrate     # the new image: applies the release's migrations, exits
+task selfhost:migrate     # the new image: applies the release's migrations, exits (refuses a newer database)
 task selfhost:migrate     # again: "migrations: nothing to apply (up to date)"
 docker compose --env-file .env.production -f docker-compose.production.yaml up -d --wait
 ```
@@ -551,6 +835,38 @@ migration that fails rolls back its transaction and leaves the journal as it
 was; the old container is already stopped, so fix the cause (or roll back)
 before starting.
 
+**One process migrates at a time.** Every migration run — a server start and
+`task selfhost:migrate` alike — holds one Postgres advisory lock while it
+applies a journal. Two replicas that start together (or a `migrate` next to
+a starting server) do not race: the second logs `waiting for another drobek
+process to finish its migrations`, waits, then finds everything applied and
+goes on.
+
+**An older image refuses a newer database.** Each run records, per journal,
+the image (and module) version that brought the journal's newest migration
+(`drizzle.__drobek_migration_images`). An image that finds migrations in a
+journal that it does not know — the database was migrated by a newer release
+— applies nothing and exits instead of serving against a schema it does not
+know:
+
+```
+the database schema is newer than this image — drizzle.__drizzle_migrations_core holds 2 migrations
+that drobek v1.2.0 (abc1234) does not know. It was migrated by drobek v1.3.0 (def5678): start drobek
+v1.3.0 (def5678) or newer (DROBEK_IMAGE_TAG). Migrations only go forward: an older image never runs
+on a newer schema.
+```
+
+In `task selfhost:upgrade` this stops the first `task selfhost:migrate`, so
+the upgrade ends with drobek stopped and the database untouched: set
+`DROBEK_IMAGE_TAG` to the version the message names (or a newer one) and run
+`task selfhost:upgrade` again. A module journal names the module version too —
+install that version of a third-party module (`task selfhost:module:add`).
+
+The `stop drobek` step lets the old container finish the requests in flight
+first (up to `SHUTDOWN_GRACE_MS`, see [Production compose](#production-compose)).
+Connected MCP clients lose their session with the old process and open a new
+one once the new release serves.
+
 **Rollback.** `previous` is the release that was `latest` before the newest
 one — but it moves with the next release, so roll back to the exact version:
 
@@ -562,8 +878,9 @@ task restore FORCE=1 BACKUP=backups/<the backup task selfhost:upgrade just took>
 docker compose --env-file .env.production -f docker-compose.production.yaml up -d --wait
 ```
 
-Migrations only go forward; an older image on a database migrated by a newer
-one is not supported, which is why the upgrade takes a backup first.
+Migrations only go forward; an older image refuses a database migrated by a
+newer one (see above), which is why the upgrade takes a backup first and a
+rollback restores it.
 
 **Check a live server end to end.** The @smoke suite drives the whole MCP loop
 against a running server over public HTTP only: `list_apps`, `create_app` (or
@@ -596,7 +913,7 @@ task selfhost:module:add -- drobek-module-acme-erp@1.2.0
 #   modules.lock.json: sha512-…
 #
 # Next: enable it in .env.production and restart drobek (it applies the module's migrations on start):
-#   DROBEK_MODULES=auth,email,forms,data,proxy,files,drobek-module-acme-erp
+#   DROBEK_MODULES=auth,email,forms,data,proxy,files,sync,oidc,webhooks,drobek-module-acme-erp
 #   ./scripts/selfhost-compose.sh up -d --wait drobek
 ```
 
@@ -624,8 +941,10 @@ its `dist/` committed). `add` runs in two steps:
 Then put the printed `DROBEK_MODULES` line into `.env.production` (the short
 name for a `drobek-module-<name>` package, else the full package name) and
 restart drobek; the start applies the module's migrations and `/api/version`
-lists it with `"source":"dir"`. The script prints this and stops: it never
-edits `.env.production` and never restarts anything.
+lists it with `"source":"dir"` (plus `"operatorOnly":true` for a module
+without a skill, e.g. an error reporter: agents and app owners never see it,
+the workspace Modules page shows it to super-admins). The script prints this
+and stops: it never edits `.env.production` and never restarts anything.
 
 ```sh
 task selfhost:module:list
@@ -698,14 +1017,32 @@ image is the source of its modules.
 | `latest` | the newest release (the compose default) | on every release |
 | `previous` | the release `latest` pointed at before the newest one | on every release |
 | `edge` | the newest `main` commit that passed CI | on every `main` push |
-| `<sha>` | one commit that passed CI (`main` or a release tag) | never |
+| `<sha>` | one `main` commit whose image passed the e2e suite | never |
+| `<sha>-vX.Y.Z` | the image a release tag tested, before its release gate (below) | never |
 
 A release is a pushed `vX.Y.Z` tag: CI runs the quality gate and the e2e suite
 against the image it builds from that tag (`GIT_SHA` = the tag's commit,
 `VERSION` = the tag, `COMMIT_TIME` = that commit's time, all in
-`/api/version`), pushes that exact image as
-`vX.Y.Z`, then retags in the registry: the former `latest` → `previous`,
-`vX.Y.Z` → `latest`. A pre-release tag (`vX.Y.Z-rc.1`) gets only its own tag.
+`/api/version`) and pushes that exact image as `<sha>-vX.Y.Z`. Before any
+release tag moves, the same tag passes the release gate:
+
+- **Dependency audit:** no production dependency in the lockfile has a known
+  advisory of high or critical severity
+  (`pnpm audit --prod --audit-level high`).
+- **Image scan:** the image's operating-system and Node packages have no
+  known vulnerability of high or critical severity that a fixed package
+  version resolves. The scanner runs from an image pinned by digest, in a
+  job without secrets or write access.
+- **Self-host rehearsal:** a clean runner pulls the pushed image and passes
+  [the rehearsal](#the-rehearsal-task-selfhostrehearsal): this guide's
+  quickstart, `task backup` and a restore on a second machine.
+
+Only then does CI retag in the registry (`vX.Y.Z`, the former `latest` →
+`previous`, `vX.Y.Z` → `latest`) and publish the GitHub Release, the npm
+packages and the MCP Registry entry. A failed gate publishes none of them and
+leaves `latest` where it was; a finding is fixed in a new patch release. The gate runs on release
+tags only, never on a `main` push or a pull request. A pre-release tag
+(`vX.Y.Z-rc.1`) passes the same gate and gets only its own tag.
 To rebuild a release image yourself: `git checkout vX.Y.Z && task build` (same
 sources and lockfile; the build args come from the checkout).
 
@@ -834,7 +1171,8 @@ the credentials only ever touch that small zone. Generated app block:
 
 With no wildcard, Caddy issues a certificate for each app host at its first
 TLS handshake. That is **always gated**: before every new certificate Caddy
-asks drobek, and drobek says yes only for a host of an existing app.
+asks drobek, and drobek says yes only for a host of an existing app (a
+`--v<N>` host: only for a version the app has).
 `task selfhost:init` generates `TLS_ASK_TOKEN` (for every mode) and the
 compose file hands the same value to drobek and to Caddy.
 
@@ -856,10 +1194,11 @@ compose file hands the same value to drobek and to Caddy.
 
 | Answer | When |
 | --- | --- |
-| 200 | `<slug>`, `<slug>--preview` or `<slug>--v<N>` directly under `APPS_DOMAIN`, and a live, non-deleted app owns `<slug>` (for `--v<N>` the version itself is not checked) |
+| 200 | `<slug>` or `<slug>--preview` directly under `APPS_DOMAIN`, and a live, non-deleted app owns `<slug>` |
+| 200 | `<slug>--v<N>` directly under `APPS_DOMAIN`, and version N of that live app exists and compiled |
 | 200 | a **verified** custom domain of a live, non-deleted app (M3-01, [Custom domains](#custom-domains)) |
 | 401 | missing or wrong token (compared in constant time; also accepted as the `X-Drobek-Tls-Ask-Token` header) |
-| 404 | everything else: other hosts outside `APPS_DOMAIN` (unknown or not yet verified custom domains), the dashboard host, deeper names, unknown slugs — and **every** request while `TLS_ASK_TOKEN` is unset (fail closed), or one that arrives on the public dashboard host |
+| 404 | everything else: other hosts outside `APPS_DOMAIN` (unknown or not yet verified custom domains), the dashboard host, deeper names, unknown slugs, version numbers the app does not have — and **every** request while `TLS_ASK_TOKEN` is unset (fail closed), or one that arrives on the public dashboard host |
 | 503 | the database lookup failed (no certificate) |
 
 The endpoint is internal: Caddy refuses `/api/internal/*` with 404 on every
@@ -901,7 +1240,10 @@ workspace-admin), creates two DNS records and clicks **Verify**:
   domains off: the Domains tab says so and offers no add form. The limits
   provider may set it per workspace (e.g. a plan without custom domains). One host name is
   verified for at most one app on the instance — an unverified claim never
-  blocks the real owner.
+  blocks the real owner, and a deleted app holds no name: its domains stop
+  serving with the delete, and any other app (in any workspace) can add the
+  name and verify it with its own records (`domain_taken` only while the app
+  that verified the name exists).
 - **Serving**: a verified domain serves the app's published version (indexable,
   like `<slug>.<APPS_DOMAIN>`). Marking one domain **primary** makes
   `<slug>.<APPS_DOMAIN>` answer `302` to it (GET/HEAD, outside
@@ -949,8 +1291,8 @@ tls:reload` after changing it (`task caddy:config` in a development checkout).
 Certificate lifecycle: Caddy obtains the certificate at the first HTTPS
 request after verification (HTTP-01 on port 80 or TLS-ALPN-01 on 443 — both
 must reach Caddy; the first request waits a few seconds) and renews it
-itself. Removing a domain or losing its verification stops serving it and
-refuses new certificates, but does **not** revoke the one already issued — it
+itself. Removing a domain, losing its verification or deleting its app stops
+serving it and refuses new certificates, but does **not** revoke the one already issued — it
 stays in `caddy_data` until it expires. Let's Encrypt's per-domain rate
 limits apply per customer domain.
 
@@ -976,8 +1318,13 @@ Anyone can publish on a public drobek, so the operator (every address in
   `abuse_reports` (the reporter's IP only as a keyed hash), audited
   `abuse.report` in the app's workspace, and e-mailed to the super-admins
   and `OPERATOR_EMAIL` (each address once) — at most once per app per hour.
+  A report on a host no app matches only waits in the queue, without an
+  e-mail, so the form cannot carry spam into the operator's mailbox.
 - **Queue** (`/admin/abuse`, super-admins only, 403 for everyone else): the
-  open reports with the app and workspace behind each host.
+  open (or resolved) reports with the app and workspace behind each host,
+  when they came and from whom, `ADMIN_LIST_PAGE` (50) at a time. Search the
+  host, app, reporter or reason (`?q=`), keep the reports on an app or on a
+  host no app matches, and sort by newest, oldest or host.
   - **Take down** (pick a reason category): the app is unpublished and
     locked (`apps.locked_reason`). Its production, preview, version and
     custom-domain hosts answer **451** with a link to `TERMS_URL` (default
@@ -991,6 +1338,18 @@ Anyone can publish on a public drobek, so the operator (every address in
   - **Restore**: the lock is lifted — the app is NOT republished, its owner
     publishes again. Owners get an e-mail; audited `admin.restore`.
   - **Mark resolved**: closes a report without acting.
+  - **Retention**: a resolved report (taken down or marked resolved) is
+    deleted `ABUSE_REPORTS_RETENTION_DAYS` (default 365) days after it was
+    resolved, with its details and the reporter's e-mail; the audit rows of
+    the report and of a takedown follow `AUDIT_RETENTION_DAYS`. Open reports
+    are never deleted.
+- **From an agent.** A super-admin's agent gets `takedown_app` and
+  `restore_app` (scope `publish`; other users never see them): the same
+  takedown and restore, the same owner e-mails and audit rows with the agent
+  as the actor, each only with `user_confirmed: true` after the super-admin's
+  explicit yes. The app is named by its id, its slug or the host a report
+  names. Reading the queue and marking a report resolved stay in the
+  dashboard.
 - **Publish heuristic.** Every publish scans the published version (HTML +
   JS): a password field AND a word from `ABUSE_BRAND_WORDS` (comma-separated;
   unset = a built-in list of ~25 bank / payment / e-mail / social / crypto
@@ -1022,9 +1381,10 @@ list.
   at query time: only apps that are listed, published, public (no password
   gate), not taken down, not deleted and not hidden appear.
 - **Hiding.** A super-admin sees every listed app in the Gallery section of
-  `/admin/abuse` and can **hide** an entry (or show it again). A hidden app
-  is off the list and neither its owner nor an agent can list it. Audited
-  `app.gallery_hidden` / `app.gallery_unhidden`.
+  `/admin/abuse` and can **hide** an entry (or show it again); their agent
+  can do the same with `set_gallery_hidden` (`user_confirmed: true`). A
+  hidden app is off the list and neither its owner nor an agent can list it.
+  Audited `app.gallery_hidden` / `app.gallery_unhidden`.
 - **Duplicates.** With "Allow duplicates" on (next to "Show in the gallery";
   off by default), your gallery website can show a Duplicate button linking
   to the item's `duplicateUrl`. A visitor signs in (and comes back), picks a
@@ -1082,7 +1442,8 @@ list.
   prerender (`Sec-Purpose` / `Purpose`) and not more than
   `GALLERY_OPENS_PER_IP_HOUR` visits per client IP per hour (the redirect
   still works). The server stores a count per app and day, never who opened
-  it.
+  it, and deletes the counts of days older than the 30-day window plus 7
+  days once a day.
 - **Likes.** Link a like button to `likeUrl` (`/gallery/like/<slug>`), with
   `?back=<your gallery URL>` to return there. The page asks the visitor to
   sign in to drobek (any account), then shows the count and a "Like this
@@ -1168,8 +1529,10 @@ state in `list_apps` and `get_app`.
 
 **Decide** at `/admin/publishing` (super-admins only; linked from
 `/workspaces` and the moderation queue): every workspace with its state,
-admins, apps and live apps; filters for waiting requests, default, allowed
-and blocked; `?workspace=<slug>` shows one. In `open` mode **Block
+admins, apps and live apps, who asked, allowed or blocked it and when;
+filters for waiting requests, default, allowed and blocked, a search over
+slug, name and e-mails (`?q=`), a sort and pages of `ADMIN_LIST_PAGE`;
+`?workspace=<slug>` shows one. In `open` mode **Block
 publishing** / **Unblock** come first; in `approval` mode **Approve** /
 **Revoke approval** / **Block publishing**. Audited
 `workspace.publish_approve`, `workspace.publish_revoke`,
@@ -1203,19 +1566,26 @@ guide end to end on throwaway stacks (unique `COMPOSE_PROJECT_NAME`s, every
 port on 127.0.0.1, a throwaway Mailpit as the SMTP server): it builds the
 image, copies only the self-host files into a fresh directory ("machine A"),
 runs `task selfhost:init` twice (idempotency) and `docker compose config`
-(no warnings), starts the stack, signs a user in over the e-mail code flow,
+(no warnings), starts the stack and checks that every container log rotates,
+signs a user in over the e-mail code flow,
 mints an API key with the container CLI, creates + writes + publishes an app
 over MCP (the official SDK client) and uploads a file through the files
 module; installs a packed module with `task selfhost:module:add`, enables it
-and checks `/api/version` loads it from the modules directory; then `task backup`, `down -v`, a second fresh directory ("machine B")
-with only machine A's `.env.production`, `task selfhost:init`, `task
-restore`, and asserts the app serves on its host, the file downloads byte for
+and checks `/api/version` loads it from the modules directory; then a `task
+backup` that must be refused for lack of room (`BACKUP_MIN_FREE_MB`) without
+writing or deleting anything, a `task backup BACKUP_KEEP=2` next to three
+older archives that must keep the newest two, `down -v`, a second fresh
+directory ("machine B") with only machine A's `.env.production` and the
+archive, where `task backup:verify` must pass on it (no stack running) and
+fail on a damaged copy, `task selfhost:init`, `task restore`, and asserts the app serves on its host, the file downloads byte for
 byte, the same API key works, Caddy's restored CA still validates and the
 server starts with the same `modules.lock.json` and the module; a
 second restore must be refused and a second `task selfhost:migrate` must
 apply nothing. It prints the wall-clock time of every phase. Not part of
-`task check` or CI (it takes minutes). Knobs: `REHEARSAL_HTTPS_PORT` (9443),
-`REHEARSAL_SKIP_BUILD=1`, `REHEARSAL_KEEP=1` (see the script header).
+`task check` (it takes minutes); CI runs it on every release tag against the
+image it is about to release ([Image tags](#image-tags)). Knobs:
+`REHEARSAL_HTTPS_PORT` (9443), `REHEARSAL_SKIP_BUILD=1`, `REHEARSAL_KEEP=1`
+(see the script header).
 
 ## Development: `task dev:tls`
 

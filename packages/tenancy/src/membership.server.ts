@@ -1,16 +1,16 @@
 /**
- * Membership lookups + the role middleware (U4, PHY-54). The access DECISION
+ * Membership lookups + the role middleware. The access DECISION
  * is pure (decideWorkspaceAccess in roles.ts); this module is the thin
  * session/db adapter that loaders and actions call.
  */
-import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { data } from 'react-router';
 import {
   isSuperAdmin,
   requireSessionUser,
   type SessionUser,
 } from '@drobek/auth';
-import { apps, getDb, memberships, users, workspaces } from '@drobek/db';
+import { getDb, memberships, users, workspaces } from '@drobek/db';
 import {
   decideWorkspaceAccess,
   type WorkspaceRole,
@@ -138,7 +138,7 @@ export interface PrincipalWorkspaceAccess {
 
 /**
  * Session-free twin of requireWorkspaceRole for token principals (MCP OAuth
- * tokens and API keys are bound to a USER, not a workspace — M0-04): resolve
+ * tokens and API keys are bound to a USER, not a workspace): resolve
  * `workspaceSlug` and the user's membership in it on every call. Returns null
  * for an unknown workspace AND for a non-member alike, so callers answer both
  * with the same `not_found` (anti-enumeration). The global super-admin reaches
@@ -167,6 +167,7 @@ export async function resolveWorkspaceAccess(input: {
 }
 
 export interface WorkspaceMember {
+  userId: string;
   email: string;
   role: WorkspaceRole;
 }
@@ -175,11 +176,21 @@ export async function listWorkspaceMembers(
   workspaceId: string
 ): Promise<WorkspaceMember[]> {
   return getDb()
-    .select({ email: users.email, role: memberships.role })
+    .select({ userId: users.id, email: users.email, role: memberships.role })
     .from(memberships)
     .innerJoin(users, eq(users.id, memberships.userId))
     .where(eq(memberships.workspaceId, workspaceId))
     .orderBy(memberships.createdAt);
+}
+
+/** The e-mail address of each of these users, keyed by user id (unknown ids are absent). */
+export async function userEmails(userIds: readonly string[]): Promise<Map<string, string>> {
+  if (userIds.length === 0) return new Map();
+  const rows = await getDb()
+    .select({ id: users.id, email: users.email })
+    .from(users)
+    .where(inArray(users.id, [...new Set(userIds)]));
+  return new Map(rows.map((r) => [r.id, r.email]));
 }
 
 export interface UserWorkspace extends WorkspaceSummary {
@@ -220,29 +231,6 @@ export async function personalWorkspaceOwners(workspaceIds?: readonly string[]):
     .innerJoin(users, eq(users.id, memberships.userId))
     .where(and(...conditions));
   return new Map(rows.map((r) => [r.workspaceId, r.email]));
-}
-
-export interface WorkspaceAppCount {
-  apps: number;
-  published: number;
-}
-
-/**
- * Apps per workspace (deleted ones left out) and how many of them have a
- * published version, keyed by workspace id, in one grouped query. A
- * workspace without apps is absent from the map.
- */
-export async function workspaceAppCounts(): Promise<Map<string, WorkspaceAppCount>> {
-  const rows = await getDb()
-    .select({
-      workspaceId: apps.workspaceId,
-      apps: sql<number>`count(*)::int`,
-      published: sql<number>`(count(*) filter (where ${apps.publishedVersionId} is not null))::int`,
-    })
-    .from(apps)
-    .where(isNull(apps.deletedAt))
-    .groupBy(apps.workspaceId);
-  return new Map(rows.map((r) => [r.workspaceId, { apps: r.apps, published: r.published }]));
 }
 
 export async function listAllWorkspaces(): Promise<WorkspaceSummary[]> {

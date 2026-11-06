@@ -1,12 +1,12 @@
 /**
- * node:http / Express adapter for the app hosts (M0-06). `createAppsHostMiddleware`
+ * node:http / Express adapter for the app hosts. `createAppsHostMiddleware`
  * is mounted FIRST in the server: it classifies the Host header and
  *   - dashboard host → `next()` (React Router, /mcp, … — the dashboard side);
  *   - apps host     → answers here and never calls `next()`, so an app request
  *                     can never reach the dashboard, the MCP resource or any
  *                     session code;
  *   - invalid Host  → 400;
- *   - custom-domain candidate (M3-01) → looked up in the domains table
+ *   - custom-domain candidate → looked up in the domains table
  *     (ServeStore, cached 60 s): a verified domain is served as the app's
  *     production host, a registered-but-unverified one is an apps-side 404,
  *     an unknown name goes to `next()` like before. A failed lookup is a 503 —
@@ -14,7 +14,7 @@
  * Typed on node:http only (Express req/res extend them), so any host app can
  * mount it without this package depending on Express.
  *
- * UNREAD BODIES (NSO-325): a response sent before the request body fully
+ * UNREAD BODIES: a response sent before the request body fully
  * arrived — a 413 in the middle of an upload, a 401 before a route read
  * anything, an oversized beacon — goes out with `Connection: close`; once it
  * is flushed the socket is half-closed and destroyed CLOSE_LINGER_MS (2 s)
@@ -23,6 +23,9 @@
  * request (module routes, the beacon) must deliver its whole body within
  * APPS_MODULE_BODY_TIMEOUT_MS (2 min): past it, 408 (or, when an answer is
  * already on its way, the connection is closed).
+ *
+ * A request that fails unexpectedly answers a plain 500; one whose database
+ * query was cut off (statement or lock timeout) a plain 503 with Retry-After.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Readable, pipeline } from 'node:stream';
@@ -34,6 +37,7 @@ import {
   findServedAsset,
   galleryEnabled,
   hostConfig,
+  imageLimits,
   splitHost,
   type AppHostTarget,
   type HostConfig,
@@ -47,8 +51,8 @@ import {
   requestBodyStream,
   type Logger,
 } from '@drobek/core';
-import { handleBeacon, incrementServingSignal } from '@drobek/insights';
-import { dbErrorForLog } from '@drobek/db';
+import { analyticsEnabled, handleBeacon, incrementServingSignal, recordPageView, type PageViewInput } from '@drobek/insights';
+import { dbErrorForLog, isQueryTimeout } from '@drobek/db';
 import {
   PLATFORM_PREFIX,
   UNLOCK_APP_ATTEMPTS,
@@ -61,6 +65,10 @@ import {
 } from './handler.js';
 import type { AssetSource } from './assets.js';
 import { appSecurityHeaders, frameSrcFromEnv, galleryFrameAncestorsFromEnv } from './csp.js';
+import { feedbackWidget } from './feedback-widget.js';
+import { browserErrorStore, takeBrowserErrorBeacon } from './browser-errors.server.js';
+import { previewEventsHub, previewEventsResponse } from './preview-events.server.js';
+import { previewScript } from './preview-script.js';
 import { appAccessSecret, appCookiesSecure } from './password.js';
 import { ServeStore } from './store.server.js';
 import { UnknownHostLimiter, unknownHostLimitsFromEnv } from './unknown-host.js';
@@ -71,7 +79,7 @@ const MAX_FORM_BYTES = 4096;
 /** Platform (module) request bodies are capped by the route; this is the hard ceiling. */
 const MAX_PLATFORM_BODY_BYTES = 1024 * 1024;
 
-/** Re-exported for the tests and callers of this module (the helper lives in @drobek/core since NSO-358). */
+/** Re-exported for the tests and callers of this module (the helper lives in @drobek/core). */
 export { CLOSE_LINGER_MS };
 
 /** Default APPS_MODULE_BODY_TIMEOUT_MS: how long a `/__drobek/*` request may take to deliver its body. */
@@ -162,7 +170,7 @@ type RateCounter = (bucket: string, key: string, limit: number, windowMs: number
  * first, so one client cannot spend the app's budget, then per app over all
  * clients (UNLOCK_APP_ATTEMPTS). Without a resolved client IP there is no
  * per-IP bucket — never a shared `unknown` one — and only the per-app cap
- * applies (NSO-328).
+ * applies.
  */
 export async function unlockAttemptAllowed(
   appId: string,
@@ -176,22 +184,31 @@ export async function unlockAttemptAllowed(
 
 /**
  * The production handler deps: HKDF'd access key, Redis limiters (unlock
- * attempts; NSO-315 unknown hosts per IP, APPS_UNKNOWN_HOST_LIMIT /
- * APPS_UNKNOWN_HOST_WINDOW_MS), insights counters + beacon, the dashboard
- * origin every app host lets frame it (NSO-342, the app-list thumbnail), the
+ * attempts; unknown hosts per IP, APPS_UNKNOWN_HOST_LIMIT /
+ * APPS_UNKNOWN_HOST_WINDOW_MS), insights counters + beacon, the page-view
+ * counter of app traffic analytics (unless ANALYTICS_ENABLED=0), the dashboard
+ * origin every app host lets frame it (the app-list thumbnail), the
  * operator's gallery origins (GALLERY_FRAME_ANCESTORS, only while
- * GALLERY_ENABLED), the frame-src list (APP_FRAME_SRC_EXTRA) and the app
- * assets on ASSETS_DIR (NSO-358).
+ * GALLERY_ENABLED), the frame-src list (APP_FRAME_SRC_EXTRA), the app
+ * assets on ASSETS_DIR, the preview's feedback widget (opening the
+ * dashboard's /feedback/new) and the preview script with its event stream
+ * (PREVIEW_EVENTS_*) and error beacon (BROWSER_ERRORS_*, Redis).
  */
 export function defaultHandlerDeps(store: ServeStore, log?: Logger): HandlerDeps {
+  const browserErrors = browserErrorStore();
   return {
     store,
     accessSecret: appAccessSecret(),
     secureCookies: appCookiesSecure(),
     allowUnlockAttempt: (appId, ip) => unlockAttemptAllowed(appId, ip),
     signal: (appId, kind, path) => void incrementServingSignal(appId, kind, path),
-    beacon: (req, app) => handleBeacon(req, app.id),
+    ...(analyticsEnabled() ? { pageView: (appId: string, view: PageViewInput) => void recordPageView(appId, view) } : {}),
+    beacon: (req, app, version) => handleBeacon(req, app.id, { servedVersion: version?.number ?? null }),
     dashboardOrigin: dashboardOrigin(),
+    feedback: feedbackWidget(dashboardOrigin()),
+    preview: previewScript({ dashboardOrigin: dashboardOrigin(), screenshotMaxBytes: imageLimits().screenshotMaxBytes }),
+    previewEvents: (req, app, version) => previewEventsResponse(previewEventsHub(), req, app, version),
+    browserErrors: (req, app, version) => takeBrowserErrorBeacon(req, app, version, { store: browserErrors }),
     galleryFrameAncestors: galleryEnabled() ? galleryFrameAncestorsFromEnv() : [],
     frameSrc: frameSrcFromEnv(),
     assets: defaultAssetSource(),
@@ -203,7 +220,7 @@ export function defaultHandlerDeps(store: ServeStore, log?: Logger): HandlerDeps
   };
 }
 
-/** The draft / frozen asset rows + the files under ASSETS_DIR (NSO-358, NSO-362). */
+/** The draft / frozen asset rows + the files under ASSETS_DIR. */
 function defaultAssetSource(): AssetSource {
   const disk = assetDisk();
   return {
@@ -342,14 +359,16 @@ export function createAppsHostMiddleware(opts: AppsHostOptions = {}): NodeMiddle
         res.destroy();
         return;
       }
+      const timedOut = isQueryTimeout(err);
       answer({
-        status: 500,
+        status: timedOut ? 503 : 500,
         headers: {
           ...appSecurityHeaders({ noindex: true }),
           'Content-Type': 'text/plain; charset=utf-8',
           'Cache-Control': 'no-store',
+          ...(timedOut ? { 'Retry-After': '5' } : {}),
         },
-        body: 'Internal Server Error',
+        body: timedOut ? 'Service Unavailable' : 'Internal Server Error',
       });
     });
   }

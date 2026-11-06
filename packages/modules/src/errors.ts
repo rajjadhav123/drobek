@@ -1,5 +1,5 @@
 /**
- * The ONE error shape every module route answers with (§3.5):
+ * The ONE error shape every module route answers with:
  *   `{ error, message, details?, hint }` + an HTTP status.
  * `hint` links the agent to the documentation — by default the module's own
  * skill, `skill_info('<module>')`. Handlers throw ModuleError; anything else
@@ -68,11 +68,15 @@ export const CORE_ERROR_CODES: readonly string[] = [
   'compile_error',
   'not_published',
   'user_confirmation_required',
+  // delete_versions: the confirmed plan is no longer what would go
+  'plan_changed',
   'gallery_hidden',
   'gallery_disabled',
   'not_duplicable',
   'publish_not_approved',
   'publish_blocked',
+  // set_visibility without a password set in the dashboard
+  'password_not_set',
   // app assets (MCP asset tools, the upload URL)
   'asset_too_large',
   'asset_type_not_allowed',
@@ -90,19 +94,24 @@ export const CORE_ERROR_CODES: readonly string[] = [
   'dns_unavailable',
   // proxy upstreams (MCP upstream tools)
   'upstream_already_registered',
+  // workspace members (MCP member tools)
+  'personal_workspace',
+  'last_workspace_admin',
+  // the workspace Modules switch (dashboard)
+  'module_requires_not_enabled',
   // compile.errors[]
   'build_error',
   'unresolved_import',
   'invalid_config',
   'timeout',
-  // compile.warnings[] (reserved core diagnostic codes)
-  'html_missing_lang',
-  'html_missing_viewport',
-  'html_missing_title',
-  'missing_favicon',
-  'a11y_img_alt',
-  'a11y_name',
-  'a11y_label',
+  // compile.warnings[]
+  'missing_reference',
+  'blocked_by_csp',
+  // readiness.warnings[]
+  'missing_title', 'missing_description', 'missing_favicon', 'og_image_not_absolute',
+  'data_public_write_no_schema', 'data_public_write_unbounded', 'data_public_read_personal', 'rule_needs_auth_module', 'proxy_public_upstream', 'module_change_pending',
+  'xss_html_sink', 'xss_eval', 'xss_url_sink',
+  'type_error',
   // OAuth
   'invalid_grant',
   'invalid_client',
@@ -168,7 +177,7 @@ export function isModuleError(err: unknown): err is ModuleError {
 }
 
 /**
- * NSO-346: an opt-in module (`availability: 'opt-in'`) that is not enabled
+ * An opt-in module (`availability: 'opt-in'`) that is not enabled
  * for the app's workspace — the module route (404), configure_module and the
  * owner's confirm answer this.
  */
@@ -177,6 +186,35 @@ export function moduleNotEnabled(name: string): ModuleError {
     'module_not_enabled',
     `The platform module "${name}" is not enabled for this app's workspace. Only the server operator can enable it.`,
     { details: { module: name }, hint: skillHint(name) }
+  );
+}
+
+/** Seconds a caller should wait after a database timeout before it retries. */
+const DATABASE_TIMEOUT_RETRY_AFTER_S = 5;
+
+/**
+ * A query the database cut off (DB_STATEMENT_TIMEOUT_MS / DB_LOCK_TIMEOUT_MS)
+ * while a module route ran: `503 unavailable`, `details.reason:
+ * database_timeout`, Retry-After.
+ */
+export function databaseTimeout(): ModuleError {
+  return new ModuleError('unavailable', 'The database did not answer in time (the server is under load). Try again in a moment.', {
+    details: { reason: 'database_timeout' },
+    headers: { 'Retry-After': String(DATABASE_TIMEOUT_RETRY_AFTER_S) },
+  });
+}
+
+/**
+ * A super-admin tried to enable an opt-in module for a workspace while a
+ * module it requires (directly or through another one) is off there.
+ * `missing` lists those modules in the order to enable them.
+ */
+export function moduleRequiresNotEnabled(name: string, missing: string[]): ModuleError {
+  const list = missing.map((x) => `"${x}"`);
+  return new ModuleError(
+    'module_requires_not_enabled',
+    `The module "${name}" depends on ${list.join(', ')}, which ${missing.length > 1 ? 'are' : 'is'} not enabled for this workspace.`,
+    { status: 409, details: { module: name, missing }, hint: `Enable ${list.join(', then ')} for this workspace first, then enable "${name}".` }
   );
 }
 
@@ -197,4 +235,12 @@ function formatPath(path: ReadonlyArray<PropertyKey>): string {
     else out += out === '' ? String(seg) : `.${String(seg)}`;
   }
   return out || '(root)';
+}
+
+/** A module set the server refuses to start with (the message names the reason and the fix). */
+export class ModuleLoadError extends Error {
+  constructor(message: string) {
+    super(`drobek refuses to start: ${message}`);
+    this.name = 'ModuleLoadError';
+  }
 }

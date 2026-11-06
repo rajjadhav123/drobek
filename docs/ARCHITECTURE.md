@@ -36,25 +36,43 @@ This document is the map of how that works. The neighbours:
  │   3. /health, /version, /api/internal/tls/ask (internal address only)                                        │
  │   4. /mcp: @drobek/oauth resource server (Bearer → user, scopes, audience) + @drobek/mcp tool bodies          │
  │   5. everything else: React Router (@drobek/dashboard routes, OAuth AS routes, /llms.txt, /report …)         │
+ │      behind the body cap: DASHBOARD_MAX_BODY_BYTES → 413 (the CSV import keeps its own limit)                │
  │   in-process jobs (apps/server/server/jobs.ts): blob GC, slug release, domain re-check, audit, files sweep   │
  └──────────────┬───────────────────────────────────────────┬────────────────────────────────┬──────────────────┘
                 │ postgres-js + drizzle                     │ ioredis                        │ SMTP (nodemailer) or Resend
           Postgres 17: users, workspaces, apps,       Redis 7: sessions, rate limits,     any SMTP server
           versions + blobs, module data, OAuth,       OTP counters, leases, caches,       (EMAIL_TRANSPORT; Mailpit in dev)
-          API keys, domains, abuse, audit             serve-cache bust pub/sub
+          API keys, domains, abuse, audit             serve-cache + live data pub/sub
 ```
 
 - **`apps/server`** is the only process: Express with
   `@react-router/express` for the dashboard, `mountMcpResource` for `/mcp` and
   the apps-host middleware in front of everything. There is no worker
   container and no job queue; background work runs on timers inside the
-  process, each under a Redis lease so only one replica does it.
+  process, each under a Redis lease so only one replica does it. An error
+  nothing caught (`uncaughtException`, `unhandledRejection`) is logged,
+  reported and stops the process like `SIGTERM` (requests drain), exit
+  code 1 (`installFatalErrorHandlers` in `@drobek/core`).
+- **Postgres connections**: two pools per process (`@drobek/db`, shared by
+  the dashboard build's bundled copy), `DB_POOL_MAX` each — requests with
+  `statement_timeout` (`DB_STATEMENT_TIMEOUT_MS`) and `lock_timeout`
+  (`DB_LOCK_TIMEOUT_MS`), background jobs with the lock timeout only;
+  migrations use one connection of their own without either. A query cut
+  off by a timeout answers `busy` (`reason: "database_timeout"`) over MCP
+  and `503 unavailable` on module routes, never the driver's message.
 - **One image**, `ghcr.io/freema/drobek` (root `Dockerfile`, targets `dev` and
   `runner`; linux/amd64 releases). The image applies every pending migration
   on start (core journal `__drizzle_migrations_core`, one
-  `__drizzle_migrations_mod_<name>` per module) and **refuses to start** on a
+  `__drizzle_migrations_mod_<name>` per module) under one Postgres advisory
+  lock, so replicas migrate one after the other, and **refuses to start** on a
+  database whose journal holds migrations it does not know (a newer release
+  migrated it — the message names that release), stored secrets that
+  neither `DROBEK_MASTER_KEY` nor `DROBEK_MASTER_KEY_PREVIOUS` opens (a key
+  rotation is `task selfhost:rekey`), a
   placeholder secret, a weak `TLS_ASK_TOKEN`, a missing `APPS_DOMAIN` in
-  production or a module it cannot load.
+  production or a module it cannot load (one from `DROBEK_MODULES_DIR`, the
+  `modules_data` volume, whose files no longer match `modules.lock.json`
+  included).
 - **Feature logic lives in packages**, not in `apps/server`: the server wires
   them together. The main ones:
 
@@ -68,9 +86,9 @@ This document is the map of how that works. The neighbours:
   | `@drobek/agent-dx` | the briefing, the tool manifest, limits, error catalogue, `/llms.txt` renderers |
   | `@drobek/dashboard` | the dashboard routes and their server halves |
   | `@drobek/auth`, `@drobek/tenancy`, `@drobek/audit` | dashboard sign-in (e-mail code, Google), sessions, rate limits, origin check; workspaces and roles; the audit log |
-  | `@drobek/domains`, `@drobek/email`, `@drobek/insights`, `@drobek/proxy` | custom domains; the one mail transport of the dashboard and the modules (`EMAIL_TRANSPORT=smtp` via nodemailer, or `resend` via the Resend HTTP API over `fetch`); the error beacon and request stats; upstream registry, envelope crypto, SSRF guard |
-  | `@drobek/core`, `@drobek/db`, `@drobek/sdk` | env/config, health, logger, Caddyfile generator; drizzle schema + migrations; the browser SDK core |
-  | `modules/{auth,email,forms,data,proxy,files}` | the built-in platform modules (`drobek-module-<name>`) |
+  | `@drobek/domains`, `@drobek/email`, `@drobek/insights`, `@drobek/proxy` | custom domains; the one mail transport of the dashboard and the modules (`EMAIL_TRANSPORT=smtp` via nodemailer, `resend` via the Resend HTTP API over `fetch`, or the id of a module's `email.transport` contribution, installed at start); the error beacon and request stats; upstream registry, envelope crypto, SSRF guard |
+  | `@drobek/core`, `@drobek/db`, `@drobek/sdk` | env/config, health, logger, the installed error reporter (`reportError`), Caddyfile generator, the platform theme (`@drobek/core/platform-theme`: the light/dark colours, font, radii and page CSS of every page drobek draws for people outside the dashboard — the app-host pages, the public dashboard pages, the e-mails and the preview widget); drizzle schema + migrations; the browser SDK core |
+  | `modules/{auth,email,forms,data,proxy,files,sync,oidc,webhooks}` | the built-in platform modules (`drobek-module-<name>`) |
   | `create-drobek-module` | the scaffold for external modules; with `@drobek/modules` + `@drobek/sdk` published to npm as `@freema/drobek-modules` + `@freema/drobek-sdk` from each release tag (`scripts/npm-packages.mjs` bundles the private packages in; modules install them under the `@drobek/*` names via npm aliases) |
 
 ## 2. Workspaces, apps and versions
@@ -80,6 +98,60 @@ This document is the map of how that works. The neighbours:
   names the operator's super-admins; super-admin is an env flag, not a role
   row. Sign-up is open: anyone can create workspaces and build and preview
   apps.
+- **Members** of a team workspace join through single-use invites (Redis,
+  7 days, indexed per workspace in `drobek:invites:<workspace_id>` so its
+  admins list and revoke the pending ones on the Members tab). Workspace
+  admins change roles and remove members, any member leaves — on the Members
+  tab or over MCP (`list_members`, `set_member_role`, `remove_member`), both
+  through `@drobek/tenancy` `members.server.ts`: a workspace always keeps a
+  workspace-admin (the change locks the workspace row) and a personal
+  workspace's one member never changes. Access is resolved on every request,
+  so a removed member is out at once; the leases they held on the
+  workspace's apps are released too (also when a member becomes a viewer).
+  Every change is audited (`member.role_change`, `member.remove`,
+  `member.leave`, `member.invite_revoke`).
+- **Deleting a workspace or an account** goes through `@drobek/tenancy`
+  `deletion.server.ts`. A workspace admin deletes a team workspace after
+  typing its slug (`/workspaces/<slug>/delete`) or over MCP
+  (`delete_workspace` with `user_confirmed`): every app is soft-deleted (the
+  modules' `onAppDelete` runs, the app hosts drop it) and then purged at once
+  like the app purge job does, then the workspace row goes, and its
+  memberships, upstreams and module opt-ins go with it through `ON DELETE
+  CASCADE`. The row is locked first, and an app created meanwhile restarts the
+  pass; the pending invites are dropped from Redis. A user deletes their
+  account at `/me/delete` after a fresh e-mailed code (its own OTP scope),
+  only there: it deletes the personal workspace and every team workspace they
+  are the last member of the same way, leaves the others (releasing their
+  edit locks), deletes the `users` row (its API keys and OAuth codes and tokens
+  cascade) and every dashboard session (a SCAN over
+  `drobek:session:*`). It is refused while the user is the only
+  workspace-admin of a team workspace other members use. A member who joins
+  one of the team workspaces it deletes meanwhile stops it
+  (`workspaces_changed`): the members are counted again before each app is
+  deleted or purged and under the row lock before the row goes, so the team
+  and its new member stay. Authors stay
+  without a name: `app_versions.created_by_user_id`, `audit_log.actor_user_id`
+  and `upstreams.created_by` are set null. `audit_log.workspace_id` has no
+  foreign key, so a deleted workspace's audit rows stay until the audit
+  retention removes them; audited `workspace.delete`, `account.delete` and,
+  in each workspace left, `member.leave` with `reason: account_deleted`.
+- **Changing the sign-in e-mail** goes through `@drobek/tenancy`
+  `email-change.server.ts`, on `/me` only (no MCP tool). The user enters the
+  new address and a code goes to it: the sign-in code's guard with the same
+  `OTP_*` limits, counted under the scope `email-change`; the code lives
+  under `email-change:<user_id>`, so it changes only that account and only to
+  that address. An address another account signs in with gets an "already
+  has an account" e-mail instead of a code, and the page answers the same, so
+  it never tells whether an address has an account. The code changes
+  `users.email` under the row lock with `account.email_change` audited in the
+  personal workspace in the same transaction, ends every dashboard session
+  (the same SCAN) and signs the browser in again, and e-mails a notice to the
+  previous address. API keys, OAuth connections, memberships, the personal
+  workspace's slug and a linked Google sign-in hang on the user id and stay;
+  the previous address now signs in to a new, empty account. What is bound to
+  the address follows the new one at once: `SUPERADMIN_EMAIL`
+  (`meta.super_admin` records `gained` / `lost`) and a workspace editor's
+  admin role in its apps' sign-in (platform module `auth`).
 - **Who may publish** (`PUBLISH_APPROVAL`, `open` by default, plus a
   super-admin's per-workspace state `default` / `allowed` / `blocked`,
   `workspaces.publish_approved_at` / `publish_blocked_at`): a super-admin
@@ -99,18 +171,68 @@ This document is the map of how that works. The neighbours:
   (a host label; `--` is not allowed in a slug, so the preview and version
   host names never collide with another app). `create_app` picks a free slug
   and falls back to `<name>-<4 hex>`. A deleted app keeps its slug for 30
-  days, then the slug is released.
+  days, then the slug is released. `APP_PURGE_AFTER_DAYS` (30) after the
+  delete the app is deleted for good: its row and every row that references
+  it (versions, module data, end users, uploads, domains, assets, logs,
+  statistics) go; audit rows stay until their own retention.
 - A **version** is an immutable, numbered snapshot of the app's files
   (`app_versions` + `version_files`): the sources the agent wrote AND the
   compiled output, plus who made it, the agent's one-line `reasoning` and the
   compile status. File bytes are content-addressed blobs in Postgres
   (`blobs`, sha256, deduplicated across versions and apps); unreferenced blobs
-  are garbage-collected hourly after a 7-day grace period.
+  are garbage-collected hourly after a 7-day grace period (a blob a feedback
+  note's screenshot references is kept like one a version references).
 - **Publishing** moves one pointer, `apps.published_version_id`, to a version
   that compiled. Rolling production back is publishing an older version.
   `restore_version` rolls the working copy back by writing a NEW version with
-  the old files — history is never rewritten. There is no git and there are
+  the old files — a version is never changed. There is no git and there are
   no branches.
+- **History retention**: an app keeps its newest `APP_VERSIONS_KEEP` versions
+  (default 200; a limits provider may set it per workspace). The hourly
+  retention job deletes older ones, except the published version, the newest
+  version that compiled (the one the preview serves), a version a member
+  keeps (`kept_at`, at most `APP_VERSIONS_KEPT_MAX` per app), a version whose
+  asset set is kept for a rollback (`assets_frozen_at`), the newest version
+  and versions from the last hour (they still count against the version
+  rate). A member's clean-up (`deleteVersions`, over MCP `delete_versions`
+  after the user's yes: every version up to a number, or only the failed
+  builds) leaves the same versions alone — one SQL rule
+  serves both. The clean-up deletes only the set it worked out under the
+  row lock of its first batch, and refuses (`plan_changed`) when that set's
+  fingerprint is not the `plan_id` the user confirmed. Both work app by app under the app's row lock, in batches,
+  audit each batch (`app.versions.prune`, a system action; `app.versions.delete`,
+  the member — shown in Activity) and bust the serve cache; `version_files`
+  go with their version and the blob GC frees the bytes. Version numbers are
+  never reused, so a missing number below the
+  newest one was deleted: `read_file`, `restore_version` and `publish` answer
+  `not_found` with "is no longer stored" and the oldest version still stored.
+  `get_app` (`version_retention`) and the dashboard's version history state
+  how many versions the app keeps and has; `list_versions` pages the history
+  by number (`APP_VERSIONS_PAGE` per page) with the published, preview and
+  kept versions pinned, and `keep_version` keeps one. While a configured limits
+  provider does not answer for a workspace (`LimitsProvider.settled` → null),
+  the job leaves it alone, so the env fallback never deletes history a plan
+  keeps.
+- **Source quota**: the unique bytes (`version_files` by sha256, sources and
+  build output) the versions of a workspace's live apps store may not pass
+  `WORKSPACE_SOURCE_QUOTA` (default 1 GiB; per workspace through a limits
+  provider; deleted apps do not count, so deleting an app frees its bytes at
+  once). `createVersion` checks it after the rate, under the app's row lock and
+  a per-workspace advisory lock, before any blob is stored: a version whose
+  NEW bytes do not fit answers `limit_exceeded` (`limit`, `value`,
+  `used_bytes`). A version that adds no bytes — a restore, a revert — always
+  fits. `create_app` and gallery copies check the files ahead of creating the
+  app, so a refusal leaves no empty app behind.
+- **New versions are rate-limited** (`VERSIONS_PER_APP_HOUR`, default 600 per
+  app, and `VERSIONS_PER_USER_HOUR`, 1200 per person across all apps, within
+  the last hour; a limits provider may set both per workspace), so a loop of
+  writes cannot fill the database. Every way to a version counts — writes,
+  `create_app`'s version 1, restores, gallery copies. `createVersion` /
+  `restore` count `app_versions` rows inside their transaction under the
+  app's row lock and a per-person advisory lock, before any blob is stored;
+  the MCP tools repeat the check before the compile and the lease. A refusal
+  is `rate_limited` with `retry_after_seconds` (when the oldest version of the
+  full window leaves it).
 - **The public gallery** (`GALLERY_ENABLED`, off by default): an editor+
   lists a PUBLISHED app with a ≤ 160-character public description
   (`apps.gallery_listed` / `gallery_description`) in the dashboard, or an
@@ -159,6 +281,8 @@ This document is the map of how that works. The neighbours:
 - **One writer at a time**: a write takes the app's Redis lease
   (`drobek:applock:<app_id>`, 3 minutes, renewed per write). Another user's
   agent gets `app_locked`; the same user's other sessions take the lease over.
+  `release_lease` frees the caller's own lease early; the dashboard's unlock
+  frees anyone's (both audited `app.lock.release`).
 
 ## 3. The compile step
 
@@ -175,13 +299,105 @@ cache. The compile result is part of the tool response.
   imports only inside that map — **never the disk**. Bare imports resolve
   only through the app's `drobek.json` import map to pinned `https://` URLs
   (esm.sh), marked external: the browser loads them, the server never fetches
-  them. `drobek` maps to the platform SDK (`/__drobek/sdk.js`);
+  them. `drobek.json` `paths` aliases (`"@/*": ["src/*"]`) resolve to app
+  files of the same map. `drobek` maps to the platform SDK (`/__drobek/sdk.js`);
   `drobek/<module>` imports inline module components (compiled with the
   app's own React).
 - `src/main.{tsx,ts,jsx,js}` → `/main.js`, the CSS it imports → `/main.css`,
   `drobek.json` `entries` → more bundles. An app without `src/main.*` is plain
-  HTML served as written. The compiler prepends the error-beacon import to
-  every JS entry (`"beacon": false` opts out).
+  HTML served as written. The compiler prepends the beacon import to every
+  JS entry (`"beacon": false` opts out): each page reports its load and its
+  browser errors, failed resource loads and CSP blocks with the version it
+  was served from (`get_app` `render`, `get_logs` runtime).
+- Preview feedback: the preview and `--v<N>` hosts (never the production
+  host or a custom domain) add `<script src="/__drobek/feedback.js">` before
+  `</body>` of every HTML response, unless drobek.json says
+  `"feedback": false` (read from the version's sources, cached per version);
+  the ETag carries the widget's hash. The script (served by the app host,
+  `no-cache`, built at start around `PUBLIC_APP_URL`) draws a Feedback button
+  in a closed shadow root, in the platform theme's light or dark colours
+  (copied into the script). While picking, an outline with a short label of
+  the element (`button "Send"`) follows the pointer, or the focus (Tab moves,
+  Enter picks; on touch a second tap picks); picking opens the dashboard's
+  `/feedback/new` in a `noopener` window with the version, path, spot, a
+  CSS selector and that label in the query — never a note's text, never a
+  credential. The label is cleaned and kept in the note's `anchor` (at most
+  80 characters). That
+  page (signed-in members of the app's workspace, any role; `frame-ancestors
+  'none'`) stores the note in `app_feedback` (`@drobek/apps`, per-member
+  hourly and per-app open limits `FEEDBACK_PER_USER_HOUR` /
+  `FEEDBACK_MAX_OPEN_PER_APP`, audited `app.feedback.*`). The app's Feedback
+  tab and `list_feedback` / `resolve_feedback` / `delete_feedback` read and
+  change them with the same functions. A note may carry a screenshot (the
+  page's Capture a tab via `getDisplayMedia`, a chosen file or a pasted
+  image, shrunk in the browser; without JavaScript the file input alone):
+  the upload is sniffed (PNG / JPEG / WebP only), decoded in-process by sharp
+  with every other libvips loader blocked and re-encoded to a WebP (longer
+  side 1600 px, metadata dropped, ≤ `SCREENSHOT_MAX_BYTES`) stored in `blobs`
+  by sha256 (`app_feedback.screenshot_*`, `FEEDBACK_SCREENSHOTS_MAX_PER_APP`);
+  the upload is never stored. The tab shows a thumbnail and a members-only
+  route the full image; `get_feedback_screenshot` returns a JPEG re-encoding
+  (≤ `MCP_IMAGE_MAX_BYTES`, 1280 px) as an MCP image content block inside an
+  untrusted envelope. Deleting the note releases the screenshot, and the
+  hourly blob job drops the screenshots of notes resolved
+  `FEEDBACK_SCREENSHOT_RETENTION_DAYS` ago before it sweeps.
+- Live preview: an HTML page of the preview host (only `<slug>--preview`)
+  also carries `<script src="/__drobek/preview.js" data-reload data-errors>`
+  before the feedback tag, unless drobek.json says `"reload": false` (the
+  ETag carries the script's hash); a `--v<N>` host carries it with
+  `data-errors` only. The script opens `GET /__drobek/preview/events` on its
+  own origin — a `text/event-stream` behind the same password gate as the
+  pages, fed by the `drobek:app-changed` events (in-process, and every other
+  process's through the serve-cache subscriber's Redis relay). Each message
+  is one JSON object typed by `type`: `ready` (the newest compiled version
+  when the stream opened) and `version` (`{ version, compiled, errors }` of a
+  version just stored). A newer compiled version reloads the page (the scroll
+  position kept in sessionStorage); one that did not compile shows a notice
+  and the page stays. Streams per app and per client IP and their lifetime
+  are capped (`PREVIEW_EVENTS_*`, 429 past a cap); the graceful stop ends
+  them. The script does nothing in a frame and reads no cookie. Its notice
+  and bar live in a shadow root styled with the platform theme (light and
+  dark), like the feedback widget.
+- Screenshots for the agent: on the preview host the tag also carries
+  `data-screenshots` (drobek.json `"screenshots": false` drops it) and the
+  dashboard origin to answer to; the app CSP's `connect-src` names that
+  origin's `/api/screenshots/` path on the preview host only. `request_screenshot` stores a request in
+  Redis (`drobek:screenshot:<id>`, the note, the version, a one-time 32-byte
+  token, `SCREENSHOT_REQUEST_TTL_SEC`), counts it against
+  `SCREENSHOT_REQUESTS_PER_APP_HOUR` and publishes a `screenshot` event on
+  `drobek:app-changed`; the serve cache ignores it and the preview event
+  streams pass it on as `screenshot_requested` (with the token), replaying
+  the newest pending request to a stream that opens later. The script shows
+  a bar with the note as text and Capture / Not now; Capture takes one frame
+  of the current tab with `getDisplayMedia`, encodes a WebP (JPEG where the
+  browser cannot) below `SCREENSHOT_MAX_BYTES` and posts it with the token,
+  without credentials, to `POST /api/screenshots/<request_id>` on the
+  dashboard origin — mounted before the Origin check like the asset upload
+  URLs, CORS only for the app's own hosts, its own body limit. The token is
+  checked in constant time and claimed once (Redis `DEL`); the image is
+  re-encoded like a feedback screenshot into `blobs` with an
+  `app_screenshots` row (core migration 0042), and `screenshot_done` closes
+  the bar in every other tab. Not now marks the request declined; no answer
+  leaves it to expire. `get_screenshot` reads the row or the Redis state and
+  returns the image as a JPEG within `MCP_IMAGE_MAX_BYTES` in an untrusted
+  envelope; the Feedback tab lists the newest under "Screenshots for the
+  agent". The hourly blob job deletes screenshots older than
+  `SCREENSHOTS_RETENTION_DAYS` before it sweeps.
+- Browser errors of the preview: with `data-errors` (drobek.json
+  `"browserErrors": false` drops it) the same script collects uncaught
+  errors, unhandled rejections and `console.error` calls with an `Error`,
+  deduplicates them in the page (one report per error per minute, with a
+  count) and beacons them to `POST /__drobek/preview/errors` on its own origin
+  (same-origin only, 16 KiB, per-IP limit `BROWSER_ERRORS_PER_IP_MINUTE`,
+  always 204). Each field is checked, capped and redacted; the page URL keeps
+  its path only and the visitor only a browser family. They are stored in
+  Redis, not Postgres: a hash per app version keyed by a hash of message and
+  stack (a repeat raises its count), at most `BROWSER_ERRORS_MAX_PER_VERSION`
+  per version, expiring `BROWSER_ERRORS_TTL_HOURS` after the last one. At read
+  time every frame of a built bundle is mapped through the version's inline
+  source map to the app's own `src/…:line:column`. `get_logs` kind `browser`,
+  `get_app` `preview_errors`, `write_files` `previous_version_browser_errors`
+  and the Logs tab read them (`@drobek/serving`).
 - Limits (`COMPILE_*`): 200 files, 512 KiB per file, 5 MiB per version, an
   import depth of 50, 10 s per build (cancelled with its own `ctx.cancel()`),
   4 builds at once and a FIFO queue whose wait answers `busy`.
@@ -223,9 +439,14 @@ before any byte of the app is touched:
 2. `/.well-known/drobek-report` → the report pointer (works for any host);
 3. the unknown-host limiter: a client IP past `APPS_UNKNOWN_HOST_LIMIT`
    "no app here" answers per window gets **429** (without a lookup for hosts
-   the cache does not know as live apps);
-4. the app lookup — a miss is a counted **404** page; misses are kept in a
-   separate negative cache for 30 s, hits in the positive cache for 60 s;
+   the cache does not know as live apps — for a version host, that very
+   version);
+4. the app lookup — a miss is a counted **404** page; a version host whose
+   version does not exist or did not compile counts against the same budget
+   (its 404 follows at step 10). Misses (unknown slugs and missing versions)
+   are kept in a separate negative cache for 30 s, hits in the positive cache
+   for 60 s; both are capped (LRU over every host of every app) and drop
+   expired entries, so no range of `--v<N>` numbers grows the process;
 5. `X-Drobek-App: <slug>` on every response from here on;
 6. a taken-down app: **451** on every host and path (JSON 451 on platform
    paths), before the redirect, the password gate and the modules;
@@ -234,11 +455,14 @@ before any byte of the app is touched:
    host-only `__Host-drobek_app_access` cookie (HMAC, key derived from
    `DROBEK_MASTER_KEY`) is set;
 9. `/__drobek/*`: the SDK, the module routes and the beacon — handed to the
-   module runtime, never to the app's files;
+   module runtime, never to the app's files; on the preview and version hosts
+   `/__drobek/feedback.js` is the feedback widget, served by the handler;
 10. the version the host serves (**404** "not published" / "nothing compiled"),
     then the file: built output wins over sources, `.ts/.tsx/.jsx` sources and
     `drobek.json` are never served, extension-less paths fall back to
-    `index.html`, `ETag` = sha256 → **304**. Every JS/CSS bundle is stored
+    `index.html`, `ETag` = sha256 → **304**; an HTML response names its
+    version in `Server-Timing: drobek-version;desc="<N>"` (the beacon reads
+    it). Every JS/CSS bundle is stored
     with an inline source map; the preview and version hosts serve it as
     stored, while the production host and custom domains serve the code
     without it (ending in `sourceMappingURL=<file>.map`) and answer
@@ -303,7 +527,7 @@ domains of an app the public gallery shows, never on preview or version
 hosts — the operator's `GALLERY_FRAME_ANCESTORS`; the dashboard frames an app
 solely for the app-list thumbnail, the gallery for its live preview, see
 [`SECURITY.md`](./SECURITY.md)),
-`nosniff` and `Referrer-Policy: no-referrer`; preview and version hosts add
+`nosniff` and `Referrer-Policy: strict-origin-when-cross-origin` (only the origin reaches a third party); preview and version hosts add
 `X-Robots-Tag: noindex`. Bytes come from a 256 MiB in-memory LRU; the host
 and manifest caches are busted through a local event emitter first and Redis
 pub/sub (`drobek:app-changed`) for other replicas, so a write is visible on
@@ -312,7 +536,7 @@ its preview host at once.
 ## 6. Platform modules
 
 A module is an npm package whose default export comes from `defineModule()`
-(`@drobek/modules`, contract `1.1.0`; a module states the versions it works
+(`@drobek/modules`, contract `1.3.0`; a module states the versions it works
 with in `contract`, e.g. `'^1.1'`, and one this server does not satisfy
 refuses the start). The operator enables modules with `DROBEK_MODULES`; a
 short name `x` loads `drobek-module-x` (which must export the module `x`), a
@@ -327,15 +551,30 @@ their source (`dir` | `builtin`). A module contributes routes under
 (`drobek.<name>`), a zod per-app config schema (its defaults overridable per
 server with `DROBEK_MODULE_<NAME>_DEFAULTS`), access rules, secrets (names
 only), env-named limits, its own error codes, its own tables and migrations,
-and a skill the agent reads with `skill_info`. Modules extend each other
-through typed **slots**: a host module declares one with a zod schema, other
-modules contribute values, checked at start and read with
-`contributions(slot)` (a host may `compose` its config schema, confirm
-rules and secrets from the contributions at start). Built in: `auth`
+and a skill the agent reads with `skill_info` — left out only by an
+operator-only module, of which nothing reaches apps (it contributes to
+`operatorOnly` slots such as `errors.reporter` and `email.transport`): agents
+and app owners never see it, `/api/version` marks it `operatorOnly`.
+Modules extend each other through typed **slots**: a host module declares
+one with a zod schema, other modules contribute values, checked at start and
+read with `contributions(slot)` (a host may `compose` its config schema,
+confirm rules and secrets from the contributions at start). Core itself hosts one
+slot, `errors.reporter`: where server errors go besides the log (an incident
+webhook, a log service, …), chosen with `ERROR_REPORTER=<id>` and fed by `reportError`
+(`@drobek/core`) from the central error points — a 5xx, a module route
+throw, a failed module job or e-mail send, a start-up failure, an error
+nothing caught. Built in: `auth`
 (end-user sign-in by e-mailed code, plus the sign-in providers other
-modules contribute to its `auth.provider` slot), `email` (notifications to the app's owners), `forms`, `data`
+modules contribute to its `auth.provider` slot, and the `auth.signedIn`
+observers told of every sign-in), `email` (notifications to the app's owners,
+and the `email.transport` slot for e-mail providers other modules contribute,
+chosen with `EMAIL_TRANSPORT=<id>`), `forms`, `data`
 (collections with per-operation rules), `proxy` (external APIs with the
-secret injected server-side) and `files` (end-user uploads). The contract is
+secret injected server-side), `files` (end-user uploads), `sync` (a data
+collection filled from an external API on a schedule) and `oidc` (company
+sign-in with any OpenID Connect provider, an `auth.provider`). The examples
+`hello` (a dependency of `apps/server`) and the opt-in `acmecrm` (installed
+into `DROBEK_MODULES_DIR`) are loaded exactly as third-party modules are. The contract is
 [`MODULES.md`](./MODULES.md).
 
 - **Core resolves the caller** before a module sees the request: the
@@ -368,11 +607,21 @@ secret injected server-side) and `files` (end-user uploads). The contract is
   (`GET /limits/<workspace_id>`, cached 60 s; an outage falls back to the env
   values). Module e-mail also passes the operator-wide mail guard (hourly
   budgets per class and per app, pause + ALERT line).
+- **Live data**: the data module's store publishes every committed record
+  write (whoever wrote it: the app, MCP, the dashboard, a sync import) to a
+  Redis pub/sub channel per app + collection and a short Redis stream (the
+  resume backlog); each process relays the channel to its open
+  `GET /__drobek/v1/data/<collection>/events` streams (`text/event-stream`,
+  `drobek.data.subscribe`), checking the collection's read rule and the
+  caller again for every event. The graceful stop ends these streams first
+  (`endModuleStreams`, next to the MCP listen streams), so the drain does
+  not wait on them ([`MODULES.md`](./MODULES.md#the-built-in-data-module)).
 - **Opt-in modules** (`availability: 'opt-in'`) are active only for the
   workspaces they are enabled for: by the limits provider's plan
   (`MODULE_ENABLED_<NAME>`: `1` on, `0` off — it wins), by the env value
   `MODULE_ENABLED_<NAME>=1` (every workspace), or by a super-admin's switch
-  on the dashboard's Workspace → Modules page (`workspace_modules`, audited).
+  on the dashboard's Workspace → Modules page or their agent's
+  `set_workspace_module` (`workspace_modules`, audited).
   Elsewhere their routes answer `404 module_not_enabled`, `configure_module`
   refuses, `get_app` shows `enabled: false` and the app's skills leave them
   out; the SDK stays one bundle per server.
@@ -392,53 +641,98 @@ normal ACME certificate; the app hosts use exactly one of three paths:
   optional `_acme-challenge` CNAME delegation;
 - **(c) on-demand**, one certificate per app host, always gated by drobek's
   `ask` endpoint (`/api/internal/tls/ask`, internal address + `TLS_ASK_TOKEN`
-  only): 200 for a host of a live app or a verified custom domain, 404 for
-  everything else.
+  only): 200 for the production or preview host of a live app, for a
+  version host whose version exists and compiled, and for a verified custom
+  domain; 404 for everything else, so no `--v<N>` number the app does not
+  have can order a certificate.
 
 Verified custom domains get their certificates from an on-demand catch-all
 behind the same `ask` (on by default in mode (c), `TLS_CUSTOM_DOMAINS`).
 `tls internal` (Caddy's local CA) serves a test box and `task dev:tls`.
 Caddy also compresses text responses (`encode zstd gzip`, `200` only, an
 explicit type list without `text/event-stream`, so `/mcp` SSE is not
-buffered); drobek itself never compresses. Details: [`SELF-HOSTING.md` → TLS](./SELF-HOSTING.md#tls).
+buffered); drobek itself never compresses. On the dashboard site Caddy refuses
+a request body over `DASHBOARD_MAX_BODY_BYTES` (`request_body`, 413) except on
+the paths drobek caps with their own limits (`/mcp`, the asset upload URLs, the
+Data tab's CSV import, the feedback note page with its screenshot); drobek applies the same cap itself in front of React
+Router (`@drobek/core` `withBodyLimit`), counting a chunked body as it arrives.
+Details: [`SELF-HOSTING.md` → TLS](./SELF-HOSTING.md#tls).
 
 ## 8. Background jobs
 
-All in-process (`apps/server/server/jobs.ts`), started with the server:
+All in-process (`apps/server/server/jobs.ts`), started with the server.
+They query through a Postgres pool of their own (`runAsJob` in `@drobek/db`)
+without the requests' `DB_STATEMENT_TIMEOUT_MS`, so a long sweep never
+takes a connection a request waits for and is not cut off like a request's
+query:
 
 | Job | Interval | What |
 | --- | --- | --- |
-| blob GC | hourly, Redis lease | deletes blobs no version references, after 7 days |
+| version retention | hourly, Redis lease | deletes the versions of each app past its workspace's `APP_VERSIONS_KEEP` (200) — never the published one, the one the preview serves, a kept one, a rollback set or the last hour's; skips a workspace whose limits provider does not answer (`@drobek/apps`) |
+| blob GC | hourly, Redis lease | drops the screenshots of feedback notes resolved `FEEDBACK_SCREENSHOT_RETENTION_DAYS` (30) ago and the screenshots for the agent older than `SCREENSHOTS_RETENTION_DAYS` (7), then deletes blobs no version, note or screenshot references, after 7 days |
 | slug release | hourly, Redis lease | a soft-deleted app's slug is free again after 30 days |
+| app purge | `APP_PURGE_INTERVAL_MS` (1 h), Redis lease | deletes an app deleted `APP_PURGE_AFTER_DAYS` (30) ago for good, one app per transaction: the `apps` row and through `ON DELETE CASCADE` its versions (their blobs go with the blob GC), module configs and secrets, domains, asset rows, feedback notes and screenshots, gallery likes and opens, logs and statistics, and the module tables (records, form submissions, end users and identities, uploads, sync state); abuse reports and duplicates keep their rows without the reference; its id leaves `upstreams.allowed_app_ids`, its asset directory and end-user sessions go; audited `app.purge`. An app a foreign key without `ON DELETE` holds is logged and retried every run (`@drobek/apps`) |
 | domain re-check | `DOMAINS_RECHECK_INTERVAL_MS` (1 h), Redis lease | re-verifies domains checked more than 24 h ago; unverifies + mails on a definitive failure |
 | files sweep (only with the `files` module) | `FILES_SWEEP_INTERVAL_MS` (1 h), Redis lease | removes the uploads of apps deleted `FILES_SWEEP_RETENTION_MS` (24 h) ago, stale temp uploads and blobs no `mod_files` row references (`drobek-module-files`) |
 | assets sweep | hourly, Redis lease | removes the asset files and rows of apps deleted 24 h ago, stale temp uploads and files neither the draft (`app_assets`) nor a kept published set (`app_version_assets`) references (`@drobek/apps`) |
 | logs prune | `LOGS_PRUNE_INTERVAL_MS` (1 h), Redis lease | removes `get_logs` rows past their retention for every app: browser errors older than 30 days or past the newest 500 per app, compiles and daily request stats older than 30 days (`@drobek/insights`) |
+| analytics rollup | a minute after start, then hourly; Redis lease | moves the app traffic counters of the last 7 days from Redis into `app_traffic_daily` / `app_traffic_top` (a count never goes down) and deletes days older than `ANALYTICS_RETENTION_DAYS` (90) (`@drobek/insights`) |
+| module jobs (only when an active module declares `jobs`) | each job's own interval (checked every 15 s), a Redis lease per run | the modules' scheduled work, for the server or for each app that configured the module; at most `MODULE_JOBS_CONCURRENCY` (4) runs per process, each cut off at `MODULE_JOBS_TIMEOUT_MS` (5 min); a failed run retries with backoff and an app's failure shows in its `get_logs` runtime; `MODULE_JOBS_ENABLED=0` = none on this process (`@drobek/modules`, [`MODULES.md`](./MODULES.md#scheduled-jobs-jobs)) |
 | audit retention | at start, then daily | deletes audit rows older than `AUDIT_RETENTION_DAYS` (365) — the only deletion of audit rows anywhere |
+| retention prune | at start, then daily, Redis lease | deletes OAuth access and refresh tokens 7 days after they expired (a rotated refresh token stays until then, so reuse detection still sees it) and authorization codes 37 days after (when the lineage a code minted has expired as well, so a replayed code revokes it as long as it exists) (`@drobek/oauth`); gallery open counts of days older than the 30-day `opens` window plus 7 days; abuse reports resolved more than `ABUSE_REPORTS_RETENTION_DAYS` (365) ago — open reports stay (`@drobek/apps`) |
 
 Request counters for `get_logs('requests')` accumulate in Redis and are
 flushed into Postgres on read (the whole window in one pipelined round trip)
-and at most once a minute per app and day; reads never delete. The paths of
+and at most once a minute per app and day; reads never delete. A flush never
+lowers a stored day: each count, and each path's 404 count, keeps the larger
+of the stored and the flushed value, so counters that restart after a Redis
+flush cannot shrink a day already in Postgres. The paths of
 failing requests are counted per app and UTC day, path only (no query, at
 most 100 distinct per class, the rest as `__other__`): a missing file's path
 is stored with the daily stats, a platform 4xx's or a 5xx's stays in Redis
 for the 30-day window.
 
+App traffic analytics (the Analytics tab, `get_analytics`, `get_app`
+`traffic`; `ANALYTICS_ENABLED`) counts what the serving handler answered
+with a 200 or 304 HTML page to a GET on the production host or a custom
+domain — never a preview or version host, a file, a platform route, a
+prefetch, a `drobek-…` user agent or a frame sent without a referrer or
+from the dashboard or the gallery website (the app thumbnail, the gallery's
+live preview). Per app and
+UTC day Redis holds page views, bot views (user-agent list), a HyperLogLog
+of `sha256(daily salt, app id, client IP, user agent)` for the visitor
+estimate, and hashes of page paths and external referrer hosts (at most 200
+each, the rest `__other__`). The salt is random per day and lives only in
+Redis, so the hashes cannot be linked across days; Postgres gets counts only.
+The rollup (a minute after start, then hourly) stores the last 7 days; a read merges today and yesterday
+from Redis (the larger count wins), so the tab is live.
+
 ## 9. Agents, the dashboard and abuse
 
 - **MCP** (`/mcp`, Streamable HTTP): OAuth 2.1 with PKCE, Client ID Metadata
   Documents or Dynamic Client Registration, RFC 8707 audience, RFC 9207
-  `iss`, rotating refresh tokens; or a personal `drk_` API key. A grant is
+  `iss`, rotating refresh tokens (each access token records the refresh token
+  it came with; a rotated refresh token sent again within 60 s is a retry
+  that gets a fresh pair, later it is reuse and revokes that lineage only —
+  `packages/oauth/src/tokens.server.ts`); or a personal `drk_` API key. A grant is
   bound to the **user** (every workspace they belong to) with the scopes
   `read`, `write`, `publish`; the scope decides which tools exist, the role in
-  the app's workspace decides each call. Fifteen tools (among them the
-  gallery listing and the asset upload URLs); the contract and the briefing
-  are in [`AGENT.md`](./AGENT.md).
+  the app's workspace decides each call. The endpoint keeps no state
+  (`packages/oauth/src/resource/mcp.ts`): every request is authenticated from
+  its headers and served by an MCP server built for its user and scope, so a
+  revoked API key or OAuth connection fails its next request and a restart is
+  invisible to clients. One handler serves MCP 2026-07-28 clients (no
+  `initialize`; each request carries its version in `_meta`) and 2025-era
+  clients (`initialize` answers but opens no session; an `Mcp-Session-Id`
+  they still send is ignored). The tools,
+  the contract and the briefing are in [`AGENT.md`](./AGENT.md).
 - **The dashboard** (core, AGPL): sign-in by e-mail code (Google optional),
   workspaces (Apps / Members / Activity / Upstreams tabs), apps with Overview
   / Files / Assets / Data / Modules / Forms / Users / Uploads / Logs /
   Domains / Settings tabs (Assets: list, upload with a progress bar, delete —
-  the same checks and upload URL as `create_asset_upload`), version history and publish, activity (the audit log, CSV),
+  the same checks and upload URL as `create_asset_upload`), version history and publish (the Overview tab lists the live, preview
+  and kept versions on their own, pages the rest by `APP_VERSIONS_PAGE` with runs of failed builds collapsed, and offers
+  Keep / Unkeep and a clean-up whose confirm panel shows what goes and why the rest stays), activity (the audit log, CSV),
   API keys and OAuth connections, the super-admin abuse queue. Every page
   shares one layout (`@drobek/tenancy/layout`: one width, a breadcrumb
   `Workspaces › <workspace> › <app> › <section>`, one set of form controls);
@@ -446,7 +740,12 @@ for the 30-day window.
   shows each app as a small sandboxed iframe thumbnail. The footer names the
   release, the commit (the AGPL source link) and the repository's GitHub
   stars (fetched server-side, cached 1 h, `DASHBOARD_GITHUB_STARS=off`
-  disables it). All dashboard cookies are `__Host-` in production.
+  disables it). After an update to a new release line (`major.minor` of
+  `DROBEK_VERSION`) a signed-in person sees a dismissible "drobek was updated
+  · What's new" notice above every page; `/whats-new` (public) redirects to
+  the GitHub release of the running version, the dismissal is a cookie per
+  line, and `WHATS_NEW_BANNER=0` turns the notice off. All dashboard cookies
+  are `__Host-` in production.
 - **Abuse**: every app host points at the public report form; super-admins
   take an app down (unpublish + lock → 451 everywhere, every write refused
   with `app_locked_by_admin`) and restore it; a publish heuristic flags

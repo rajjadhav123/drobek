@@ -1,10 +1,10 @@
 /**
- * The app page's tabs (NSO-288) — ONE data-driven list, rendered by
+ * The app page's tabs — ONE data-driven list, rendered by
  * <AppTabs> in the app header on every app page. `to` is relative to the
  * app's base path `/workspaces/<ws>/apps/<app>` ('' = the base page).
  *
- * Adding a tab = one line here plus its route (e.g. `modules` for M2-02,
- * `domains` for M3). Keep the order the user reads left to right.
+ * Adding a tab = one line here plus its route (e.g. `modules`,
+ * `domains`). Keep the order the user reads left to right.
  */
 export interface AppTab {
   /** Stable key (data-tab attribute, active-tab matching). */
@@ -27,6 +27,8 @@ export const APP_TABS: readonly AppTab[] = [
   { key: 'end-users', to: 'end-users', label: 'Users' },
   { key: 'uploads', to: 'uploads', label: 'Uploads' },
   { key: 'logs', to: 'logs', label: 'Logs' },
+  { key: 'analytics', to: 'analytics', label: 'Analytics' },
+  { key: 'feedback', to: 'feedback', label: 'Feedback' },
   { key: 'domains', to: 'domains', label: 'Domains' },
   { key: 'settings', to: 'settings', label: 'Settings' },
 ];

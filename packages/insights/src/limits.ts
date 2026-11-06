@@ -1,9 +1,10 @@
 /**
- * Beacon caps + the pure security decisions (PHY-123). The beacon is public and
+ * Beacon caps + the pure security decisions. The beacon is public and
  * writes, so it is bounded on every axis: payload SIZE, per-app+IP RATE, a
  * SAMPLE rate, and a per-app ring-buffer RETENTION (count + age). All are pure
  * functions here (unit-tested) + env-tunable; the server modules apply them.
  */
+import { sanitizeVersion } from './sanitize.js';
 
 /** Hard payload cap — reject (413) any beacon body larger than this. */
 export const BEACON_MAX_BYTES = 8 * 1024;
@@ -22,15 +23,15 @@ export const DEFAULT_BEACON_WINDOW_MS = 60_000;
 export const DEFAULT_MAX_EVENTS_PER_APP = 500;
 /**
  * Ring buffer: drop events older than this many days — the get_logs window
- * (30 days), enforced on insert and by the periodic prune (NSO-327).
+ * (30 days), enforced on insert and by the periodic prune.
  */
 export const DEFAULT_RETENTION_DAYS = 30;
 /**
- * get_logs (M1-07): how far back the compile history, the module request
+ * get_logs: how far back the compile history, the module request
  * counters and the daily serving signals reach (days). Nothing older is kept.
  */
 export const LOGS_RETENTION_DAYS = 30;
-/** get_logs (M1-07): compile-history rows kept per app (newest first). */
+/** get_logs: compile-history rows kept per app (newest first). */
 export const COMPILE_HISTORY_KEEP = 200;
 /** 1 = store every event; <1 = randomly sample (bounds storage under floods). */
 export const DEFAULT_SAMPLE_RATE = 1;
@@ -89,6 +90,28 @@ export function shouldSample(rate: number, rnd: number): boolean {
   if (rate >= 1) return true;
   if (rate <= 0) return false;
   return rnd < rate;
+}
+
+/** A beacon POST: its events, the version its page was served from and whether it reports the page load. */
+export interface BeaconBatch {
+  events: unknown[];
+  /** null = the page did not say. */
+  version: number | null;
+  /** `load: true` — the page loaded (sent once per page load). */
+  load: boolean;
+}
+
+/** Coerce an untrusted POST body to a batch: `{ version?, load?, events: [...] }` (or a bare event / an array). */
+export function extractBatch(payload: unknown, max: number): BeaconBatch {
+  const events = extractEvents(payload, max);
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return { events, version: null, load: false };
+  const p = payload as { version?: unknown; load?: unknown; events?: unknown };
+  const batch = Array.isArray(p.events) || p.load === true;
+  return {
+    events: batch && !Array.isArray(p.events) ? [] : events,
+    version: sanitizeVersion(p.version),
+    load: p.load === true,
+  };
 }
 
 /** Coerce an untrusted batch to an event array, capped to MAX_EVENTS_PER_BATCH. */

@@ -1,8 +1,9 @@
 /**
- * Abuse and moderation, the stateful half (M4-02, NSO-293):
+ * Abuse and moderation, the stateful half:
  *
  *  - the report queue (`abuse_reports`): `createAbuseReport` (the public form
- *    on the dashboard origin), `listAbuseReports`, `resolveAbuseReport`;
+ *    on the dashboard origin), `listAbuseReports`, `resolveAbuseReport`,
+ *    `pruneResolvedAbuseReports` (the daily retention prune);
  *  - the takedown (`apps.locked_reason`): `takedownApp` unpublishes the app
  *    and locks it in one transaction (audit `admin.takedown`),
  *    `restoreApp` lifts the lock WITHOUT republishing (audit `admin.restore`);
@@ -16,20 +17,23 @@
  * restore refuse with `app_locked_by_admin`) and by every caller that changes
  * an app another way (MCP configure_module, the dashboard APIs).
  *
- * E-mail (super-admins on a report, owners on a takedown/restore) is the
- * dashboard's business — this package sends none.
+ * E-mail: the owners hear about a takedown / restore through
+ * mailOwnersAboutModeration (moderation-mail.server.ts), which the dashboard
+ * queue and the MCP tools call after these functions; the super-admins'
+ * report mail is the dashboard's.
  */
 import { createHmac } from 'node:crypto';
-import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
-import { AUDIT_ACTIONS, writeAudit } from '@drobek/audit';
+import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
+import { AUDIT_ACTIONS, writeAudit, type AuditActorKind } from '@drobek/audit';
 import { createConsoleLogger, type Logger } from '@drobek/core';
-import { abuseReports, appVersions, apps, blobs, dbErrorForLog, domains, getDb, users, versionFiles, workspaces } from '@drobek/db';
+import { abuseReports, appVersions, apps, blobs, containsPattern, dbErrorForLog, domains, getDb, users, versionFiles, workspaces } from '@drobek/db';
 import { AppsError } from './errors.js';
 import { notifyAppChanged } from './events.js';
 import { brandWordsFromEnv, describeFinding, scanForPhishing, type HeuristicFinding } from './heuristic.js';
 import { appHostOf, classifyHost, type HostConfig } from './host.js';
 import {
   REPORT_DETAILS_MAX,
+  abuseReportsRetentionDays,
   isLockReason,
   lockCategory,
   normalizeReportHost,
@@ -75,7 +79,7 @@ export interface ModerationTarget {
  * Take an app down: `locked_reason = reason`, `published_version_id = null`
  * (the production host stops serving; preview/version hosts answer 451 like
  * it), every open report of the app resolved, a gallery listing ended
- * (NSO-340, `app.gallery_unlisted` reason `takedown`) — one transaction,
+ * (`app.gallery_unlisted` reason `takedown`) — one transaction,
  * audited `admin.takedown` (meta: reason, the unpublished version id).
  * Idempotent: taking an app down again with the category it already has
  * changes nothing (`changed: false`, no audit, no cache bust) — a double
@@ -85,6 +89,8 @@ export async function takedownApp(input: {
   appId: string;
   reason: string;
   actorUserId: string;
+  /** `agent` when a super-admin's agent called takedown_app; default `user` (the dashboard). */
+  actorKind?: AuditActorKind;
   log?: Logger;
 }): Promise<ModerationTarget & { unpublishedVersionId: string | null; alreadyLocked: boolean; changed: boolean }> {
   if (!isLockReason(input.reason)) {
@@ -108,7 +114,7 @@ export async function takedownApp(input: {
     if (app.lockedReason !== null && lockCategory(app.lockedReason) === reason) {
       return { appId: app.id, slug: app.slug, workspaceId: app.workspaceId, unpublishedVersionId: null, alreadyLocked: true, changed: false };
     }
-    // NSO-340: a taken-down app also leaves the public gallery.
+    // A taken-down app also leaves the public gallery.
     await tx
       .update(apps)
       .set({ lockedReason: reason, publishedVersionId: null, publishedAt: null, galleryListed: false })
@@ -122,7 +128,7 @@ export async function takedownApp(input: {
       {
         workspaceId: app.workspaceId,
         actorUserId: input.actorUserId,
-        actorKind: 'user',
+        actorKind: input.actorKind ?? 'user',
         action: AUDIT_ACTIONS.adminTakedown,
         subjectType: 'app',
         target: app.slug,
@@ -140,7 +146,7 @@ export async function takedownApp(input: {
         {
           workspaceId: app.workspaceId,
           actorUserId: input.actorUserId,
-          actorKind: 'user',
+          actorKind: input.actorKind ?? 'user',
           action: AUDIT_ACTIONS.appGalleryUnlisted,
           subjectType: 'app',
           target: app.slug,
@@ -171,6 +177,8 @@ export async function takedownApp(input: {
 export async function restoreApp(input: {
   appId: string;
   actorUserId: string;
+  /** `agent` when a super-admin's agent called restore_app; default `user` (the dashboard). */
+  actorKind?: AuditActorKind;
   log?: Logger;
 }): Promise<ModerationTarget & { wasLocked: boolean; reason: LockReason | null }> {
   const out = await getDb().transaction(async (tx) => {
@@ -188,7 +196,7 @@ export async function restoreApp(input: {
       {
         workspaceId: app.workspaceId,
         actorUserId: input.actorUserId,
-        actorKind: 'user',
+        actorKind: input.actorKind ?? 'user',
         action: AUDIT_ACTIONS.adminRestore,
         subjectType: 'app',
         target: app.slug,
@@ -227,7 +235,7 @@ const reportedAppColumns = {
 
 /**
  * The live app a reported host belongs to (`<slug>`, `<slug>--preview`,
- * `<slug>--v<N>` under APPS_DOMAIN, or a VERIFIED custom domain — M3-01), or
+ * `<slug>--v<N>` under APPS_DOMAIN, or a VERIFIED custom domain), or
  * null — a host outside the apps origin that no verified domain names, a
  * malformed label, or no such (live) app.
  */
@@ -352,58 +360,123 @@ export interface AbuseReportRow {
   app: ReportedApp | null;
 }
 
-/** The queue: reports by status, newest first (with the app, its workspace and lock state). */
-export async function listAbuseReports(opts: { status?: 'open' | 'resolved'; limit?: number } = {}): Promise<AbuseReportRow[]> {
+export const ABUSE_REPORT_SORTS = ['newest', 'oldest', 'host'] as const;
+type AbuseReportSort = (typeof ABUSE_REPORT_SORTS)[number];
+export const ABUSE_REPORT_APP_FILTERS = ['present', 'unknown-host'] as const;
+
+interface AbuseReportQuery {
+  status?: 'open' | 'resolved';
+  /** Host, app slug, reporter e-mail, reason or details contain it (case-insensitive). */
+  q?: string;
+  /** `present` = the host is an app's, `unknown-host` = no app matched it. */
+  app?: (typeof ABUSE_REPORT_APP_FILTERS)[number] | null;
+  sort?: AbuseReportSort;
+  /** 1-based. */
+  page?: number;
+  pageSize?: number;
+}
+
+interface AbuseReportPage {
+  reports: AbuseReportRow[];
+  /** The reports with this status. */
+  total: number;
+  /** Of them, the ones the search and filter match (all pages). */
+  matching: number;
+}
+
+/** The queue: one page of the reports with a status (with the app, its workspace and lock state), newest first by default. */
+export async function listAbuseReports(opts: AbuseReportQuery = {}): Promise<AbuseReportPage> {
   const status = opts.status ?? 'open';
-  const rows = await getDb()
-    .select({
-      id: abuseReports.id,
-      host: abuseReports.host,
-      reason: abuseReports.reason,
-      details: abuseReports.details,
-      reporterEmail: abuseReports.reporterEmail,
-      status: abuseReports.status,
-      createdAt: abuseReports.createdAt,
-      resolvedAt: abuseReports.resolvedAt,
-      resolvedByEmail: users.email,
-      appId: apps.id,
-      appSlug: apps.slug,
-      appName: apps.name,
-      workspaceId: apps.workspaceId,
-      workspaceSlug: workspaces.slug,
-      lockedReason: apps.lockedReason,
-      publishedVersionId: apps.publishedVersionId,
-    })
-    .from(abuseReports)
-    .leftJoin(apps, eq(apps.id, abuseReports.appId))
-    .leftJoin(workspaces, eq(workspaces.id, apps.workspaceId))
-    .leftJoin(users, eq(users.id, abuseReports.resolvedBy))
-    .where(eq(abuseReports.status, status))
-    .orderBy(desc(abuseReports.createdAt))
-    .limit(Math.min(Math.max(opts.limit ?? 100, 1), 500));
-  return rows.map((r) => ({
-    id: r.id,
-    host: r.host,
-    reason: r.reason,
-    details: r.details,
-    reporterEmail: r.reporterEmail,
-    status: r.status,
-    createdAt: r.createdAt,
-    resolvedAt: r.resolvedAt,
-    resolvedByEmail: r.resolvedByEmail,
-    app:
-      r.appId && r.appSlug && r.workspaceId && r.workspaceSlug
-        ? {
-            id: r.appId,
-            slug: r.appSlug,
-            name: r.appName,
-            workspaceId: r.workspaceId,
-            workspaceSlug: r.workspaceSlug,
-            lockedReason: r.lockedReason,
-            published: r.publishedVersionId !== null,
-          }
-        : null,
-  }));
+  const conditions = [eq(abuseReports.status, status)];
+  const q = opts.q?.trim();
+  if (q) {
+    const pattern = containsPattern(q);
+    conditions.push(
+      or(
+        ilike(abuseReports.host, pattern),
+        ilike(apps.slug, pattern),
+        ilike(abuseReports.reporterEmail, pattern),
+        ilike(abuseReports.reason, pattern),
+        ilike(abuseReports.details, pattern)
+      )!
+    );
+  }
+  if (opts.app === 'present') conditions.push(isNotNull(apps.id));
+  if (opts.app === 'unknown-host') conditions.push(isNull(apps.id));
+  const sort = opts.sort ?? 'newest';
+  const order =
+    sort === 'oldest'
+      ? [asc(abuseReports.createdAt), asc(abuseReports.id)]
+      : sort === 'host'
+        ? [asc(abuseReports.host), desc(abuseReports.createdAt)]
+        : [desc(abuseReports.createdAt), desc(abuseReports.id)];
+  const pageSize = Math.min(Math.max(opts.pageSize ?? 100, 1), 500);
+  const page = Math.max(1, opts.page ?? 1);
+  const db = getDb();
+  const [rows, [counts]] = await Promise.all([
+    db
+      .select({
+        id: abuseReports.id,
+        host: abuseReports.host,
+        reason: abuseReports.reason,
+        details: abuseReports.details,
+        reporterEmail: abuseReports.reporterEmail,
+        status: abuseReports.status,
+        createdAt: abuseReports.createdAt,
+        resolvedAt: abuseReports.resolvedAt,
+        resolvedByEmail: users.email,
+        appId: apps.id,
+        appSlug: apps.slug,
+        appName: apps.name,
+        workspaceId: apps.workspaceId,
+        workspaceSlug: workspaces.slug,
+        lockedReason: apps.lockedReason,
+        publishedVersionId: apps.publishedVersionId,
+      })
+      .from(abuseReports)
+      .leftJoin(apps, eq(apps.id, abuseReports.appId))
+      .leftJoin(workspaces, eq(workspaces.id, apps.workspaceId))
+      .leftJoin(users, eq(users.id, abuseReports.resolvedBy))
+      .where(and(...conditions))
+      .orderBy(...order)
+      .limit(pageSize)
+      .offset((page - 1) * pageSize),
+    db
+      .select({
+        total: sql<number>`count(*)`.mapWith(Number),
+        matching: sql<number>`(count(*) filter (where ${and(...conditions)}))`.mapWith(Number),
+      })
+      .from(abuseReports)
+      .leftJoin(apps, eq(apps.id, abuseReports.appId))
+      .where(eq(abuseReports.status, status)),
+  ]);
+  return {
+    total: counts?.total ?? 0,
+    matching: counts?.matching ?? 0,
+    reports: rows.map((r) => ({
+      id: r.id,
+      host: r.host,
+      reason: r.reason,
+      details: r.details,
+      reporterEmail: r.reporterEmail,
+      status: r.status,
+      createdAt: r.createdAt,
+      resolvedAt: r.resolvedAt,
+      resolvedByEmail: r.resolvedByEmail,
+      app:
+        r.appId && r.appSlug && r.workspaceId && r.workspaceSlug
+          ? {
+              id: r.appId,
+              slug: r.appSlug,
+              name: r.appName,
+              workspaceId: r.workspaceId,
+              workspaceSlug: r.workspaceSlug,
+              lockedReason: r.lockedReason,
+              published: r.publishedVersionId !== null,
+            }
+          : null,
+    })),
+  };
 }
 
 /** Mark one open report resolved (no other effect). false when it is not open. */
@@ -414,6 +487,20 @@ export async function resolveAbuseReport(reportId: string, actorUserId: string):
     .where(and(eq(abuseReports.id, reportId), eq(abuseReports.status, 'open')))
     .returning({ id: abuseReports.id });
   return rows.length > 0;
+}
+
+/**
+ * Delete the reports resolved more than ABUSE_REPORTS_RETENTION_DAYS ago
+ * (the daily retention prune). Open reports always stay; the audit trail of
+ * the report and of its takedown follows AUDIT_RETENTION_DAYS.
+ */
+export async function pruneResolvedAbuseReports(opts: { now?: Date; env?: NodeJS.ProcessEnv } = {}): Promise<{ deleted: number }> {
+  const cutoff = new Date((opts.now ?? new Date()).getTime() - abuseReportsRetentionDays(opts.env) * 86_400_000);
+  const rows = await getDb()
+    .delete(abuseReports)
+    .where(and(eq(abuseReports.status, 'resolved'), lt(abuseReports.resolvedAt, cutoff)))
+    .returning({ id: abuseReports.id });
+  return { deleted: rows.length };
 }
 
 /** Every app that is currently taken down (live rows), newest first by slug order. */

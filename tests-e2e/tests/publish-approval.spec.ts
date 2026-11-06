@@ -5,7 +5,7 @@ import { FULL_SCOPE, callTool, mcpClient, type McpClient } from './helpers/mcp';
 import { personalWorkspaceOf, withDb } from './helpers/seed';
 
 /**
- * NSO-366: who may publish, on the local stack.
+ * Who may publish, on the local stack.
  *
  *  - /admin/publishing is super-admin only (403 for anyone else);
  *  - list_apps / get_app carry `can_publish` + `publishing`;
@@ -20,8 +20,10 @@ import { personalWorkspaceOf, withDb } from './helpers/seed';
  *    E2E_PUBLISH_APPROVAL=approval, and E2E_OPERATOR_EMAIL when OPERATOR_EMAIL
  *    is set): an unapproved publish answers publish_not_approved naming the
  *    contact, the operator gets one e-mail (a second refused publish sends
- *    none), and after approval the publish goes through. The dev stack runs
- *    `open`, so that part is skipped there.
+ *    none), and after approval the publish goes through. The dev stack and
+ *    the image flow's first phase run `open`, so that part is skipped there;
+ *    the image flow's second phase restarts drobek with
+ *    PUBLISH_APPROVAL=approval from E2E_PUBLISH_APPROVAL (scripts/e2e-image.sh).
  */
 
 const SUPER_ADMIN = 'e2e-superadmin@drobek.test';
@@ -53,7 +55,7 @@ async function requestedAt(workspaceId: string): Promise<Date | null> {
 
 test.describe.configure({ mode: 'serial' });
 
-test.describe('publish approval and blocking (NSO-366) @local', () => {
+test.describe('publish approval and blocking @local', () => {
   let owner: McpClient;
   let boss: McpClient | null = null;
   let admin: BrowserContext | null = null;
@@ -144,7 +146,7 @@ test.describe('publish approval and blocking (NSO-366) @local', () => {
     const row = ap.locator(`[data-testid="publishing-workspace"][data-slug="${ws.slug}"]`);
     await expect(row).toHaveAttribute('data-publishing', 'default');
     await row.getByTestId('publishing-block').click();
-    // NSO-371: Block opens a confirm panel naming the workspace; only its button blocks.
+    // Block opens a confirm panel naming the workspace; only its button blocks.
     await expect(ap.getByTestId('block-confirm')).toHaveAttribute('data-slug', ws.slug);
     await ap.getByTestId('block-confirm-submit').click();
     await expect(ap.getByTestId('publishing-result')).toHaveText(

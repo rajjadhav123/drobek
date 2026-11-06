@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { REACT_VERSION, TEMPLATE_IMPORTS } from '@drobek/agent-dx';
-import { Compiler } from '@drobek/compile';
+import { Compiler, readinessReport } from '@drobek/compile';
 import { TEMPLATES, templateFiles } from './templates.js';
 
 describe('create_app templates', () => {
@@ -10,6 +10,12 @@ describe('create_app templates', () => {
     const r = await compiler.compile(templateFiles(name, 'Test "app" <b>&'));
     expect(r.errors).toEqual([]);
     expect(r.ok).toBe(true);
+  });
+
+  it.each(TEMPLATES)('%s has a <title>; its only warnings are the description and the favicon the agent adds', async (name) => {
+    const report = await readinessReport({ files: templateFiles(name, 'Test "app" <b>&') });
+    expect(report.ready).toBe(true);
+    expect(report.warnings.map((w) => w.code)).toEqual(['missing_description', 'missing_favicon']);
   });
 
   it('react-ts: the 4 files, a pinned import map with ONE react, main.js + main.css', async () => {

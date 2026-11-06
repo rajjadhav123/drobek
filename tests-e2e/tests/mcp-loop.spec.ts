@@ -1,22 +1,15 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { UnauthorizedError, type OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import type {
-  OAuthClientInformationMixed,
-  OAuthClientMetadata,
-  OAuthTokens,
-} from '@modelcontextprotocol/sdk/shared/auth.js';
+import { UnauthorizedError, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import type { OAuthClientProvider, OAuthClientInformationMixed, OAuthClientMetadata, OAuthTokens } from '@modelcontextprotocol/client';
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { BASE_URL_MCP, BASE_URL_WEB, TEST_ENV } from '../playwright.config';
 import { DASHBOARD_ORIGIN, getAppUrl, type Raw } from './helpers/apps-host';
 import { loginViaEmail, resetDcrIpRateLimit, skipUnlessLocal, uniqueEmail } from './helpers/auth';
-import { callTool, connectBearer } from './helpers/mcp';
-import { withDb } from './helpers/seed';
+import { callTool, connectBearer, mcpEra, newMcpClient, requireSmokeKey } from './helpers/mcp';
 
 /**
- * M0-08 (NSO-289): the agent loop, end to end, the way a real MCP client
- * (Claude Code, Cursor, …) drives it.
+ * The agent loop, end to end, the way a real MCP client
+ * (Claude Code, Cursor, …) drives it — in the project's protocol era.
  *
  * 1. `@local` — the official SDK client with an OAuthClientProvider: 401 →
  *    RFC 9728/8414 discovery → Dynamic Client Registration → PKCE S256
@@ -25,15 +18,15 @@ import { withDb } from './helpers/seed';
  *    on the app host → publish → GET production host → restore_version →
  *    get_app. Must finish in < 90 s (asserted).
  * 2. `@smoke` — the same tool loop minus OAuth, safe against production
- *    (M0-09): a `drk_` API key from SMOKE_API_KEY (read from the environment
+ *    a `drk_` API key from SMOKE_API_KEY (read from the environment
  *    only, never logged), public HTTP + MCP only against a non-local target —
  *    no database, Redis or Mailpit. Locally (TEST_ENV=local, no key) the key
  *    is minted straight into the local DB for a throwaway user.
- *    Cleanup (NSO-316) — MCP has no delete tool and gets none (no destructive
- *    MCP tool), so the app never outlives the run where it can be deleted:
+ *    Cleanup — MCP has no delete tool, so the app never outlives the run
+ *    where it can be deleted:
  *    (a) TEST_ENV=local: a fresh `smoke-<random>` app, deleted at the end —
  *        also when the test fails (try/finally) — through the dashboard
- *        delete action (NSO-288) as the smoke user, signed in by e-mail OTP
+ *        delete action as the smoke user, signed in by e-mail OTP
  *        via Mailpit;
  *    (b) any other target (production): the smoke has only the API key, so
  *        it uses ONE stable slug per key, `smoke-<12 hex of sha256(key)>`,
@@ -132,8 +125,8 @@ async function approveConsent(page: Page, url: URL): Promise<URL> {
   return back;
 }
 
-function newClient(): Client {
-  return new Client({ name: 'drobek-e2e-mcp-loop', version: '0.0.0' });
+function newClient() {
+  return newMcpClient('drobek-e2e-mcp-loop');
 }
 
 /** GET an app URL, retried while a fresh host warms up (TLS issuance, DNS). */
@@ -191,7 +184,7 @@ test('mcp loop: DCR + PKCE consent → list → create → broken write → fix 
   expect(back.searchParams.get('iss')).toBe(BASE_URL_WEB.replace(/\/+$/, ''));
   const code = back.searchParams.get('code');
   expect(code, 'authorization code').toBeTruthy();
-  await first.finishAuth(code as string);
+  await first.finishAuth(back.searchParams);
   expect(provider.tokens()?.access_token, 'access token').toBeTruthy();
   expect(provider.tokens()?.refresh_token, 'refresh token').toBeTruthy();
   expect(provider.tokens()?.scope?.split(' ').sort()).toEqual(['publish', 'read', 'write']);
@@ -199,6 +192,7 @@ test('mcp loop: DCR + PKCE consent → list → create → broken write → fix 
   const transport = new StreamableHTTPClientTransport(mcpUrl, { authProvider: provider });
   const client = newClient();
   await client.connect(transport);
+  expect(client.getProtocolEra()).toBe(mcpEra());
   try {
     // ── list_apps: the token is bound to this user; nothing yet. ───────────
     const listed = await callTool(client, 'list_apps', {});
@@ -255,11 +249,13 @@ test('mcp loop: DCR + PKCE consent → list → create → broken write → fix 
     expect(published.json).toMatchObject({ published_version: 3, previous_version: null, published_url: prodUrl });
     const prodHtml = await getAppUrl(prodUrl);
     expect(prodHtml.status).toBe(200);
-    expect(prodHtml.body).toBe(previewHtml.body);
+    expect(previewHtml.body).toContain('<script src="/__drobek/feedback.js" defer');
+    expect(prodHtml.body).not.toContain('/__drobek/feedback.js');
+    expect(prodHtml.body).toBe(previewHtml.body.replace(/<script src="\/__drobek\/preview\.js"[^>]*><\/script><script src="\/__drobek\/feedback\.js"[^>]*><\/script>/, ''));
     expect(prodHtml.headers['x-robots-tag']).toBeUndefined();
     const prodJs = await getAppUrl(prodUrl, '/main.js');
     expect(prodJs.body).toContain(marker);
-    // NSO-381: preview keeps the inline source map; production serves it as /main.js.map.
+    // Preview keeps the inline source map; production serves it as /main.js.map.
     expect(previewJs.body).toContain('//# sourceMappingURL=data:application/json;base64,');
     expect(prodJs.body).not.toContain('sourceMappingURL=data:');
     expect(prodJs.body.trimEnd().endsWith('//# sourceMappingURL=main.js.map')).toBe(true);
@@ -308,27 +304,6 @@ test('mcp loop: DCR + PKCE consent → list → create → broken write → fix 
 });
 
 /**
- * The smoke credential. Production (M0-09): SMOKE_API_KEY from the deploy
- * job's secrets. Local stack: a throwaway user + key written straight into the
- * local DB (withDb refuses unless TEST_ENV=local).
- */
-async function smokeKey(): Promise<string | null> {
-  const fromEnv = process.env.SMOKE_API_KEY?.trim();
-  if (fromEnv) return fromEnv;
-  if (TEST_ENV !== 'local') return null;
-  const key = `drk_${randomBytes(24).toString('base64url')}`;
-  const userId = `usr${randomBytes(12).toString('hex')}`;
-  await withDb(async (c) => {
-    await c.query(`INSERT INTO users (id, email) VALUES ($1, $2)`, [userId, uniqueEmail('smoke')]);
-    await c.query(
-      `INSERT INTO api_keys (id, user_id, name, key_hash, scopes) VALUES ($1, $2, 'smoke', $3, 'read write publish')`,
-      [`key${randomBytes(8).toString('hex')}`, userId, createHash('sha256').update(key).digest('hex')]
-    );
-  });
-  return key;
-}
-
-/**
  * The ONE slug a non-local smoke identity uses, run after run:
  * `smoke-<12 hex>` of a domain-separated SHA-256 of the key. Derived from the
  * secret (not from the key id or e-mail, which the client does not know or
@@ -342,7 +317,7 @@ function stableSmokeSlug(key: string): string {
 }
 
 /**
- * Local cleanup: the dashboard delete (NSO-288) as the smoke user — e-mail
+ * Local cleanup: the dashboard delete as the smoke user — e-mail
  * OTP sign-in through Mailpit, Settings → type the slug → Delete. MCP has no
  * delete tool, by design (no destructive MCP tool).
  */
@@ -363,17 +338,7 @@ test('smoke loop: API key → list → create/reuse smoke-* → write → previe
   request,
 }) => {
   test.setTimeout(LOOP_BUDGET_MS);
-  const key = await smokeKey();
-  const web = new URL(BASE_URL_WEB);
-  if (!key) {
-    // A local target without TEST_ENV=local simply has no credential; any
-    // other target (production after a deploy) MUST be given one.
-    test.skip(
-      web.hostname === 'localhost' || web.hostname === '127.0.0.1',
-      'no SMOKE_API_KEY (and not TEST_ENV=local)'
-    );
-    throw new Error('SMOKE_API_KEY is required for the @smoke MCP loop against a non-local target');
-  }
+  const key = await requireSmokeKey();
   // Local stack → a fresh `smoke-<random>` app, deleted through the dashboard
   // at the end. Anywhere else (production) → the identity's one stable slug,
   // reused every run: nothing to delete, nothing accumulates.
@@ -441,7 +406,7 @@ test('smoke loop: API key → list → create/reuse smoke-* → write → previe
     expect(published.json.published_version).toBe(version);
     const prod = await getWhenUp(published.json.published_url as string);
     expect(prod.body).toContain(`<p id="marker">${marker}</p>`);
-    // NSO-342: only the dashboard (its app-list thumbnail) may frame the app.
+    // Only the dashboard (its app-list thumbnail) may frame the app.
     expect(prod.headers['content-security-policy']).toContain(`frame-ancestors ${DASHBOARD_ORIGIN};`);
   } catch (err) {
     failed = true;

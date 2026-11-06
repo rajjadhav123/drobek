@@ -13,15 +13,16 @@ export interface AppRow {
   workspaceId: string;
   workspaceSlug: string;
   publishedVersionId: string | null;
-  /** NSO-293: the super-admin takedown category; non-null = locked (app_locked_by_admin). */
+  /** The super-admin takedown category; non-null = locked (app_locked_by_admin). */
   lockedReason: string | null;
-  /** NSO-340: what get_app's `gallery` reports. */
+  /** What get_app's `gallery` reports; with `frameAncestors` also get_app's own fields. */
   visibility: string;
+  frameAncestors: string | null;
   galleryListed: boolean;
   galleryDescription: string | null;
   galleryHiddenAt: Date | null;
   galleryAllowDuplicate: boolean;
-  /** NSO-340: the gallery app this one was duplicated from. */
+  /** The gallery app this one was duplicated from. */
   duplicatedFromSlug: string | null;
 }
 
@@ -34,6 +35,7 @@ const appColumns = {
   publishedVersionId: apps.publishedVersionId,
   lockedReason: apps.lockedReason,
   visibility: apps.visibility,
+  frameAncestors: apps.frameAncestors,
   galleryListed: apps.galleryListed,
   galleryDescription: apps.galleryDescription,
   galleryHiddenAt: apps.galleryHiddenAt,
@@ -123,6 +125,17 @@ export async function lastOkVersionNumber(appId: string): Promise<number | null>
     .orderBy(desc(appVersions.number))
     .limit(1);
   return row?.number ?? null;
+}
+
+/** The newest version that compiled ok with its id, or null. */
+export async function previewVersionHead(appId: string): Promise<{ id: string; number: number } | null> {
+  const [row] = await getDb()
+    .select({ id: appVersions.id, number: appVersions.number })
+    .from(appVersions)
+    .where(and(eq(appVersions.appId, appId), eq(appVersions.compileStatus, 'ok')))
+    .orderBy(desc(appVersions.number))
+    .limit(1);
+  return row ?? null;
 }
 
 export async function emailsByUserIds(userIds: string[]): Promise<Map<string, string>> {

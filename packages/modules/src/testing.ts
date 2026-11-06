@@ -1,5 +1,5 @@
 /**
- * `createModuleTestContext()` (M1-01) — unit-test a module without a server,
+ * `createModuleTestContext()` — unit-test a module without a server,
  * Redis or SMTP: a real ModuleContext over in-memory fakes, plus `request()`
  * that runs a route through the SAME pipeline production uses (CSRF, rule,
  * rate limit, body/query validation, uniform errors).
@@ -12,7 +12,7 @@
  * `db` is whatever drizzle database the test passes (e.g. PGlite with the
  * module's migrations applied); a module that never touches `ctx.db` needs none.
  * `coreMigrationsDir()` + `createTestApp()` build that database without any
- * other drobek package (NSO-349):
+ * other drobek package:
  *
  *   const pg = new PGlite();
  *   const db = drizzle(pg);
@@ -21,17 +21,24 @@
  *   const app = await createTestApp(db);
  *
  * `checkSkill(module)` checks the module's SKILL.md like the built-in
- * modules' (skill-check/).
+ * modules' (skill-check/). `t.runJob(name)` runs one of the module's
+ * scheduled `jobs` once (contract 1.2); its `ctx.upstreams.fetch` and
+ * `ctx.records.import` are the test's `upstreams` / `records` fakes.
  */
 import { existsSync } from 'node:fs';
+import type { Readable } from 'node:stream';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { noopLogger, type Logger } from '@drobek/core';
 import { apps, workspaces, type DB } from '@drobek/db';
 import {
+  JOB_MAX_INTERVAL_MS,
+  JOB_MIN_INTERVAL_MS,
   normalizeConfirmItems,
+  parseJobInterval,
   type AnyModule,
+  type AppJobContext,
   type EmailMessage,
   type EndUserCallbackResult,
   type HookApp,
@@ -39,6 +46,11 @@ import {
   type MailEnvelope,
   type ModuleContext,
   type Principal,
+  type RecordsImportOptions,
+  type RecordsImportResult,
+  type ServerJobContext,
+  type UpstreamRequest,
+  type UpstreamResponse,
 } from './contract.js';
 import { mergePatch } from './merge-patch.js';
 import { collectRoutes, errorResult, isReadable, matchRoute, runRoute, type PipelineResult } from './router.js';
@@ -47,13 +59,37 @@ import { CORE_ERROR_CODES, ModuleError } from './errors.js';
 import { assertSignInSender, capEmailText, emailKind, resolveRecipients, sanitizeSubject } from './email.js';
 import type { MailGuard } from './mail-guard.js';
 import { memoryRateLimiter } from './runtime.js';
-import { composeModule } from './registry.js';
+import { composeModule, loadModuleSet } from './registry.js';
+import { buildSdk as buildServerSdk } from './sdk-build.js';
 
 export { checkSkill, checkSkillSources, knownErrorCodes, moduleSkillSource, type CheckSkillOptions, type CheckSkillSourcesOptions } from './skill-check/index.js';
 export { checkExamples, type ExamplesOptions, type ExamplesReport } from './skill-check/examples.js';
 export { SKILL_MAX_LINES, SKILL_SECTIONS, skillFormatIssues } from './skill-check/format.js';
 export { codeBlocks, headings, proseOf, sectionText, type CodeBlock, type Heading } from './skill-check/markdown.js';
 export { formatSkillIssue, type SkillIssue, type SkillSource } from './skill-check/source.js';
+export { memoryMailGuard, type MailGuard, type MailGuardConfig } from './mail-guard.js';
+
+/**
+ * Load `DROBEK_MODULES` the way the server does at start (resolve, validate,
+ * check the set: slots, requires, error codes) and return the modules in
+ * that order. `importer` resolves a package name (`drobek-module-<name>` for
+ * a short name) to the module's ES module, or null when it is not installed.
+ */
+export async function loadModules(env: { DROBEK_MODULES?: string }, opts: { importer: (specifier: string) => Promise<unknown> }): Promise<AnyModule[]> {
+  return (await loadModuleSet({ DROBEK_MODULES: env.DROBEK_MODULES }, { importer: opts.importer, log: noopLogger })).modules;
+}
+
+/** The browser SDK the server builds from these modules: the bundle (`js`) and its declarations (`dts`). */
+export interface TestSdkBundle {
+  js: Buffer;
+  dts: string;
+}
+
+/** Build the browser SDK (`/__drobek/sdk.js` + its `.d.ts`) from these modules, as the server does at start. */
+export async function buildSdk(modules: AnyModule[]): Promise<TestSdkBundle> {
+  const sdk = await buildServerSdk(modules);
+  return { js: sdk.js, dts: sdk.dts };
+}
 
 /**
  * The folder of drobek's core migrations (journal `__drizzle_migrations_core`):
@@ -112,6 +148,12 @@ export interface ModuleTestOptions {
    * host's `compose` runs with them first, as at server start.
    */
   contributions?: Record<string, unknown[]>;
+  /** A job's `ctx.upstreams.fetch` (default: ModuleError `unavailable`, like a server without proxy). */
+  upstreams?: (name: string, request: UpstreamRequest) => Promise<UpstreamResponse>;
+  /** A job's `ctx.records.import` (default: ModuleError `unavailable`, like a server without data). */
+  records?: (collection: string, records: Record<string, unknown>[], opts: RecordsImportOptions) => Promise<RecordsImportResult>;
+  /** A route's `ctx.records.create` (default: ModuleError `unavailable`, like a server without data). */
+  createRecords?: (collection: string, records: Record<string, unknown>[]) => Promise<Record<string, unknown>[]>;
 }
 
 /** One request to the module's `endUsers.callback` (the dashboard-host IdP callback). */
@@ -135,17 +177,41 @@ export interface TestRequestInit {
   headers?: Record<string, string>;
   /** Default `127.0.0.1`; `null` = no resolved client IP (per-IP limits are skipped). */
   clientIp?: string | null;
+  /**
+   * Hand a streamed body over unread (`res.stream`) instead of collecting it —
+   * for a response that stays open (an event stream). Destroy it when done.
+   */
+  stream?: boolean;
+}
+
+export interface TestJobRunInit {
+  /** Default: a signal that never aborts. */
+  signal?: AbortSignal;
+  /** `ctx.lastSuccessAt` (default null: the first run). */
+  lastSuccessAt?: Date | null;
+}
+
+export interface TestJobRun {
+  /** false: a `scope: 'app'` job whose `every(config, app)` gave no interval for the test app — core would not run it. */
+  ran: boolean;
+  /** The interval core would run it at for the test app (ms, clamped to 1 min – 30 days), or null. */
+  intervalMs: number | null;
 }
 
 export interface TestResponse {
   status: number;
+  /** A list-valued header is joined with `, ` (like fetch `Headers.get`). */
   headers: Record<string, string>;
+  /** Every `Set-Cookie` value in order (like fetch `Headers.getSetCookie`). */
+  setCookies: string[];
   /** Parsed JSON (or the raw text when the body is not JSON). */
   body: unknown;
   /** The raw response bytes (a streamed body is collected). */
   bytes: Buffer;
   /** Request body bytes a streaming (`file`) route pulled before it stopped. */
   bodyBytesRead: number;
+  /** The unread streamed body when the request asked for `stream: true` (else null). */
+  stream: Readable | null;
 }
 
 export interface ModuleTestContext {
@@ -166,8 +232,14 @@ export interface ModuleTestContext {
    * runs first (limits, envelope) exactly as core runs it.
    */
   emails: ({ to: string[]; subject: string; text: string; kind: 'sign_in' | 'notification' } & MailEnvelope)[];
-  /** Change who is calling. */
+  /** Change who is calling (`ctx.currentPrincipal()` of an open response answers the new one). */
   setPrincipal(principal: Principal): void;
+  /**
+   * Change the app's config (a partial config merged over configDefaults,
+   * then validated): new requests get it as `ctx.config`, an open response
+   * through `ctx.currentConfig()`.
+   */
+  setConfig(config: Record<string, unknown>): void;
   /**
    * Run the module's `confirmRequired(before, after, context)` the way
    * configure_module does — both configs merged over configDefaults and
@@ -183,6 +255,14 @@ export interface ModuleTestContext {
    * limiter shares the test clock. Rejects when the module has no callback.
    */
   endUserCallback(init: TestCallbackInit): Promise<EndUserCallbackResult>;
+  /**
+   * Run the module's job `name` once, the way core's scheduler runs it: a
+   * `scope: 'app'` job for the test app with the test config, secrets and
+   * limits (not at all when `every(config, app)` gives no interval), a
+   * `server` job with `apps()` yielding the test app. Rejects with the job's
+   * own error, or when the module has no such job.
+   */
+  runJob(name: string, init?: TestJobRunInit): Promise<TestJobRun>;
   /** The module as the test runs it (composed from `contributions` when it hosts slots). */
   module: AnyModule;
 }
@@ -201,7 +281,7 @@ export function createModuleTestContext(declared: AnyModule, opts: ModuleTestOpt
   if (!parsed.success) {
     throw new Error(`createModuleTestContext: config does not pass ${module.name}.configSchema: ${parsed.error.message}`);
   }
-  const config = parsed.data;
+  let config = parsed.data;
   let pendingConfig: unknown = null;
   if (opts.pendingConfig) {
     const p = module.configSchema.safeParse(mergePatch(module.configDefaults, opts.pendingConfig));
@@ -217,7 +297,10 @@ export function createModuleTestContext(declared: AnyModule, opts: ModuleTestOpt
   const rateLimit = memoryRateLimiter(opts.now);
   const audits: ModuleTestContext['audits'] = [];
   const emails: ModuleTestContext['emails'] = [];
-  const secretNames = new Set((module.secrets ?? []).map((s) => s.name));
+  const secretNames = new Set([
+    ...(module.secrets ?? []).map((s) => s.name),
+    ...(module.secretsFor ? module.secretsFor(config).map((s) => s.name) : []),
+  ]);
   let principal: Principal = opts.principal ?? { kind: 'anon' };
 
   const buildCtx = (): ModuleContext<any> => ({
@@ -226,6 +309,8 @@ export function createModuleTestContext(declared: AnyModule, opts: ModuleTestOpt
     principal,
     config,
     pendingConfig,
+    currentConfig: async () => config,
+    currentPrincipal: async () => principal,
     db: opts.db ?? noDb(),
     log: opts.log ?? noopLogger,
     contributions: <T,>(slot: string) => [...(opts.contributions?.[slot] ?? [])] as T[],
@@ -240,6 +325,12 @@ export function createModuleTestContext(declared: AnyModule, opts: ModuleTestOpt
     },
     audit: async (action, meta = {}) => {
       audits.push({ action: action.startsWith(`${module.name}.`) ? action : `${module.name}.${action}`, meta });
+    },
+    records: {
+      create: async (collection, records) => {
+        if (!opts.createRecords) throw new ModuleError('unavailable', 'No module that stores records (data) is on for this app\'s workspace.');
+        return opts.createRecords(collection, records);
+      },
     },
     email: {
       send: async (message: EmailMessage) => {
@@ -275,16 +366,20 @@ export function createModuleTestContext(declared: AnyModule, opts: ModuleTestOpt
   // As in production: a route may answer the core codes and the module's own `errors` only.
   const errorCodes = new Set([...CORE_ERROR_CODES, ...(module.errors ?? []).map((e) => e.code)]);
 
-  const toResponse = async (r: PipelineResult, bodyBytesRead = 0): Promise<TestResponse> => {
+  const toResponse = async (r: PipelineResult, bodyBytesRead = 0, keepStream = false): Promise<TestResponse> => {
     let bytes: Buffer;
-    if (isReadable(r.body)) {
+    let stream: Readable | null = null;
+    if (keepStream && isReadable(r.body)) {
+      stream = r.body;
+      bytes = Buffer.alloc(0);
+    } else if (isReadable(r.body)) {
       const chunks: Buffer[] = [];
       for await (const c of r.body) chunks.push(Buffer.from(c as Uint8Array));
       bytes = Buffer.concat(chunks);
     } else {
       bytes = r.body === null ? Buffer.alloc(0) : Buffer.from(r.body);
     }
-    let body: unknown = r.body === null ? null : bytes.toString('utf8');
+    let body: unknown = r.body === null || stream ? null : bytes.toString('utf8');
     if (typeof body === 'string') {
       try {
         body = JSON.parse(body);
@@ -292,7 +387,13 @@ export function createModuleTestContext(declared: AnyModule, opts: ModuleTestOpt
         /* keep the text */
       }
     }
-    return { status: r.status, headers: r.headers, body, bytes, bodyBytesRead };
+    const headers: Record<string, string> = {};
+    const setCookies: string[] = [];
+    for (const [k, v] of Object.entries(r.headers)) {
+      headers[k] = Array.isArray(v) ? v.join(', ') : v;
+      if (k.toLowerCase() === 'set-cookie') setCookies.push(...(Array.isArray(v) ? v : [v]));
+    }
+    return { status: r.status, headers, setCookies, body, bytes, bodyBytesRead, stream };
   };
 
   /** `raw` as the adapter's pull stream, in `size`-byte chunks; counts what was pulled. */
@@ -331,6 +432,11 @@ export function createModuleTestContext(declared: AnyModule, opts: ModuleTestOpt
     setPrincipal(p) {
       principal = p;
     },
+    setConfig(patch) {
+      const next = module.configSchema.safeParse(mergePatch(module.configDefaults, patch));
+      if (!next.success) throw new Error(`setConfig: config does not pass ${module.name}.configSchema: ${next.error.message}`);
+      config = next.data;
+    },
     async confirm(before, after) {
       if (!module.confirmRequired) return [];
       const parse = (patch: Record<string, unknown>) => {
@@ -360,6 +466,57 @@ export function createModuleTestContext(declared: AnyModule, opts: ModuleTestOpt
             appId === app.id ? { app, config, limits: async () => limits, secrets: base.secrets, audit: base.audit, contributions: base.contributions } : null,
         },
       });
+    },
+    async runJob(name, init = {}) {
+      const job = module.jobs?.find((j) => j.name === name);
+      if (!job) throw new Error(`module "${module.name}" has no job "${name}"`);
+      const base = buildCtx();
+      const common = {
+        db: base.db,
+        log: base.log,
+        contributions: base.contributions,
+        module: module.name,
+        job: job.name,
+        signal: init.signal ?? new AbortController().signal,
+        lastSuccessAt: init.lastSuccessAt ?? null,
+        limits: async () => limits,
+      };
+      if (job.scope === 'app') {
+        const every = typeof job.every === 'function' ? job.every(config, app) : job.every;
+        const ms = every === null || every === undefined ? null : parseJobInterval(every);
+        if (ms === null) return { ran: false, intervalMs: null };
+        const ctx: AppJobContext<any> = {
+          ...common,
+          app,
+          config,
+          pendingConfig: pendingConfig ?? null,
+          rateLimit: base.rateLimit,
+          secrets: base.secrets,
+          upstreams: {
+            fetch: async (upstream, request = {}) => {
+              if (!opts.upstreams) throw new ModuleError('unavailable', 'No module that calls upstreams (proxy) is on for this app\'s workspace.');
+              return opts.upstreams(upstream, request);
+            },
+          },
+          records: {
+            import: async (collection, records, importOpts) => {
+              if (!opts.records) throw new ModuleError('unavailable', 'No module that stores records and imports them in batches (data) is on for this app\'s workspace.');
+              return opts.records(collection, records, importOpts);
+            },
+          },
+          audit: base.audit,
+        };
+        await job.run(ctx);
+        return { ran: true, intervalMs: Math.min(JOB_MAX_INTERVAL_MS, Math.max(JOB_MIN_INTERVAL_MS, ms)) };
+      }
+      const ctx: ServerJobContext<any> = {
+        ...common,
+        apps: async function* () {
+          yield { app, config, db: base.db, log: base.log };
+        },
+      };
+      await job.run(ctx);
+      return { ran: true, intervalMs: parseJobInterval(job.every) };
     },
     async request(method, path, init = {}) {
       const upper = method.toUpperCase();
@@ -408,7 +565,7 @@ export function createModuleTestContext(declared: AnyModule, opts: ModuleTestOpt
           },
         }
       );
-      return toResponse(res, read.n);
+      return toResponse(res, read.n, init.stream === true);
     },
   };
 }

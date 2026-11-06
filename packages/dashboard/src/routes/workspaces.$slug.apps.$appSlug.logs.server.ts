@@ -1,9 +1,11 @@
 /**
- * GET /workspaces/:slug/apps/:appSlug/logs — server half of the Logs tab
- * (M2-03): the SAME readers as the `get_logs` MCP tool (@drobek/insights) —
+ * GET /workspaces/:slug/apps/:appSlug/logs — server half of the Logs tab:
+ * the SAME readers as the `get_logs` MCP tool (@drobek/insights) —
  * browser runtime errors (deduped, with counts), the last compiles, and the
- * per-day request totals (module calls by status class) — for a window picked
- * from `?since=1h|24h|7d|30d` (default 24h). Viewer+; no mutations; no
+ * per-day request totals (module calls by status class), plus the preview's
+ * browser errors (`get_logs kind: "browser"`, Redis, stacks mapped to the
+ * app's source files) — for a window picked from `?since=1h|24h|7d|30d`
+ * (default 24h). Viewer+; no mutations; no
  * realtime (the page has a Refresh button; a beacon is stored synchronously,
  * so an error raised in preview shows on the next load).
  *
@@ -12,6 +14,7 @@
  */
 import { type LoaderFunctionArgs } from 'react-router';
 import { queryCompileLog, queryRequestLog, queryRuntimeLog } from '@drobek/insights';
+import { browserErrorStore } from '@drobek/serving';
 import { requireWorkspaceRole } from '@drobek/tenancy';
 import { appHeaderFor } from '../app-page.server.js';
 import { dbErrorForLog } from '@drobek/db';
@@ -34,20 +37,22 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   const app = await ownerApp(access, String(params.appSlug ?? ''));
   const now = new Date();
   const { key, since } = sinceWindow(new URL(request.url).searchParams.get('since'), now);
-  const [runtime, compile, requests] = await Promise.all([
+  const [runtime, browser, compile, requests] = await Promise.all([
     section(() => queryRuntimeLog(app.id, since, now)),
+    section(() => browserErrorStore().read(app.id, { since, limit: 100 })),
     section(() => queryCompileLog(app.id, since, now)),
     section(() => queryRequestLog(app.id, since, { now })),
   ]);
   return {
     workspace: { slug: access.workspace.slug, name: access.workspace.name },
     appSlug: app.slug,
-    /** NSO-342: the app header + tabs on every app sub-page. */
+    /** The app header + tabs on every app sub-page. */
     header: await appHeaderFor(access, app.slug),
     since: key,
     sinceOptions: SINCE_OPTIONS.map((o) => ({ key: o.key, label: o.label })),
     loadedAt: now.toISOString(),
     runtime,
+    browser,
     compile,
     requests,
   };

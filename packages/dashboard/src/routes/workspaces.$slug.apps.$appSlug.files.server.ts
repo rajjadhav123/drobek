@@ -1,6 +1,6 @@
 /**
- * GET /workspaces/:slug/apps/:appSlug/files — server half of the Files tab
- * (NSO-288). viewer+, read-only: the chosen version's file tree (source and
+ * GET /workspaces/:slug/apps/:appSlug/files — server half of the Files tab.
+ * viewer+, read-only: the chosen version's file tree (source and
  * built outputs), one file's content for the viewer and the ZIP download
  * link. `?version=N` (default: the newest), `?path=…&kind=source|built`
  * (default: index.html / the first source file). The UI is not a builder —
@@ -36,7 +36,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   const { app } = page;
   const url = new URL(request.url);
 
-  const [header, all] = await Promise.all([appHeaderData(page), listVersions(app.id, { limit: 500 })]);
+  const [header, { versions: all }] = await Promise.all([appHeaderData(page), listVersions(app.id, { limit: 500 })]);
   const number = positiveInt(url.searchParams.get('version')) ?? all[0]?.number ?? null;
   const version = number !== null ? await getVersion(app.id, { number }) : null;
   if (number !== null && !version) throw data({ message: 'Not found' }, { status: 404 });

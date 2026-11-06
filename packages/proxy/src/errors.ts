@@ -1,5 +1,5 @@
 /**
- * Typed proxy errors (PHY-59). Every rejection carries a stable `code` so the
+ * Typed proxy errors. Every rejection carries a stable `code` so the
  * route layer maps it to an HTTP status without string-matching. Messages are
  * ALWAYS secret-free (a decrypt/config failure must never echo key material).
  */
@@ -11,15 +11,19 @@ export type ProxyErrorCode =
   | 'method_not_allowed'
   | 'path_not_allowed'
   | 'rate_limited'
+  | 'limit_exceeded'
   | 'proxy_busy'
   | 'ssrf_blocked'
   | 'upstream_error'
+  | 'upstream_redirect'
   | 'config_error';
 
 export class ProxyError extends Error {
   constructor(
     readonly code: ProxyErrorCode,
-    message: string
+    message: string,
+    /** Secret-free facts for the caller, e.g. `{ limit, value }` or `{ retry_after_seconds }`. */
+    readonly details: Record<string, unknown> = {}
   ) {
     super(message);
     this.name = 'ProxyError';
@@ -39,6 +43,8 @@ export function proxyErrorStatus(code: ProxyErrorCode): number {
       return 403;
     case 'not_found':
       return 404;
+    case 'limit_exceeded':
+      return 409;
     case 'method_not_allowed':
       return 405;
     case 'rate_limited':
@@ -47,6 +53,9 @@ export function proxyErrorStatus(code: ProxyErrorCode): number {
       return 429;
     case 'upstream_error':
       // A bad gateway to the upstream (DNS fail, timeout, connection refused).
+      return 502;
+    case 'upstream_redirect':
+      // A redirect the gateway does not follow (another origin, a path outside the prefixes, too many hops).
       return 502;
     case 'config_error':
       // A misconfigured/missing KEK or an un-decryptable secret — fail CLOSED.

@@ -16,7 +16,7 @@ import {
 } from './helpers/seed';
 
 /**
- * M2-01 (NSO-288) acceptance — the app page of the dashboard:
+ * The app page of the dashboard:
  *   (1) publish / rollback / restore / unpublish from the UI change what the
  *       apps host serves (production, preview, `--v<N>`), all audited;
  *   (2) a viewer sees the app, its versions, files and settings but no
@@ -38,7 +38,8 @@ import {
  * node:http(s) with an explicit Host (helpers/apps-host.ts).
  */
 
-const HTML = (text: string) => `<!doctype html><html><head><title>${text}</title></head><body><h1>${text}</h1></body></html>`;
+const HTML = (text: string) =>
+  `<!doctype html><html><head><title>${text}</title><meta name="description" content="Version ${text}."><link rel="icon" href="data:,"></head><body><h1>${text}</h1></body></html>`;
 
 function watchConsole(page: Page): string[] {
   const problems: string[] = [];
@@ -145,6 +146,9 @@ test('app page: publish, rollback, restore and unpublish from the UI change what
   await expect(page.getByTestId('app-preview-url')).toHaveAttribute('href', urlOf(previewHost(app.slug)));
   await expect(page.getByTestId('app-compile-status')).toHaveAttribute('data-status', 'ok');
   await expect(page.locator('[data-testid="app-tab"][aria-current="page"]')).toHaveAttribute('data-tab', 'overview');
+  // the newest version passed the publish readiness checks (a <title>, a description and an icon).
+  await expect(page.getByTestId('readiness-section')).toHaveAttribute('data-state', 'ready');
+  await expect(page.getByTestId('readiness-section')).toHaveAttribute('data-version', '2');
   // "Open" goes to the version host (a link, never a frame).
   await expect(row(2).getByTestId('version-open-link')).toHaveAttribute('href', urlOf(versionHost(app.slug, 2)));
   expect((await hostRequest(versionHost(app.slug, 1))).body).toContain('<h1>one</h1>');
@@ -187,6 +191,55 @@ test('app page: publish, rollback, restore and unpublish from the UI change what
 
   await page.waitForLoadState('networkidle');
   expect(problems).toEqual([]);
+});
+
+test('app page: the background TypeScript check lists a type_error after a reload, never blocking @local', async ({ page, request }) => {
+  skipUnlessLocal();
+  const email = uniqueEmail('dash-types');
+  await loginViaEmail(page, request, email);
+  const ws = await personalWorkspaceOf(email);
+  const app = await seedApp({ workspaceId: ws.id });
+  // A version nobody type-checked yet (seeded): opening the page schedules it.
+  await seedVersion({
+    appId: app.id,
+    files: [
+      { path: 'index.html', content: '<!doctype html><html><head><title>Typed</title></head><body><div id="root"></div></body></html>' },
+      { path: 'src/main.ts', content: "const count: number = 'three';\nconsole.log(count);\n" },
+    ],
+  });
+
+  await page.goto(`/workspaces/${ws.slug}/apps/${app.slug}`);
+  const section = page.getByTestId('readiness-section');
+  const typeError = section.locator('[data-testid="readiness-warning"][data-code="type_error"]');
+  await expect(async () => {
+    await page.reload();
+    await expect(typeError).toBeVisible({ timeout: 1_000 });
+  }).toPass({ timeout: 30_000 });
+  await expect(typeError).toContainText('src/main.ts:1');
+  await expect(typeError).toContainText("TS2322: Type 'string' is not assignable to type 'number'.");
+  await expect(section).toHaveAttribute('data-state', 'warnings');
+  await expect(section).toContainText('never block Publish');
+});
+
+test('app page: "Before you publish" lists a readiness warning and Publish still goes through @local', async ({ page, request }) => {
+  skipUnlessLocal();
+  const email = uniqueEmail('dash-ready');
+  await loginViaEmail(page, request, email);
+  const ws = await personalWorkspaceOf(email);
+  const app = await seedApp({ workspaceId: ws.id });
+  await seedVersion({ appId: app.id, files: [{ path: 'index.html', content: '<!doctype html><html><head></head><body><h1>untitled</h1></body></html>' }] });
+
+  await page.goto(`/workspaces/${ws.slug}/apps/${app.slug}`);
+  const section = page.getByTestId('readiness-section');
+  await expect(section).toHaveAttribute('data-state', 'warnings');
+  await expect(section.locator('[data-testid="readiness-warning"][data-code="missing_title"]')).toContainText('index.html');
+  await expect(section).toContainText('never block Publish');
+
+  // A warning never blocks: the version publishes and production serves it.
+  const row = page.locator('[data-testid="version-row"][data-version="1"]');
+  await row.getByTestId('publish-button').click();
+  await expect(row.getByTestId('version-published')).toBeVisible();
+  expect((await hostRequest(prodHost(app.slug))).body).toContain('<h1>untitled</h1>');
 });
 
 test('app page: a viewer sees versions, files and settings but no action; every POST is 403 @local', async ({
@@ -422,7 +475,7 @@ test('app page: Settings — password visibility and frame-ancestors change the 
   await page.getByTestId('frame-ancestors-save').click();
   await expect(page.getByTestId('settings-frame-ancestors-current')).toHaveText('https://intranet.example.com');
   const csp = String((await hostRequest(prodHost(app.slug))).headers['content-security-policy']);
-  // NSO-342: the dashboard origin stays allowed next to the override (the app-list thumbnail).
+  // the dashboard origin stays allowed next to the override (the app-list thumbnail).
   expect(csp).toContain(`frame-ancestors https://intranet.example.com ${DASHBOARD_ORIGIN};`);
   await page.getByTestId('frame-ancestors-input').fill('');
   await page.getByTestId('frame-ancestors-save').click();

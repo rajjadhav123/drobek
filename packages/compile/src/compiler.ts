@@ -7,7 +7,7 @@ import { limitsFromEnv, type CompileLimits } from './limits.js';
 import { isAllowedExt, normalizeAppPath, TEXT_EXTS, extOf } from './paths.js';
 import { APP_NAMESPACE, SDK_SOURCE_NAMESPACE, virtualFsPlugin, type FailDetail, type VirtualFsState } from './plugin.js';
 import { Semaphore } from './queue.js';
-import { checkHtmlBasics } from './html-basics.js';
+import { scanReferences } from './references.js';
 import { scanForSecrets } from './secrets.js';
 import type {
   CompileErrorCode,
@@ -96,26 +96,26 @@ export class Compiler {
     const secrets = [...checked.text].flatMap(([path, text]) => scanForSecrets(path, text));
     if (secrets.length > 0) return failed(secrets, started);
 
-    const appFiles = new Set(checked.all.keys());
-    const htmlWarnings = [...checked.text].flatMap(([path, text]) => checkHtmlBasics(path, text, appFiles));
-
     const { config, errors: configErrors } = readAppConfig(checked.text);
-    if (configErrors.length > 0) return { ...failed(configErrors, started), warnings: htmlWarnings };
+    if (configErrors.length > 0) return failed(configErrors, started);
+
+    const references = scanReferences({ files: checked.all, text: checked.text, config, servedPaths: opts.servedPaths });
 
     if (Object.keys(config.entries).length === 0) {
       // A plain static app (index.html + assets) has nothing to bundle.
-      return { ok: true, outputs: new Map(), errors: [], warnings: htmlWarnings, inputs: [], durationMs: 0 };
+      return { ok: true, outputs: new Map(), errors: [], warnings: references, inputs: [], durationMs: 0 };
     }
 
     if (!(await this.slots.acquire())) {
-      return {
-        ...failed([{ code: 'busy', text: 'The compiler is busy — retry the write in a few seconds.' }], started),
-        warnings: htmlWarnings,
-      };
+      return failed(
+        [{ code: 'busy', text: 'The compiler is busy — retry the write in a few seconds.' }],
+        started
+      );
     }
     try {
       const result = await this.build(checked.all, config, opts, hooks, started);
-      return { ...result, warnings: [...htmlWarnings, ...result.warnings] };
+      result.warnings.push(...references);
+      return result;
     } finally {
       this.slots.release();
     }
@@ -190,7 +190,7 @@ export class Compiler {
 
   private async build(
     files: Map<string, string | Buffer>,
-    config: { imports: Record<string, string>; entries: Record<string, string>; beacon?: boolean },
+    config: { imports: Record<string, string>; paths: Record<string, string[]>; entries: Record<string, string>; beacon?: boolean },
     opts: CompileOptions,
     hooks: CompileHooks,
     started: number
@@ -199,6 +199,7 @@ export class Compiler {
     const state: VirtualFsState = {
       files,
       imports: config.imports,
+      paths: config.paths,
       sdkUrl: opts.sdkUrl ?? SDK_URL,
       sdkSources: opts.sdkSources ?? {},
       maxImportDepth: this.limits.maxImportDepth,
@@ -228,7 +229,7 @@ export class Compiler {
       tsconfigRaw: '{}',
       logLevel: 'silent',
       plugins: [virtualFsPlugin(state)],
-      // M1-07: every entry loads the error beacon first (ES imports run in order).
+      // Every entry loads the error beacon first (ES imports run in order).
       ...(opts.beaconUrl && config.beacon !== false ? { banner: { js: `import ${JSON.stringify(opts.beaconUrl)};` } } : {}),
     });
 

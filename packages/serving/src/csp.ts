@@ -1,5 +1,5 @@
 /**
- * Security headers of every response an app host sends (M0-06, plan §3.3).
+ * Security headers of every response an app host sends.
  * Pure. Every app has its own host = its own origin, so the CSP confines the
  * app to itself (+ esm.sh for the import-mapped dependencies) and the headers
  * below go on EVERY app-host response — files, 304s, the not-published / 404
@@ -11,51 +11,55 @@
  *   img-src     'self' data: blob: https:
  *   font-src    'self' data: https:
  *   connect-src 'self' https://esm.sh                   — fetch only back to the app itself
- *                                                          (modules live at /__drobek/*, M1)
+ *                                                          (modules live at /__drobek/*); the preview
+                                                         host also the dashboard origin, where the
+                                                         preview script answers an agent's
+                                                         screenshot request
  *   media-src   'self' blob: https:                     — <video>/<audio> from the app's own
  *                                                          assets or any https URL (media runs
- *                                                          no script; NSO-358)
+ *                                                          no script)
  *   frame-src   https://www.youtube-nocookie.com https://www.youtube.com
  *               https://player.vimeo.com https://drive.google.com
  *                                                        — the curated video embeds, plus the
- *                                                          operator's APP_FRAME_SRC_EXTRA origins
- *                                                          (NSO-358); any other iframe is blocked
+ *                                                          operator's APP_FRAME_SRC_EXTRA origins;
+ *                                                          any other iframe is blocked
  *   object-src 'none'; base-uri 'self'; form-action 'self'
  *   frame-ancestors 'none'                              — or the app's validated override;
- *                                                          plus the dashboard origin (NSO-342);
+ *                                                          plus the dashboard origin;
  *                                                          plus GALLERY_FRAME_ANCESTORS on the
  *                                                          production host of an app shown in
  *                                                          the public gallery
  *
  * Plus `X-Content-Type-Options: nosniff` (the Content-Type comes from the path
- * extension only), `Referrer-Policy: no-referrer` (an app URL never leaks to a
- * third party), and `X-Robots-Tag: noindex` on the preview and version hosts
+ * extension only), `Referrer-Policy: strict-origin-when-cross-origin` (a third
+ * party sees only the app's origin, never its path or query; map tile servers
+ * such as OpenStreetMap's refuse requests without a Referer), and `X-Robots-Tag: noindex` on the preview and version hosts
  * (only the published host may be indexed).
  */
 
+import { appCspFetchDirectives } from '@drobek/compile';
+
 export const DEFAULT_FRAME_ANCESTORS = "'none'";
 
-/** The embeds every app may frame (NSO-358): YouTube (privacy-enhanced and classic), Vimeo, Google Drive. */
+const APP_REFERRER_POLICY = 'strict-origin-when-cross-origin';
+
+/** The embeds every app may frame: YouTube (privacy-enhanced and classic), Vimeo, Google Drive. */
 export const DEFAULT_FRAME_SRC = 'https://www.youtube-nocookie.com https://www.youtube.com https://player.vimeo.com https://drive.google.com';
 
-const CSP_HEAD = [
-  "default-src 'self'",
-  "script-src 'self' https://esm.sh 'unsafe-inline'",
-  "style-src 'self' 'unsafe-inline' https:",
-  "img-src 'self' data: blob: https:",
-  "font-src 'self' data: https:",
-  "connect-src 'self' https://esm.sh",
-  "media-src 'self' blob: https:",
-];
+// The fetch directives come from @drobek/compile, whose reference check warns
+// about URLs this policy blocks.
+const CSP_HEAD = appCspFetchDirectives();
 const CSP_TAIL = ["object-src 'none'", "base-uri 'self'"];
 
 /**
  * The CSP for an app host with the given (already validated) frame-ancestors
  * value and frame-src list (default: the curated embeds; node.ts adds the
- * operator's APP_FRAME_SRC_EXTRA, see frameSrcFromEnv).
+ * operator's APP_FRAME_SRC_EXTRA, see frameSrcFromEnv), and one more
+ * `connect-src` origin when given (the dashboard origin on the preview host).
  */
-export function appCsp(frameAncestors: string = DEFAULT_FRAME_ANCESTORS, frameSrc: string = DEFAULT_FRAME_SRC): string {
-  return [...CSP_HEAD, `frame-src ${frameSrc}`, ...CSP_TAIL, `frame-ancestors ${frameAncestors}`, "form-action 'self'"].join('; ');
+export function appCsp(frameAncestors: string = DEFAULT_FRAME_ANCESTORS, frameSrc: string = DEFAULT_FRAME_SRC, connectExtra: string | null = null): string {
+  const head = connectExtra ? CSP_HEAD.map((d) => (d.startsWith('connect-src ') ? `${d} ${connectExtra}` : d)) : CSP_HEAD;
+  return [...head, `frame-src ${frameSrc}`, ...CSP_TAIL, `frame-ancestors ${frameAncestors}`, "form-action 'self'"].join('; ');
 }
 
 // One APP_FRAME_SRC_EXTRA entry: an https origin — a host (no wildcard, no
@@ -140,7 +144,7 @@ function ancestorOrigin(raw: string | null | undefined): string | null {
 /**
  * Add origins to a validated frame-ancestors value (parseFrameAncestors):
  * each one next to the owner's override, or instead of `'none'`. Used for the
- * dashboard origin (NSO-342, the app-list thumbnail — every app host) and the
+ * dashboard origin (the app-list thumbnail — every app host) and the
  * operator's gallery origins (GALLERY_FRAME_ANCESTORS — the production host of
  * an app shown in the public gallery). An origin that is not a bare http(s)
  * origin (ancestorOrigin) is ignored; no origin to add → the value as it was.
@@ -202,14 +206,21 @@ export interface SecurityHeaderInput {
   frameSrc?: string;
   /** Preview and version hosts are never indexed. */
   noindex: boolean;
+  /** The dashboard origin on the preview host (a bare http(s) origin, else ignored): `connect-src` then allows its `/api/screenshots/` path only. */
+  connectSrcExtra?: string | null;
+}
+
+function screenshotUploadSource(raw: string | null | undefined): string | null {
+  const origin = ancestorOrigin(raw);
+  return origin ? `${origin}/api/screenshots/` : null;
 }
 
 /** The invariant security headers of EVERY app-host response (incl. 304/401/404/405). */
 export function appSecurityHeaders(input: SecurityHeaderInput): Record<string, string> {
   const h: Record<string, string> = {
-    'Content-Security-Policy': appCsp(input.frameAncestors ?? DEFAULT_FRAME_ANCESTORS, input.frameSrc ?? DEFAULT_FRAME_SRC),
+    'Content-Security-Policy': appCsp(input.frameAncestors ?? DEFAULT_FRAME_ANCESTORS, input.frameSrc ?? DEFAULT_FRAME_SRC, screenshotUploadSource(input.connectSrcExtra)),
     'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'no-referrer',
+    'Referrer-Policy': APP_REFERRER_POLICY,
   };
   if (input.noindex) h['X-Robots-Tag'] = 'noindex';
   return h;

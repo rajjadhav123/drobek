@@ -5,9 +5,10 @@ import { APPS_URL_SCHEME, BASE_URL_WEB } from '../playwright.config';
 import { hostRequest, previewHost, urlOf } from './helpers/apps-host';
 import { skipUnlessLocal } from './helpers/auth';
 import { FULL_SCOPE, callTool, mcpClient, type McpClient } from './helpers/mcp';
+import { withDb } from './helpers/seed';
 
 /**
- * M1-07 (NSO-290): get_logs end to end on the local stack.
+ * get_logs end to end on the local stack.
  *
  *  - runtime: a page on the PREVIEW host throws (uncaught error + unhandled
  *    rejection) in a real browser → the beacon the compiler put in front of
@@ -16,11 +17,18 @@ import { FULL_SCOPE, callTool, mcpClient, type McpClient } from './helpers/mcp';
  *    untrusted envelope;
  *  - compile: the last compiles with ok / errors / version (≤ 50);
  *  - requests: today's totals + module calls by status class (hello: 2xx, 4xx);
+ *    a flush never lowers a day Postgres already holds (Redis restarted);
  *  - the beacon: 9 KiB (declared or chunked) → 413 and the server keeps
- *    answering (the PHY-76 #10 regression); a cross-origin POST → 403;
- *  - NSO-327: the page URL is stored as origin + path — the SDK never sends
+ *    answering; a cross-origin POST → 403;
+ *  - the page URL is stored as origin + path — the SDK never sends
  *    the query string or fragment (`?code=…`), and a client that does has
- *    them stripped by the server.
+ *    them stripped by the server;
+ *  - the render signal: every HTML response names its version in
+ *    `Server-Timing`; get_app's `render` and the get_logs envelope count the
+ *    newest version's page loads (0 before anyone opened it) and its browser
+ *    errors — an image that failed to load and a fetch the CSP blocked,
+ *    reported with the version and without their query strings;
+ *    `"beacon": false` in drobek.json turns it off.
  */
 
 interface Created {
@@ -34,6 +42,14 @@ interface RuntimeEntry {
   count: number;
   url: string;
   file_hint: string | null;
+  version: number | null;
+}
+
+interface Render {
+  version: number;
+  beacon: boolean;
+  page_loads: number;
+  errors: number;
 }
 
 const STAMP = `${Date.now()}${Math.floor(Math.random() * 1e4)}`;
@@ -52,6 +68,16 @@ const FAILING_MAIN = [
   '',
   'setTimeout(checkout, 50);',
   "setTimeout(() => { void Promise.reject(new Error('async boom')); }, 60);",
+  '',
+].join('\n');
+
+/** A page that renders, then shows an image that is not there and fetches an origin the app CSP blocks. */
+const RENDER_MAIN = [
+  "import './styles.css';",
+  '',
+  "const root = document.getElementById('root')!;",
+  'root.innerHTML = \'<h1>Render demo ready</h1><img alt="logo" src="/missing-logo.png?v=secret">\';',
+  "fetch('https://api.example.com/v1/items?token=abc').catch(() => undefined);",
   '',
 ].join('\n');
 
@@ -101,7 +127,7 @@ function chunkedPost(host: string, path: string, body: Buffer): Promise<number> 
 
 test.describe.configure({ mode: 'serial' });
 
-test.describe('get_logs — runtime errors, compile history, request stats (M1-07) @local', () => {
+test.describe('get_logs — runtime errors, compile history, request stats @local', () => {
   let mcp: McpClient;
   let app: Created;
   let host: string;
@@ -137,7 +163,7 @@ test.describe('get_logs — runtime errors, compile history, request stats (M1-0
     const ctx = await browser.newContext();
     try {
       const tab = await ctx.newPage();
-      // A one-time code in the query and a token in the fragment must never reach the log (NSO-327).
+      // A one-time code in the query and a token in the fragment must never reach the log.
       await tab.goto(`${urlOf(host)}/?code=123456&e=${encodeURIComponent(LEAKED_EMAIL)}#token=${STAMP}`);
       await expect(tab.getByRole('heading', { name: 'Logs demo ready' })).toBeVisible();
       const loadedAt = Date.now();
@@ -209,11 +235,11 @@ test.describe('get_logs — runtime errors, compile history, request stats (M1-0
     skipUnlessLocal();
     expect((await hostRequest(host, '/')).status).toBe(200);
     expect((await hostRequest(host, '/__drobek/v1/hello')).status).toBe(200);
-    // An unknown route (and a 429) is not counted — only matched routes are (NSO-323).
+    // An unknown route (and a 429) is not counted — only matched routes are.
     expect((await hostRequest(host, '/__drobek/v1/hello/nope')).status).toBe(404);
     // A mutation without the SDK header → 403 (csrf_rejected), a 4xx of hello.
     expect((await hostRequest(host, '/__drobek/v1/hello/wave', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"name":"x"}' })).status).toBe(403);
-    // A missing file → 404, its path (never its query) listed under failing_paths (NSO-380).
+    // A missing file → 404, its path (never its query) listed under failing_paths.
     expect((await hostRequest(host, '/favicon.ico?v=secret')).status).toBe(404);
 
     const today = new Date().toISOString().slice(0, 10);
@@ -255,6 +281,39 @@ test.describe('get_logs — runtime errors, compile history, request stats (M1-0
     expect(day!.modules._beacon).toBeUndefined();
   });
 
+  test('requests: a flush never lowers the stored day (counters that restarted after a Redis flush)', async () => {
+    skipUnlessLocal();
+    const today = new Date().toISOString().slice(0, 10);
+    // Postgres holds more than Redis — what a Redis restart leaves behind.
+    const stored = await withDb(async (c) => {
+      const res = await c.query(
+        `UPDATE app_daily_stats
+            SET request_count = request_count + 100000,
+                path_404_counts = path_404_counts || '{"/before-restart": 40}'::jsonb
+          WHERE app_id = $1 AND day = $2
+          RETURNING request_count`,
+        [app.app_id, today]
+      );
+      return Number(res.rows[0]?.request_count ?? 0);
+    });
+    expect(stored).toBeGreaterThan(100_000);
+    expect((await hostRequest(host, '/')).status).toBe(200);
+
+    const r = await callTool(mcp.client, 'get_logs', { app_id: app.app_id, kind: 'requests' });
+    expect(r.isError, JSON.stringify(r.json)).toBe(false);
+    const day = (r.json.entries as { day: string; requests: number; count_404: number }[]).find((d) => d.day === today);
+    expect(day?.requests).toBeGreaterThanOrEqual(stored);
+    expect(day?.count_404).toBeGreaterThanOrEqual(40);
+
+    const row = await withDb(
+      async (c) =>
+        (await c.query(`SELECT request_count, path_404_counts FROM app_daily_stats WHERE app_id = $1 AND day = $2`, [app.app_id, today]))
+          .rows[0] as { request_count: number; path_404_counts: Record<string, number> }
+    );
+    expect(row.request_count).toBeGreaterThanOrEqual(stored);
+    expect(row.path_404_counts['/before-restart']).toBe(40);
+  });
+
   test('beacon: 9 KiB → 413 (declared and chunked), the server keeps answering; cross-origin → 403', async ({ request }) => {
     skipUnlessLocal();
     const nine = Buffer.alloc(9 * 1024, 0x78);
@@ -282,7 +341,7 @@ test.describe('get_logs — runtime errors, compile history, request stats (M1-0
     expect(JSON.stringify(r.json.entries)).not.toContain('forged');
   });
 
-  test('beacon: a client that sends the query string and fragment has them stripped server-side (NSO-327)', async () => {
+  test('beacon: a client that sends the query string and fragment has them stripped server-side', async () => {
     skipUnlessLocal();
     const marker = `raw-client-${STAMP}`;
     const posted = await hostRequest(host, '/__drobek/v1/_beacon', {
@@ -304,5 +363,91 @@ test.describe('get_logs — runtime errors, compile history, request stats (M1-0
       .toBe(true);
     expect(entry!.url).toBe(`${urlOf(host)}/checkout`);
     expect(entry!.url).not.toContain('654321');
+  });
+
+  test('render signal: page loads and browser errors of the newest version, a failed image and a CSP block; "beacon": false turns it off', async ({ browser }) => {
+    skipUnlessLocal();
+    const demo = (await callTool(mcp.client, 'create_app', { name: 'Render demo', template: 'react-ts' })).json as unknown as Created;
+    const rhost = previewHost(demo.slug);
+    const w = await callTool(mcp.client, 'write_files', {
+      app_id: demo.app_id,
+      files: [{ path: 'src/main.tsx', content: RENDER_MAIN }],
+      reasoning: 'A page with a missing image and a blocked fetch',
+    });
+    expect(w.isError, JSON.stringify(w.json)).toBe(false);
+    expect((w.json.compile as { ok: boolean }).ok, JSON.stringify(w.json.compile)).toBe(true);
+
+    const render = async (): Promise<Render> => {
+      const r = await callTool(mcp.client, 'get_app', { app_id: demo.app_id });
+      expect(r.isError, JSON.stringify(r.json)).toBe(false);
+      return r.json.render as Render;
+    };
+    // Nobody opened version 2 yet; a plain HTTP request runs no script and counts nothing.
+    const index = await hostRequest(rhost, '/');
+    expect(index.status).toBe(200);
+    expect(index.headers['server-timing']).toBe('drobek-version;desc="2"');
+    expect(await render()).toEqual({ version: 2, beacon: true, page_loads: 0, errors: 0 });
+    const before = await callTool(mcp.client, 'get_logs', { app_id: demo.app_id, kind: 'runtime' });
+    expect(before.json.render).toEqual({ version: 2, beacon: true, page_loads: 0, errors: 0 });
+    expect(String(before.json.note)).toContain('No page of version 2 has loaded in a browser yet');
+
+    const ctx = await browser.newContext();
+    try {
+      const tab = await ctx.newPage();
+      await tab.goto(`${urlOf(rhost)}/`);
+      await expect(tab.getByRole('heading', { name: 'Render demo ready' })).toBeVisible();
+      let signal: Render | undefined;
+      await expect
+        .poll(
+          async () => {
+            signal = await render();
+            return signal.page_loads >= 1 && signal.errors >= 2;
+          },
+          { timeout: 5_000, intervals: [250] }
+        )
+        .toBe(true);
+      expect(signal).toMatchObject({ version: 2, beacon: true });
+    } finally {
+      await ctx.close();
+    }
+
+    const logs = await callTool(mcp.client, 'get_logs', { app_id: demo.app_id, kind: 'runtime' });
+    expect(logs.isError, JSON.stringify(logs.json)).toBe(false);
+    expect(logs.structured).toBe(false);
+    const entries = logs.json.entries as RuntimeEntry[];
+    const image = entries.find((e) => e.type === 'resource');
+    expect(image, JSON.stringify(entries)).toBeTruthy();
+    expect(image!.message).toContain('Failed to load image');
+    expect(image!.message).toContain('/missing-logo.png');
+    expect(image!.version).toBe(2);
+    const blocked = entries.find((e) => e.type === 'csp');
+    expect(blocked, JSON.stringify(entries)).toBeTruthy();
+    expect(blocked!.message).toContain('Content-Security-Policy blocked https://api.example.com');
+    expect(blocked!.message).toContain('(connect-src)');
+    expect(blocked!.version).toBe(2);
+    expect(logs.text).not.toContain('v=secret');
+    expect(logs.text).not.toContain('token=abc');
+    expect(logs.text).toMatch(/<untrusted-app-logs [^>]*latest_version="2" beacon="on" page_loads="[1-9]\d*" page_errors="([2-9]|\d{2,})"/);
+    expect(String(logs.json.note)).toContain('Version 2:');
+
+    // "beacon": false: the compiler adds no beacon and drobek counts nothing for the version.
+    const cfg = await callTool(mcp.client, 'read_file', { app_id: demo.app_id, path: 'drobek.json' });
+    expect(cfg.isError, JSON.stringify(cfg.json)).toBe(false);
+    const config = { ...(JSON.parse(cfg.json.content as string) as Record<string, unknown>), beacon: false };
+    const off = await callTool(mcp.client, 'write_files', {
+      app_id: demo.app_id,
+      files: [{ path: 'drobek.json', content: `${JSON.stringify(config, null, 2)}\n` }],
+      reasoning: 'Turn the browser error reports off',
+    });
+    expect(off.isError, JSON.stringify(off.json)).toBe(false);
+    expect((off.json.compile as { ok: boolean }).ok, JSON.stringify(off.json.compile)).toBe(true);
+    const mainJs = await hostRequest(rhost, '/main.js');
+    expect(mainJs.status).toBe(200);
+    expect(mainJs.body).not.toContain('/__drobek/beacon.js');
+    expect((await hostRequest(rhost, '/')).headers['server-timing']).toBe('drobek-version;desc="3"');
+    expect(await render()).toEqual({ version: 3, beacon: false, page_loads: 0, errors: 0 });
+    const offLogs = await callTool(mcp.client, 'get_logs', { app_id: demo.app_id, kind: 'runtime' });
+    expect(offLogs.text).toMatch(/<untrusted-app-logs [^>]*latest_version="3" beacon="off" nonce=/);
+    expect(String(offLogs.json.note)).toContain('Version 3 has "beacon": false in drobek.json');
   });
 });

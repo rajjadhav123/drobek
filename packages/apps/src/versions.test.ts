@@ -120,12 +120,12 @@ describe('versions', () => {
         createVersion(appId, [{ path: 'index.html', content: `v${i}` }], { actor })
       )
     );
-    const list = await listVersions(appId);
+    const list = (await listVersions(appId)).versions;
     expect(list.map((v) => v.number)).toEqual([5, 4, 3, 2, 1]);
     expect(await latestVersionNumber(appId)).toBe(5);
   });
 
-  it('baseVersion: stores on top of the base, refuses with version_conflict once another version landed (NSO-382)', async () => {
+  it('baseVersion: stores on top of the base, refuses with version_conflict once another version landed', async () => {
     await expect(createVersion(appId, [{ path: 'index.html', content: 'a' }], { actor, baseVersion: null })).resolves.toMatchObject({ number: 1 });
     await expect(createVersion(appId, [{ path: 'index.html', content: 'b' }], { actor, baseVersion: 1 })).resolves.toMatchObject({ number: 2 });
     const err = await createVersion(appId, [{ path: 'index.html', content: 'c' }], { actor, baseVersion: 1 }).catch((e) => e);
@@ -179,7 +179,7 @@ describe('versions', () => {
 
     const [app] = await db.select().from(apps).where(eq(apps.id, appId));
     expect(app.publishedVersionId).toBe(v1.id);
-    expect((await listVersions(appId)).find((v) => v.published)?.number).toBe(1);
+    expect((await listVersions(appId)).versions.find((v) => v.published)?.number).toBe(1);
 
     const history = await db
       .select({ action: auditLog.action, meta: auditLog.meta, actorKind: auditLog.actorKind })

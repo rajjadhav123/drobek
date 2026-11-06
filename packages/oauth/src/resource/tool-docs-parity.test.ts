@@ -1,5 +1,5 @@
 /**
- * DRIFT GUARD (PHY-124, M0-05) — the tools the MCP server ACTUALLY registers
+ * DRIFT GUARD — the tools the MCP server ACTUALLY registers
  * must equal the @drobek/agent-dx manifest (TOOL_DOCS): the same names, the
  * same input field names, the same annotations, and the scope each doc names
  * must be the one TOOL_SCOPES enforces. Add or change a tool without its doc
@@ -10,8 +10,7 @@
  * super-admin-only tools are listed too) is listed over an in-memory
  * MCP client. No DB is touched: listing never runs a tool body.
  */
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 import { describe, expect, it } from 'vitest';
 import { TOOL_DOCS, TOOL_NAMES } from '@drobek/agent-dx';
 import { SCOPES, TOOL_SCOPES } from '../scopes.js';
@@ -21,6 +20,7 @@ import type { AuthContext } from './oauth-resource.js';
 const FULL_SCOPE_CTX: AuthContext = {
   kind: 'oauth',
   credentialId: 'tok_test',
+  oauthClientId: null,
   userId: 'u_test',
   email: 'test@example.com',
   superAdmin: true,
@@ -46,7 +46,7 @@ describe('MCP tools/list ↔ agent-dx TOOL_DOCS parity', () => {
   it('registers exactly the documented tools, in manifest order', async () => {
     const tools = await listedTools();
     expect(tools.map((t) => t.name)).toEqual(TOOL_NAMES);
-    expect(tools).toHaveLength(25);
+    expect(tools).toHaveLength(67);
   });
 
   it('each tool has the documented title, description, annotations and input fields', async () => {

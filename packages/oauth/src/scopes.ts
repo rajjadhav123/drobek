@@ -1,25 +1,50 @@
 /**
- * drobek MCP scope vocabulary + the tool → scope table (M0-04, NSO-282).
+ * drobek MCP scope vocabulary + the tool → scope table.
  *
  * Three scopes, one consent checkbox each. A grant (OAuth token or API key) is
  * bound to a USER; the scope decides WHICH tools exist for it, and the user's
  * membership role in the targeted workspace decides what each call may touch.
  *
- *   read    — look: list apps (+ who am I), get an app, read its files, read skills,
- *             query an app's stored data, read its logs, list its assets and
- *             its custom domains, and (workspace admins) the workspace's proxy
- *             upstreams (NSO-372).
+ *   read    — look: list apps (+ who am I), get an app, read its files and
+ *             page its version history (`list_versions`), read skills,
+ *             query an app's stored data, read its logs and the feedback
+ *             members left on its preview with their screenshots
+             (`list_feedback`, `get_feedback_screenshot`) and the screenshots
+ *             it asked for (`get_screenshot`), list its assets and
+ *             its custom domains, its form submissions, end users and uploads,
+ *             a workspace's members, and (workspace admins) the workspace's
+ *             proxy upstreams and activity log.
  *   write   — change: create apps (also as a copy of a gallery app,
- *             `duplicate_app`, NSO-340), write files (new versions), restore,
+ *             `duplicate_app`), write files (new versions), restore,
+ *             keep a version and delete old versions (`keep_version`,
+ *             `delete_versions`, the clean-up only after the user's yes),
+ *             resolve, reopen or delete a feedback note (`resolve_feedback`,
+ *             `delete_feedback`, the deletion only after the user's yes),
+ *             ask the preview for a screenshot (`request_screenshot`),
  *             configure platform modules, upload (upload URLs) and delete assets,
- *             add, verify and remove custom domains (NSO-366), register and
- *             remove proxy upstreams without a secret (NSO-372).
- *   publish — make a version live at its public URL (the `publish` tool, M0-06),
- *             list it in the public gallery (`set_gallery_listing`, NSO-340) and
- *             choose the primary domain the production address redirects to
- *             (`set_primary_domain`, NSO-366);
+ *             add, verify and remove custom domains, register, stream and
+ *             remove proxy upstreams without a secret, set which sites may
+ *             embed an app, release one's own write lease and delete an app
+ *             (`set_frame_ancestors`, `release_lease`, `delete_app`), and
+ *             change an app's stored data as its owner (`create_records`,
+ *             `update_record`, `delete_record`, `delete_collection`,
+ *             `purge_orphan_records`), delete a form submission or an
+ *             upload, change an end user's role, block them or sign every
+ *             end user out, and remove a module secret (never set one),
+ *             create a team workspace and invite a member by e-mail
+ *             (`create_workspace`, `invite_member`), change a member's role,
+ *             remove a member or leave a workspace, delete a team workspace;
+ *             a super-admin also switches a workspace's opt-in modules
+ *             (`set_workspace_module`).
+ *   publish — make a version live at its public URL (the `publish` tool),
+ *             take it offline again (`unpublish`), choose who can open it
+ *             (`set_visibility`), list it in the public gallery
+ *             (`set_gallery_listing`) and choose the primary domain the
+ *             production address redirects to (`set_primary_domain`);
  *             a super-admin also allows or blocks a workspace's publishing
- *             (`set_workspace_publishing`, NSO-366 — registered for super-admins only).
+ *             (`set_workspace_publishing`), takes an app down or restores it
+ *             (`takedown_app`, `restore_app`) and hides a gallery entry
+ *             (`set_gallery_hidden`) — all registered for super-admins only.
  *
  * `TOOL_SCOPES` is the ONE table both `tools/list` filtering and per-call
  * enforcement read (resource/mcp.ts).
@@ -83,29 +108,84 @@ export const TOOL_SCOPES = {
   skill_info: 'read',
   query_data: 'read',
   get_logs: 'read',
+  get_analytics: 'read',
+  // Feedback on the preview: reading it is a read, resolving or deleting a note an app change.
+  list_feedback: 'read',
+  get_feedback_screenshot: 'read',
+  resolve_feedback: 'write',
+  delete_feedback: 'write',
+  // A screenshot of the preview: asking for one adds a request the people on the preview answer; reading it is a read.
+  request_screenshot: 'write',
+  get_screenshot: 'read',
   list_assets: 'read',
   list_domains: 'read',
   list_upstreams: 'read',
   create_app: 'write',
-  // NSO-340: a copy of a gallery app in the caller's workspace, like create_app.
+  // A copy of a gallery app in the caller's workspace, like create_app.
   duplicate_app: 'write',
   write_files: 'write',
   restore_version: 'write',
+  // The version history: paging it is a read, keeping a version or cleaning old ones up an app change.
+  list_versions: 'read',
+  keep_version: 'write',
+  delete_versions: 'write',
   configure_module: 'write',
+  // A run writes the fetched records into the app's data, like the scheduled run.
+  sync_now: 'write',
   create_asset_upload: 'write',
   delete_asset: 'write',
   add_domain: 'write',
   verify_domain: 'write',
   remove_domain: 'write',
   register_upstream: 'write',
+  set_upstream_streaming: 'write',
   remove_upstream: 'write',
+  // Workspace members: reading them is read, changing a role or removing someone is write.
+  list_members: 'read',
+  set_member_role: 'write',
+  remove_member: 'write',
+  // Deleting a team workspace changes what exists, like the other workspace-admin tools.
+  delete_workspace: 'write',
+  // App lifecycle: embedding, the caller's own lease and deletion (with the user's yes) are app changes.
+  set_frame_ancestors: 'write',
+  release_lease: 'write',
+  delete_app: 'write',
+  // The owner's edits of an app's stored data, like the dashboard's Data tab (editor+).
+  create_records: 'write',
+  update_record: 'write',
+  delete_record: 'write',
+  delete_collection: 'write',
+  purge_orphan_records: 'write',
+  // The owner's module tabs (Forms, Users, Uploads, a module's secrets) and the workspace Activity page.
+  list_form_submissions: 'read',
+  delete_form_submission: 'write',
+  list_end_users: 'read',
+  set_end_user_role: 'write',
+  set_end_user_blocked: 'write',
+  sign_out_end_users: 'write',
+  list_uploads: 'read',
+  delete_upload: 'write',
+  remove_module_secret: 'write',
+  list_activity: 'read',
+  // Taking the production address offline and opening an app to everyone are public exposure, like publishing.
+  unpublish: 'publish',
+  set_visibility: 'publish',
   publish: 'publish',
-  // NSO-340: listing in the public gallery is public exposure, like publishing.
+  // Listing in the public gallery is public exposure, like publishing.
   set_gallery_listing: 'publish',
-  // NSO-366: the primary domain decides where the production address sends every visitor.
+  // The primary domain decides where the production address sends every visitor.
   set_primary_domain: 'publish',
-  // NSO-366: who may publish is decided under the publish scope; @drobek/mcp registers it for super-admins only.
+  // Who may publish is decided under the publish scope; @drobek/mcp registers it for super-admins only.
   set_workspace_publishing: 'publish',
+  // A new team workspace and an e-mailed invite to one change the user's workspaces, like the dashboard's /workspaces.
+  create_workspace: 'write',
+  invite_member: 'write',
+  // Super-admins only (@drobek/mcp): a workspace's opt-in module switch is configuration;
+  // a takedown, its restore and hiding a gallery entry decide what the public sees.
+  set_workspace_module: 'write',
+  takedown_app: 'publish',
+  restore_app: 'publish',
+  set_gallery_hidden: 'publish',
 } as const satisfies Record<string, Scope | null>;
 
 export type ToolName = keyof typeof TOOL_SCOPES;

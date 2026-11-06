@@ -1,5 +1,5 @@
 /**
- * get_logs (M1-07) — the pure half: status classes, the capped compile-error
+ * get_logs — the pure half: status classes, the capped compile-error
  * shape that is stored, and the agent-facing entry shapes of the three kinds
  * (`runtime`, `compile`, `requests`). No DB / no Redis here → unit-tested.
  */
@@ -66,9 +66,14 @@ export interface RuntimeEntry {
   last_seen: string;
   /** The page the latest occurrence fired on (its host tells preview from production). */
   url: string;
+  /** The app version that page was served from (null = unknown, e.g. `module_job`). */
+  version: number | null;
   file_hint: string | null;
   /** The first lines of the latest stack (redacted), when the browser sent one. */
   stack: string | null;
+  /** Type `module_job` only: the platform module and its job whose run failed (url is empty). */
+  module?: string;
+  job?: string;
 }
 
 export function stackHead(stack: string | null, lines = STACK_HEAD_LINES): string | null {
@@ -88,9 +93,22 @@ export function runtimeEntries(errors: DedupedError[], stacks: Map<string, strin
       first_seen: e.firstSeen,
       last_seen: e.lastSeen,
       url: e.lastUrl,
+      version: e.lastVersion,
       file_hint: e.fileHint,
       stack: stackHead(stacks.get(e.dedupKey) ?? null),
+      ...(e.module ? { module: e.module } : {}),
+      ...(e.job ? { job: e.job } : {}),
     }));
+}
+
+// ── render signal ────────────────────────────────────────────────────────────
+
+/** What the beacon reported for one version: page loads and browser errors of its pages. */
+export interface RenderCounts {
+  /** Pages of the version that loaded in a browser (a count only). */
+  page_loads: number;
+  /** Browser errors (uncaught, resource, CSP) reported by pages of the version. */
+  errors: number;
 }
 
 // ── compile ──────────────────────────────────────────────────────────────────
@@ -194,7 +212,7 @@ function topPaths(counts: Map<string, number>): FailingPath[] {
 
 /**
  * Per-day totals + per-module status classes, newest day first, ≤ 100 days.
- * `failing` adds the day's platform-4xx / 5xx paths (NSO-380); the 4xx list
+ * `failing` adds the day's platform-4xx / 5xx paths; the 4xx list
  * also takes the day's file 404s (`path404Counts`).
  */
 export function requestEntries(

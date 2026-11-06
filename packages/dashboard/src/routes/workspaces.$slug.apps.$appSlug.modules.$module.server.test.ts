@@ -1,34 +1,44 @@
 /**
- * The module page's loader + action (M2-02, NSO-291) against a real PGlite
+ * The module page's loader + action against a real PGlite
  * database and a real ModuleRuntime (test modules; the workspace role gate is
  * stubbed — requireWorkspaceRole has its own tests in @drobek/tenancy):
  * form errors per field, pending via the configure path + confirm with audit,
  * write-only secrets (the value in no response, loader data or audit row),
  * the collections / upstreams editors — chosen by the module's declared
- * `dashboard.editor`, never by its name (NSO-347: the fixtures are NOT named
+ * `dashboard.editor`, never by its name (the fixtures are NOT named
  * data / proxy, and a module named `proxy` without the declaration gets the
  * generic form) — "About this module" + error codes, a viewer refused before
- * anything changes.
+ * anything changes, and the choices of fields annotated `x-drobek-choices`
+ * (the workspace's upstreams, the app's collections, the intervals the
+ * workspace's limit allows, the app's forms as names for a new entry), the
+ * limit an empty field stands for, and rule / size / hidden fields saving
+ * through the configure path.
  */
 import { fileURLToPath } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 import { eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/pglite';
 import { migrate } from 'drizzle-orm/pglite/migrator';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as schema from '@drobek/db/schema';
-import { apps, auditLog, moduleConfigs, moduleSecrets, setDbForTests, users, workspaceModules, workspaces } from '@drobek/db';
+import { apps, auditLog, moduleConfigs, moduleSecrets, setDbForTests, upstreams, users, workspaceModules, workspaces } from '@drobek/db';
 import { noopLogger } from '@drobek/core';
 import {
+  ERROR_REPORTER_SLOT,
+  defineErrorReporter,
   defineModule,
   loadModuleRuntime,
   memoryMailGuard,
   memoryRateLimiter,
   setModuleRuntimeForTests,
   z,
+  ModuleError,
+  type ConfigFieldMeta,
   type ModuleRuntime,
+  type SyncRun,
+  type SyncSourceState,
 } from '@drobek/modules';
-import { entryInputs, fieldName, ruleInputName } from '../module-config.js';
+import { BYTES_PER_MB, entryInputs, fieldName, ruleInputName, ruleInputs } from '../module-config.js';
 
 const role = vi.hoisted(() => ({ current: 'editor' as 'viewer' | 'editor' | 'workspace-admin', user: { id: '', email: 'owner@example.com' }, ws: { id: '', slug: 'acme', name: 'Acme' } }));
 
@@ -113,7 +123,7 @@ const gateway = defineModule<{ upstreams: Record<string, { rules: { call: string
       .default({}),
   }),
   configDefaults: { upstreams: {} },
-  // Like the real proxy module: assignments need a workspace ADMIN (NSO-322 H3).
+  // Like the real proxy module: assignments need a workspace ADMIN.
   confirmRequired: (b, a) =>
     Object.keys(a.upstreams)
       .filter((n) => !b.upstreams[n])
@@ -140,7 +150,7 @@ const proxy = defineModule<{ upstreams: Record<string, { url: string; retries?: 
   configDefaults: { upstreams: {}, slow: false },
 });
 
-/** NSO-346: an opt-in module — off for the workspace until a workspace_modules row enables it. */
+/** An opt-in module — off for the workspace until a workspace_modules row enables it. */
 const vault = defineModule<{ shelf: string }>({
   name: 'vault',
   version: '1.0.0',
@@ -148,6 +158,170 @@ const vault = defineModule<{ shelf: string }>({
   skill: { useWhen: 'the app needs the firm vault', markdown: '# vault' },
   configSchema: z.strictObject({ shelf: z.string().max(20) }),
   configDefaults: { shelf: 'main' },
+});
+
+/**
+ * A scheduled-import module under another name — the sources panel
+ * follows the declared `sync` authority. Its state lives in memory: `FAILED`
+ * holds the sources paused after failed runs.
+ */
+const FAILED = new Set<string>();
+const IMPORT_RUNS: SyncRun[] = [];
+const importer = defineModule<{ sources: Record<string, { upstream: string; paused?: boolean }> }>({
+  name: 'importer',
+  version: '1.0.0',
+  contract: '^1.2',
+  skill: { useWhen: 'you import a feed on a schedule', markdown: '# importer' },
+  configSchema: z.strictObject({ sources: z.record(z.string(), z.strictObject({ upstream: z.string(), paused: z.boolean().optional() })).default({}) }),
+  configDefaults: { sources: {} },
+  sync: {
+    sources: async ({ config }) =>
+      Object.keys(config.sources)
+        .sort()
+        .map(
+          (name): SyncSourceState => ({
+            name,
+            upstream: config.sources[name].upstream,
+            path: '/feed',
+            collection: 'items',
+            mode: 'replace',
+            every: '15m',
+            paused: config.sources[name].paused ? 'owner' : FAILED.has(name) ? 'failures' : null,
+            failures: FAILED.has(name) ? 5 : 0,
+            last_run_at: FAILED.has(name) ? '2026-09-29T10:00:00.000Z' : null,
+            last_status: FAILED.has(name) ? 'failed' : null,
+            last_records: null,
+            last_error: FAILED.has(name) ? 'the upstream answered HTTP 401' : null,
+            last_success_at: null,
+            next_run_at: null,
+          })
+        ),
+    runs: async () => IMPORT_RUNS,
+    runNow: async (ctx, source) => {
+      if (source === 'hot') throw new ModuleError('rate_limited', 'The source "hot" ran by hand 2 times this minute (SYNC_NOW_PER_MINUTE) — wait 30 s.');
+      const run: SyncRun = {
+        source,
+        trigger: 'manual',
+        started_at: new Date().toISOString(),
+        duration_ms: 1,
+        status: source === 'broken' ? 'failed' : 'ok',
+        records: source === 'broken' ? null : 4,
+        error: source === 'broken' ? 'the upstream answered HTTP 500' : null,
+      };
+      IMPORT_RUNS.unshift(run);
+      await ctx.audit('run', { source, status: run.status });
+      return run;
+    },
+    resume: async (_view, source) => FAILED.delete(source),
+  },
+});
+
+/** A module whose fields take their choices from the workspace and the app (`x-drobek-choices`). */
+const feeder = defineModule<{ sources: Record<string, { upstream: string; collection: string; every: string }> }>({
+  name: 'feeder',
+  version: '1.0.0',
+  skill: { useWhen: 'you feed a collection from an API', markdown: '# feeder' },
+  dashboard: { title: 'Feeds', description: 'Fills a collection from an upstream on a schedule.' },
+  limits: [{ env: 'FEEDER_MIN_INTERVAL_MIN', default: 15, meaning: 'the shortest feed interval, in minutes' }],
+  configSchema: z.strictObject({
+    sources: z
+      .record(
+        z.string().meta({ title: 'Feed name' }),
+        z.strictObject({
+          upstream: z.string().min(1).meta({ title: 'Upstream', 'x-drobek-choices': 'upstreams' } satisfies ConfigFieldMeta),
+          collection: z.string().min(1).meta({ title: 'Collection', 'x-drobek-choices': 'collections' } satisfies ConfigFieldMeta),
+          every: z
+            .string()
+            .default('1h')
+            .meta({ title: 'Schedule', 'x-drobek-choices': 'intervals', 'x-drobek-min-interval': 'FEEDER_MIN_INTERVAL_MIN' } satisfies ConfigFieldMeta),
+        })
+      )
+      .default({}),
+  }),
+  configDefaults: { sources: {} },
+});
+
+/** A module that receives webhooks: its secrets follow its config, its endpoints come from the declared `webhooks` authority. */
+const hooks = defineModule<{ endpoints: Record<string, { collection: string }> }>({
+  name: 'hooks',
+  version: '1.0.0',
+  contract: '^1.3',
+  skill: { useWhen: 'another service posts events to the app', markdown: '# hooks' },
+  configSchema: z.object({ endpoints: z.record(z.string(), z.object({ collection: z.string() })).default({}) }),
+  configDefaults: { endpoints: {} },
+  secretsFor: (config) => Object.keys(config.endpoints).map((n) => ({ name: `HOOK_${n.toUpperCase()}`, description: `The secret of ${n}`, required: true })),
+  webhooks: {
+    endpoints: async ({ config, app }) =>
+      Object.entries(config.endpoints).map(([name, e]) => ({
+        name,
+        url: `https://${app.slug}.apps.example/__drobek/v1/hooks/${name}`,
+        collection: e.collection,
+        verify: 'hmac-sha256',
+        signed: true,
+        secret: `HOOK_${name.toUpperCase()}`,
+        enabled: true,
+        last_delivery_at: null,
+        last_status: null,
+      })),
+    deliveries: async () => [
+      { endpoint: 'pay', status: 'rejected_signature', http_status: 401, bytes: 10, reason: 'bad_signature', record_id: null, received_at: new Date(0).toISOString() },
+    ],
+  },
+});
+
+/** An operator-only module: no skill, only the core-hosted errors.reporter slot. */
+const sentinel = defineModule({
+  name: 'sentinel',
+  version: '1.0.0',
+  contract: '^1.2',
+  configSchema: z.object({}),
+  configDefaults: {},
+  contributes: { [ERROR_REPORTER_SLOT]: defineErrorReporter({ id: 'sentinel', label: 'Sentinel', report: () => {} }) },
+});
+
+/** A form-submissions module under another name: its forms come from the declared `submissions` authority. */
+const LEADS_FORMS = [
+  { name: 'contact', submissions: 3 },
+  { name: 'order', submissions: 0 },
+];
+const leadRule = z.string().regex(/^(public|user|owner|admin|none)(\|(public|user|owner|admin|none))*$/);
+const leads = defineModule<{
+  rules: { submit: string };
+  maxBytes?: number;
+  forms: Record<string, { note?: string; paused?: boolean }>;
+}>({
+  name: 'leads',
+  version: '1.0.0',
+  contract: '^1.2',
+  skill: { useWhen: 'visitors leave their contact', markdown: '# leads' },
+  limits: [{ env: 'LEADS_MAX_BYTES', default: 10 * 1024 * 1024, meaning: 'bytes of one attachment' }],
+  configSchema: z.strictObject({
+    rules: z
+      .strictObject({ submit: leadRule.default('public').meta({ title: 'Who may submit', 'x-drobek-rule': ['public', 'user', 'admin'] } satisfies ConfigFieldMeta) })
+      .default({ submit: 'public' }),
+    maxBytes: z
+      .int()
+      .min(1)
+      .max(100 * 1024 * 1024)
+      .optional()
+      .meta({ title: 'Largest attachment', 'x-drobek-unit': 'bytes', 'x-drobek-default-limit': 'LEADS_MAX_BYTES' } satisfies ConfigFieldMeta),
+    forms: z
+      .record(
+        z.string().regex(/^[a-z]+$/).meta({ title: 'Form name', 'x-drobek-choices': 'forms' } satisfies ConfigFieldMeta),
+        z.strictObject({ note: z.string().optional(), paused: z.boolean().optional().meta({ 'x-drobek-hidden': true } satisfies ConfigFieldMeta) })
+      )
+      .default({}),
+  }),
+  configDefaults: { rules: { submit: 'public' }, forms: {} },
+  submissions: {
+    forms: async ({ config }) => {
+      const names = new Set([...LEADS_FORMS.map((f) => f.name), ...Object.keys(config.forms)]);
+      return [...names].sort().map((name) => ({ name, submissions: LEADS_FORMS.find((f) => f.name === name)?.submissions ?? 0 }));
+    },
+    list: async () => ({ submissions: [], next_cursor: null, total: 0 }),
+    csv: async function* () {},
+    remove: async () => false,
+  },
 });
 
 let pg: PGlite;
@@ -204,7 +378,7 @@ beforeAll(async () => {
   rt = await loadModuleRuntime({
     env: ENV,
     log: noopLogger,
-    modules: [shop, store, gateway, proxy, vault],
+    modules: [shop, store, gateway, proxy, vault, importer, feeder, sentinel, leads, hooks],
     skillsDir: null,
     deps: {
       rateLimit: memoryRateLimiter(),
@@ -235,7 +409,24 @@ function drizzleDb() {
   return drizzle(pg, { schema });
 }
 
-describe('the module page (M2-02)', () => {
+describe('the webhooks panel', () => {
+  it('lists each endpoint with its address and whether its secret is set; the secret named by the config is set write-only', async () => {
+    expect((await load('shop')).webhooks).toBeNull();
+    const empty = await load('hooks');
+    expect(empty.webhooks).toEqual({ endpoints: [], deliveries: expect.any(Array) });
+    expect(empty.secrets).toEqual([]);
+    await rt.configure({ app: { id: appId, slug: 'shop-app', workspaceId: role.ws!.id, workspaceSlug: 'acme' }, module: 'hooks', patch: { endpoints: { pay: { collection: 'payments' } } }, actorUserId: role.user!.id });
+    const d = await load('hooks');
+    expect(d.webhooks!.endpoints).toEqual([expect.objectContaining({ name: 'pay', url: 'https://shop-app.apps.example/__drobek/v1/hooks/pay', secret: 'HOOK_PAY', hasSecret: false })]);
+    expect(d.webhooks!.deliveries).toEqual([expect.objectContaining({ status: 'rejected_signature', reason: 'bad_signature' })]);
+    expect(d.secrets).toEqual([expect.objectContaining({ name: 'HOOK_PAY', required: true, hasSecret: false })]);
+    expect(doneOf(await post('hooks', { intent: 'set-secret', secret: 'HOOK_PAY', value: 'v'.repeat(24) }))).toBe('secret-set');
+    expect((await load('hooks')).webhooks?.endpoints?.[0]?.hasSecret).toBe(true);
+    expect(failed(await post('hooks', { intent: 'set-secret', secret: 'HOOK_OTHER', value: 'v'.repeat(24) })).status).toBe(400);
+  });
+});
+
+describe('the module page', () => {
   it('loader: the generated form, the secrets as status only, the banner; unknown module / app → 404', async () => {
     const d = await load();
     expect(d.module).toMatchObject({ name: 'shop', confirms: true });
@@ -250,6 +441,12 @@ describe('the module page (M2-02)', () => {
     expect(d.banner).toMatchObject({ count: 0 });
     expect(d.canEdit).toBe(true);
     await expect(load('nope')).rejects.toMatchObject({ init: { status: 404 } });
+  });
+
+  it('an operator-only module (no skill) has no page: the loader and every POST answer 404', async () => {
+    expect(rt.get('sentinel')).toBeDefined();
+    await expect(load('sentinel')).rejects.toMatchObject({ init: { status: 404 } });
+    await expect(post('sentinel', { intent: 'save-config' })).rejects.toMatchObject({ init: { status: 404 } });
   });
 
   it('save-config: out-of-schema input → 400 with the error at the field (nothing stored); a safe change applies', async () => {
@@ -301,6 +498,39 @@ describe('the module page (M2-02)', () => {
     expect((await load()).values.access).toBe('user');
   });
 
+  it("a relaxation saved while an agent's change waits joins it (done=merged): one diff, Reject drops both", async () => {
+    const hook = { id: appId, slug: 'shop-app', workspaceId: role.ws.id, workspaceSlug: role.ws.slug };
+    await rt.configure({ app: hook, module: 'store', patch: { collections: { notes: {}, board: {} } }, actorUserId: role.user.id });
+    const agent = await rt.configure({ app: hook, module: 'store', patch: { collections: { notes: { rules: { create: 'public' } } } }, actorUserId: role.user.id });
+    expect(agent.applied).toBe(false);
+
+    const checks = { [ruleInputName('read', 'owner')]: 'on', [ruleInputName('create', 'public')]: 'on' };
+    expect(doneOf(await post('store', { intent: 'save-collection', collection: 'board', schema: '', ...checks }))).toBe('merged');
+    const d = await load('store');
+    expect(d.pending?.changes.map((c) => c.text).sort()).toEqual([
+      'data.collections.board.rules.create: → "public"',
+      'data.collections.notes.rules.create: → "public"',
+    ]);
+    expect(d.pending?.diff.map((x) => x.path)).toEqual(expect.arrayContaining(['collections.board.rules.create', 'collections.notes.rules.create']));
+    expect(d.collections.map((c) => [c.name, c.rules.create])).toEqual([
+      ['board', 'user'],
+      ['notes', 'user'],
+    ]);
+
+    expect(doneOf(await post('store', { intent: 'reject' }))).toBe('rejected');
+    const after = await load('store');
+    expect(after.pending).toBeNull();
+    expect(after.collections.map((c) => [c.name, c.rules.create])).toEqual([
+      ['board', 'user'],
+      ['notes', 'user'],
+    ]);
+    const rows = await drizzleDb().select().from(auditLog);
+    expect(rows.filter((r) => r.action === 'module.pending').map((r) => [r.actorKind, (r.meta as { merged_with_pending?: unknown }).merged_with_pending])).toEqual([
+      ['agent', undefined],
+      ['user', ['data.collections.notes.rules.create: → "public"']],
+    ]);
+  });
+
   it('secrets are write-only: set, rotate, remove — the value is in no response, loader data or audit row', async () => {
     const set = await post('shop', { intent: 'set-secret', secret: 'SHOP_KEY', value: SECRET_VALUE });
     expect(doneOf(set)).toBe('secret-set');
@@ -344,7 +574,7 @@ describe('the module page (M2-02)', () => {
     expect(await drizzleDb().select().from(moduleSecrets)).toEqual([]);
   });
 
-  it('a taken-down app (NSO-293): the banner, every change → 423 app_locked_by_admin, reject still allowed', async () => {
+  it('a taken-down app: the banner, every change → 423 app_locked_by_admin, reject still allowed', async () => {
     await drizzleDb().update(apps).set({ lockedReason: 'phishing' }).where(eq(apps.id, appId));
     try {
       expect((await load()).header.lockedByAdmin).toMatchObject({ reason: 'phishing' });
@@ -383,7 +613,7 @@ describe('the module page (M2-02)', () => {
       { path: 'upstreams.weather.rateLimit', before: '(not set)', after: '30' },
       { path: 'upstreams.weather.rules.call', before: '(not set)', after: '"user"' },
     ]);
-    // Only a workspace admin confirms it (NSO-322 H3): the editor sees why, and confirm is refused.
+    // Only a workspace admin confirms it: the editor sees why, and confirm is refused.
     expect(d.pending).toMatchObject({ confirmRole: 'admin', canConfirm: false });
     const refused = failed(await post('gateway', { intent: 'confirm' }));
     expect(refused.status).toBe(403);
@@ -501,7 +731,7 @@ describe('the module page (M2-02)', () => {
   });
 });
 
-describe('an opt-in module not enabled for the workspace (NSO-346)', () => {
+describe('an opt-in module not enabled for the workspace', () => {
   it('the page says so instead of the form, and every change answers 404 until it is enabled', async () => {
     const db = drizzleDb();
     expect((await load('vault')).enabled).toBe(false);
@@ -518,5 +748,228 @@ describe('an opt-in module not enabled for the workspace (NSO-346)', () => {
     } finally {
       await db.delete(workspaceModules);
     }
+  });
+});
+
+describe('the sources of a scheduled-import module', () => {
+  const configureImporter = (sources: Record<string, unknown>) =>
+    rt.configure({ app: { id: appId, slug: 'shop-app', workspaceId: role.ws.id, workspaceSlug: 'acme' }, module: 'importer', patch: { sources }, actorUserId: role.user.id, surface: 'web' });
+
+  beforeEach(() => {
+    FAILED.clear();
+    IMPORT_RUNS.length = 0;
+  });
+
+  it('only the module that declares sync gets the panel: sources, the latest runs, an empty list apart from a loading error', async () => {
+    expect((await load('shop')).sync).toBeNull();
+    const empty = await load('importer');
+    expect(empty.sync).toEqual({ sources: [], runs: [] });
+    await configureImporter({ feed: { upstream: 'news' } });
+    const d = await load('importer');
+    expect(d.sync!.sources!.map((s) => [s.name, s.upstream, s.paused])).toEqual([['feed', 'news', null]]);
+  });
+
+  it('Run now: an ok run, a failed run (not an error), a refusal at the source; the audit names the person', async () => {
+    await configureImporter({ feed: { upstream: 'news' }, broken: { upstream: 'news' }, hot: { upstream: 'news' } });
+    expect(doneOf(await post('importer', { intent: 'sync-run', source: 'feed' }))).toBe('sync-ran');
+    expect(doneOf(await post('importer', { intent: 'sync-run', source: 'broken' }))).toBe('sync-failed');
+    const refused = failed(await post('importer', { intent: 'sync-run', source: 'hot' }));
+    expect(refused.status).toBe(429);
+    expect(refused.errors).toMatchObject({ intent: 'sync-run', target: 'hot', general: [expect.stringMatching(/SYNC_NOW_PER_MINUTE/)] });
+    expect(failed(await post('importer', { intent: 'sync-run', source: 'ghost' })).status).toBe(404);
+    expect((await load('importer')).sync!.runs.map((r) => [r.source, r.status])).toEqual([
+      ['broken', 'failed'],
+      ['feed', 'ok'],
+    ]);
+    const rows = await drizzleDb().select().from(auditLog).where(eq(auditLog.action, 'importer.run'));
+    expect(rows.map((r) => [r.actorUserId, r.actorKind, (r.meta as { by: string }).by])).toEqual([
+      [role.user.id, 'user', 'web'],
+      [role.user.id, 'user', 'web'],
+    ]);
+  });
+
+  it("Pause sets the source's paused key directly; Resume removes it", async () => {
+    await configureImporter({ feed: { upstream: 'news' } });
+    expect(doneOf(await post('importer', { intent: 'sync-pause', source: 'feed' }))).toBe('sync-paused');
+    expect((await load('importer')).sync!.sources![0].paused).toBe('owner');
+    expect(doneOf(await post('importer', { intent: 'sync-resume', source: 'feed' }))).toBe('sync-resumed');
+    expect((await load('importer')).sync!.sources![0].paused).toBeNull();
+    const [row] = await drizzleDb().select().from(moduleConfigs).where(eq(moduleConfigs.module, 'importer'));
+    expect(row.config).toEqual({ sources: { feed: { upstream: 'news' } } });
+  });
+
+  it('a source paused after failed runs: the banner on every app page, Resume clears it (audited)', async () => {
+    await configureImporter({ feed: { upstream: 'news' } });
+    FAILED.add('feed');
+    const shopPage = await load('shop');
+    expect(shopPage.syncBanner).toEqual({
+      paused: [{ name: 'feed', failures: 5, error: 'the upstream answered HTTP 401' }],
+      href: '/workspaces/acme/apps/shop-app/modules/importer#sync',
+    });
+    expect((await load('importer')).sync!.sources![0].paused).toBe('failures');
+    expect(doneOf(await post('importer', { intent: 'sync-resume', source: 'feed' }))).toBe('sync-resumed');
+    expect((await load('shop')).syncBanner).toBeNull();
+    const [audit] = await drizzleDb().select().from(auditLog).where(eq(auditLog.action, 'importer.resume'));
+    expect(audit).toMatchObject({ actorUserId: role.user.id, actorKind: 'user', meta: { module: 'importer', source: 'feed' } });
+  });
+
+  it('another module has no sources to run; a viewer is refused before anything runs', async () => {
+    expect(failed(await post('shop', { intent: 'sync-run', source: 'feed' })).status).toBe(400);
+    await configureImporter({ feed: { upstream: 'news' } });
+    role.current = 'viewer';
+    await expect(post('importer', { intent: 'sync-run', source: 'feed' })).rejects.toMatchObject({ status: 403 });
+    expect(IMPORT_RUNS).toEqual([]);
+  });
+});
+
+describe('fields with choices (x-drobek-choices)', () => {
+  const hookApp = () => ({ id: appId, slug: 'shop-app', workspaceId: role.ws.id, workspaceSlug: 'acme' });
+  const values = (list: { groups: { options: { value: string }[] }[] }) => list.groups.flatMap((g) => g.options.map((o) => o.value));
+  const register = (workspaceId: string, name: string) =>
+    drizzleDb().insert(upstreams).values({ workspaceId, name, baseUrl: `https://${name}.example`, allowedMethods: ['GET'], allowedPathPrefixes: ['/'] });
+
+  afterEach(async () => {
+    await drizzleDb().delete(upstreams);
+  });
+
+  it('the module page names the module by its title; a module without annotated fields loads no choices', async () => {
+    const d = await load('feeder');
+    expect(d.module).toMatchObject({ name: 'feeder', title: 'Feeds', description: 'Fills a collection from an upstream on a schedule.' });
+    expect((await load('shop')).choices).toEqual({});
+    expect((await load('shop')).module).toMatchObject({ title: null, description: null });
+  });
+
+  it('nothing set up yet: each field says what to set up first and links there; the intervals start at the workspace minimum', async () => {
+    const d = await load('feeder');
+    expect(Object.keys(d.choices).sort()).toEqual(['collections', 'intervals:FEEDER_MIN_INTERVAL_MIN', 'upstreams']);
+    expect(d.choices.upstreams.groups).toEqual([]);
+    expect(d.choices.upstreams.empty).toEqual({
+      text: 'This workspace has no upstream yet. A workspace admin registers one on the Upstreams page; then assign it to this app in the gateway module.',
+      link: { href: '/workspaces/acme/upstreams', label: 'Open the Upstreams page' },
+    });
+    expect(values(d.choices.collections)).toEqual([]);
+    expect(d.choices.collections.empty).toEqual({
+      text: 'This app has no data collection yet. Create one in the store module first.',
+      link: { href: '/workspaces/acme/apps/shop-app/modules/store#collections', label: 'Create a collection' },
+    });
+    expect(values(d.choices['intervals:FEEDER_MIN_INTERVAL_MIN'])).toEqual(['15m', '30m', '1h', '3h', '6h', '12h', '24h']);
+  });
+
+  it("the workspace's upstreams, those assigned to the app first (never another workspace's), and the app's collections", async () => {
+    const [other] = await drizzleDb().insert(workspaces).values({ kind: 'team', slug: 'other-ws', name: 'Other' }).returning();
+    await register(role.ws.id, 'weather');
+    await register(role.ws.id, 'news');
+    await register(other.id, 'secret-feed');
+    await rt.configure({ app: hookApp(), module: 'store', patch: { collections: { players: {}, fixtures: {} } }, actorUserId: role.user.id, surface: 'web' });
+    await rt.configure({ app: hookApp(), module: 'gateway', patch: { upstreams: { weather: {} } }, actorUserId: role.user.id, surface: 'web' });
+    await rt.confirm({ app: hookApp(), module: 'gateway', userId: role.user.id, role: 'admin' });
+
+    const d = await load('feeder');
+    expect(d.choices.upstreams.groups).toEqual([
+      { label: 'Assigned to this app', options: [{ value: 'weather', label: 'weather' }] },
+      { label: 'Not assigned to this app yet', options: [{ value: 'news', label: 'news' }] },
+    ]);
+    expect(d.choices.upstreams.note?.link).toEqual({ href: '/workspaces/acme/apps/shop-app/modules/gateway#upstreams', label: 'Assign an upstream' });
+    expect(JSON.stringify(d.choices)).not.toContain('secret-feed');
+    expect(values(d.choices.collections)).toEqual(['fixtures', 'players']);
+    await drizzleDb().delete(workspaces).where(eq(workspaces.id, other.id));
+  });
+
+  it('a value picked from the selects saves through the configure path; the schema still decides what is valid', async () => {
+    await register(role.ws.id, 'weather');
+    const prefix = entryInputs.prefix('sources', 0);
+    const form = (upstream: string) => ({
+      intent: 'save-config',
+      [entryInputs.count('sources')]: '1',
+      [entryInputs.isNew('sources', 0)]: '1',
+      [entryInputs.key('sources', 0)]: 'scores',
+      [fieldName(`${prefix}.upstream`)]: upstream,
+      [fieldName(`${prefix}.collection`)]: 'players',
+      [fieldName(`${prefix}.every`)]: '30m',
+    });
+    const bad = failed(await post('feeder', form('')));
+    expect(bad.status).toBe(400);
+    expect(bad.errors.fields.sources?.[0]).toMatch(/upstream/);
+    expect(doneOf(await post('feeder', form('weather')))).toBe('applied');
+    const [row] = await drizzleDb().select().from(moduleConfigs).where(eq(moduleConfigs.module, 'feeder'));
+    expect(row.config).toEqual({ sources: { scores: { upstream: 'weather', collection: 'players', every: '30m' } } });
+    expect((await load('feeder')).values.sources).toMatchObject({ entries: [{ key: 'scores', values: { upstream: 'weather', collection: 'players', every: '30m' } }] });
+  });
+});
+
+describe('rule, size and hidden fields; names suggested for a new entry', () => {
+  const hookApp = () => ({ id: appId, slug: 'shop-app', workspaceId: role.ws.id, workspaceSlug: 'acme' });
+  const stored = async () => (await rt.moduleView(hookApp(), 'leads')).stored as Record<string, unknown> | null;
+  const seed = (patch: unknown) => rt.configure({ app: hookApp(), module: 'leads', patch, actorUserId: role.user.id, surface: 'web' });
+
+  /** The form as the page posts it for the config in force, with `change` applied (null removes an input). */
+  const untouched = async (change: Record<string, string | null> = {}) => {
+    const d = await load('leads');
+    const forms = d.values.forms as { entries: { key?: string; values: Record<string, string> }[] };
+    const body: Record<string, string> = { intent: 'save-config' };
+    const rule = String(d.values['rules.submit']);
+    body[ruleInputs.shown('rules.submit')] = rule;
+    for (const p of rule.split('|')) if (p !== 'none') body[ruleInputs.principal('rules.submit', p as 'public')] = 'on';
+    body[fieldName('maxBytes')] = String(d.values.maxBytes);
+    body[entryInputs.count('forms')] = String(forms.entries.length);
+    forms.entries.forEach((e, i) => {
+      body[entryInputs.key('forms', i)] = e.key ?? '';
+      body[fieldName(`forms[${i}].note`)] = e.values.note;
+      body[fieldName(`forms[${i}].paused`)] = e.values.paused;
+    });
+    for (const [k, v] of Object.entries(change)) {
+      if (v === null) delete body[k];
+      else body[k] = v;
+    }
+    return post('leads', body);
+  };
+
+  it("loader: the app's forms from the module declaring submissions, and the workspace's value of the limit an empty field stands for", async () => {
+    const d = await load('leads');
+    expect(d.choices.forms.groups).toEqual([
+      {
+        options: [
+          { value: 'contact', label: 'contact', detail: '3 submissions' },
+          { value: 'order', label: 'order', detail: 'no submissions yet' },
+        ],
+      },
+    ]);
+    expect(d.limits).toEqual({ LEADS_MAX_BYTES: 10 * BYTES_PER_MB });
+    expect((await load('shop')).limits).toEqual({});
+    const fields = d.fields.map((f) => [f.path, f.kind]);
+    expect(fields).toEqual([
+      ['rules', 'object'],
+      ['maxBytes', 'integer'],
+      ['forms', 'record'],
+    ]);
+  });
+
+  it('an untouched form saves nothing — a hidden paused, a rule written in another order and an odd byte count included', async () => {
+    await seed({ rules: { submit: 'admin|user' }, maxBytes: 5_000_000, forms: { contact: { note: 'Sales', paused: true } } });
+    const before = await stored();
+    expect(doneOf(await untouched())).toBe('unchanged');
+    expect(await stored()).toEqual(before);
+  });
+
+  it('a change to another field keeps the hidden value; MB typed in are stored as bytes; checked principals make the rule', async () => {
+    await seed({ forms: { contact: { note: 'Sales', paused: true } } });
+    const done = doneOf(
+      await untouched({
+        [fieldName('maxBytes')]: '2.5',
+        [fieldName('forms[0].note')]: 'Leads',
+        [ruleInputs.principal('rules.submit', 'public')]: null,
+        [ruleInputs.principal('rules.submit', 'user')]: 'on',
+      })
+    );
+    expect(done).toBe('applied');
+    expect(await stored()).toMatchObject({ rules: { submit: 'user' }, maxBytes: 2.5 * BYTES_PER_MB, forms: { contact: { note: 'Leads', paused: true } } });
+  });
+
+  it('a size the schema refuses comes back in MB words at its field, nothing stored', async () => {
+    const bad = failed(await untouched({ [fieldName('maxBytes')]: '500' }));
+    expect(bad.status).toBe(400);
+    expect(bad.errors.fields).toEqual({ maxBytes: ['At most 100 MB.'] });
+    expect(bad.errors.values?.maxBytes).toBe('500');
+    expect((await stored()) ?? {}).toEqual({});
   });
 });

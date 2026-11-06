@@ -1,5 +1,5 @@
 /**
- * The upload URL endpoint (NSO-358): `/api/assets/upload/<token>` on the
+ * The upload URL endpoint: `/api/assets/upload/<token>` on the
  * DASHBOARD host (never an app host), mounted by apps/server before React
  * Router. Typed on node:http only, so Express req/res fit.
  *
@@ -7,15 +7,15 @@
  *        credential: it is taken (single use) before a byte is read; the
  *        user it was issued for must STILL be an editor of the app's
  *        workspace (or a super-admin) — a member removed or demoted since
- *        cannot complete an upload with an earlier link (403 forbidden,
- *        NSO-362). Then the body streams through storeAsset (size, type,
+ *        cannot complete an upload with an earlier link (403 forbidden). Then the body streams through storeAsset (size, type,
  *        quota, audit as that user) into the app's DRAFT assets — the
  *        production host shows it after the next publish. 201 `{ name, path,
  *        size, type, replaced }`; a refusal is `{ code, message, hint,
  *        …details }` with its status (404 upload_token_invalid, 403
  *        forbidden, 413 asset_too_large /
  *        asset_quota_exceeded, 415 asset_type_not_allowed, 400
- *        asset_size_mismatch, 423 app_locked_by_admin). A refusal sent while
+ *        asset_size_mismatch, 423 app_locked_by_admin; 503 busy with
+ *        `reason: database_timeout` when the database cut a query off). A refusal sent while
  *        the body is still arriving closes the connection after the answer
  *        (closeAfterResponse) instead of reading the rest.
  *   GET  a small page with a file picker that PUTs to the same URL — for a
@@ -27,7 +27,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { closeAfterResponse, createConsoleLogger, requestBodyStream, type Logger } from '@drobek/core';
 import { and, eq, inArray } from 'drizzle-orm';
-import { dbErrorForLog, getDb, memberships, users } from '@drobek/db';
+import { dbErrorForLog, getDb, isQueryTimeout, memberships, users } from '@drobek/db';
 import type { AssetLimits } from './config.js';
 import type { AssetDisk } from './disk.server.js';
 import { AssetsError } from './errors.js';
@@ -56,7 +56,7 @@ type NodeHandler = (req: IncomingMessage, res: ServerResponse) => void;
 /**
  * Is `userId` still an editor+ of `workspaceId` — or a super-admin
  * (SUPERADMIN_EMAIL, the global flag; @drobek/auth cannot be imported here)?
- * Checked when an upload URL is USED, not only when it was issued (NSO-362).
+ * Checked when an upload URL is USED, not only when it was issued.
  */
 export async function uploaderMayEdit(userId: string, workspaceId: string, env: NodeJS.ProcessEnv = process.env): Promise<boolean> {
   const db = getDb();
@@ -189,6 +189,15 @@ export function createAssetUploadHandler(opts: AssetUploadHandlerOptions): NodeH
       }
       if (!req.complete && !req.readableEnded && req.destroyed) return; // the uploader went away mid-body
       log.error('asset upload failed', { error: dbErrorForLog(err, { stack: true }) });
+      if (isQueryTimeout(err)) {
+        sendJson(req, res, 503, {
+          code: 'busy',
+          reason: 'database_timeout',
+          message: 'The database did not answer in time (the server is under load), so the upload was not stored. Ask for a new upload URL and retry in a moment.',
+          hint: opts.hint('busy'),
+        });
+        return;
+      }
       sendJson(req, res, 500, {
         code: 'internal_error',
         message: 'drobek hit an internal error while storing the upload. Ask for a new upload URL and retry once.',

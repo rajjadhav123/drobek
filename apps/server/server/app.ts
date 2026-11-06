@@ -1,7 +1,8 @@
-import { ASSET_UPLOAD_PATH_PREFIX } from '@drobek/apps';
+import { ASSET_UPLOAD_PATH_PREFIX, SCREENSHOT_UPLOAD_PATH_PREFIX } from '@drobek/apps';
 import { createOriginCheckMiddleware } from '@drobek/auth';
-import { coreVersion } from '@drobek/core';
-import { mountMcpResource } from '@drobek/oauth/resource';
+import { coreVersion, dashboardMaxBodyBytes, reportError, withBodyLimit } from '@drobek/core';
+import { hasOwnBodyLimit } from '@drobek/dashboard/body-limits';
+import { mountMcpResource, type McpEndpoint } from '@drobek/oauth/resource';
 import { TLS_ASK_PATH, createAppsHostMiddleware, createTlsAskHandler } from '@drobek/serving';
 import express, {
   type Express,
@@ -22,43 +23,60 @@ export interface ServerAppOptions {
   /** Absolute path of `build/client` — served statically in production. */
   clientDir?: string;
   /**
-   * The app-host dispatcher (M0-06). Default: a fresh one from APPS_DOMAIN +
+   * The app-host dispatcher. Default: a fresh one from APPS_DOMAIN +
    * PUBLIC_APP_URL; index.ts passes one whose cache is wired to the
    * app-changed events.
    */
   appsHost?: RequestHandler;
-  /** Caddy's on-demand TLS `ask` handler (M0-07). Default: from TLS_ASK_TOKEN. */
+  /** Caddy's on-demand TLS `ask` handler. Default: from TLS_ASK_TOKEN. */
   tlsAsk?: RequestHandler;
   /**
-   * NSO-358: the asset upload URL endpoint (`/api/assets/upload/<token>`,
+   * The asset upload URL endpoint (`/api/assets/upload/<token>`,
    * @drobek/apps createAssetUploadHandler). Absent → not mounted.
    */
   assetUpload?: RequestHandler;
+  /**
+   * The screenshot answer endpoint (`/api/screenshots/<request_id>`,
+   * @drobek/apps createScreenshotUploadHandler). Absent → not mounted.
+   */
+  screenshotUpload?: RequestHandler;
+  /** The request body cap in front of React Router. Default: DASHBOARD_MAX_BODY_BYTES. */
+  maxBodyBytes?: number;
 }
 
+/** The server's Express app plus the handle on its open MCP sessions (index.ts closes them on shutdown). */
+export type ServerApp = Express & { mcp: McpEndpoint };
+
 /**
- * The single drobek process (M0-01): one Express app serves the dashboard +
+ * The single drobek process: one Express app serves the dashboard +
  * OAuth 2.1 AS (React Router) and the OAuth-protected MCP resource at `/mcp`.
  *
  * Order matters:
- *  1. the app-host dispatcher (M0-06) runs FIRST: a request whose Host is an
+ *  1. the app-host dispatcher runs FIRST: a request whose Host is an
  *     app host (`<slug>[--preview|--v<N>].<APPS_DOMAIN>`) is answered there and
  *     never reaches anything below — no dashboard route, no /mcp, no session
  *     code. The dashboard host never serves app files (there is no app route).
- *  2. the asset upload URLs (NSO-358, `/api/assets/upload/<token>`): the
+ *  2. the asset upload URLs (`/api/assets/upload/<token>`): the
  *     token in the path is the whole authorization (single use, no cookie is
  *     read), so they sit before the Origin check — `curl -T` sends no Origin;
+ *     likewise the screenshot answers (`/api/screenshots/<request_id>`): the
+ *     one-time token in the body is the credential, the preview's page posts
+ *     cross-origin without cookies, and the handler checks the Origin itself
+ *     (only the app's own hosts) and caps its body at SCREENSHOT_MAX_BYTES;
  *  3. the Origin check (CSRF) for every mutating dashboard request;
- *  4. health/version, Caddy's TLS `ask` endpoint (M0-07 — token-guarded,
- *     internal network only, blocked by Caddy on every public site), then `/mcp` (with `express.json()` scoped to it, because
- *     React Router actions must read the raw body), then React Router.
+ *  4. health/version, Caddy's TLS `ask` endpoint (token-guarded,
+ *     internal network only, blocked by Caddy on every public site), then `/mcp` (it parses its own
+ *     JSON bodies; no parser runs app-wide, because React Router actions must read the raw body),
+ *     then React Router behind the request body cap (DASHBOARD_MAX_BODY_BYTES → 413; the Data
+ *     tab's collection page keeps its own, larger limit; /mcp, the asset uploads and the screenshot answers never get here).
  */
-export function createServerApp(opts: ServerAppOptions): Express {
+export function createServerApp(opts: ServerAppOptions): ServerApp {
   const app = express();
   app.disable('x-powered-by');
 
   app.use(opts.appsHost ?? (createAppsHostMiddleware() as RequestHandler));
   if (opts.assetUpload) app.all(`${ASSET_UPLOAD_PATH_PREFIX}:token`, opts.assetUpload);
+  if (opts.screenshotUpload) app.all(`${SCREENSHOT_UPLOAD_PATH_PREFIX}:id`, opts.screenshotUpload);
   app.use(createOriginCheckMiddleware() as RequestHandler);
 
   // Static liveness (D3) — no dependency checks; `/healthz` (React Router)
@@ -71,11 +89,8 @@ export function createServerApp(opts: ServerAppOptions): Express {
   });
   app.get(TLS_ASK_PATH, opts.tlsAsk ?? (createTlsAskHandler() as RequestHandler));
 
-  // Cap the MCP body (write_files batches + JSON-RPC envelope headroom) so an
-  // abusive oversized body is rejected by the parser.
-  app.use('/mcp', express.json({ limit: '512kb' }));
   // RFC 9728 discovery + the Bearer-gated Streamable HTTP endpoint.
-  mountMcpResource(app);
+  const mcp = mountMcpResource(app);
 
   for (const mw of opts.before ?? []) app.use(mw);
 
@@ -88,11 +103,12 @@ export function createServerApp(opts: ServerAppOptions): Express {
     app.use(express.static(opts.clientDir, { maxAge: '1h' }));
   }
 
-  app.all('*', opts.rrHandler);
+  app.all('*', withBodyLimit(opts.rrHandler, { maxBytes: opts.maxBodyBytes ?? dashboardMaxBodyBytes(), exempt: hasOwnBodyLimit }));
 
   // Clean JSON for body-parser failures (oversized / malformed) — never leak
   // express's default HTML error page (which discloses node_modules paths).
-  app.use((err: unknown, _req: Request, res: Response, next: NextFunction): void => {
+  // Anything else is a 500 and goes to the operator's error reporter.
+  app.use((err: unknown, req: Request, res: Response, next: NextFunction): void => {
     const e = err as { type?: string };
     if (e && (e.type === 'entity.too.large' || e.type === 'entity.parse.failed')) {
       res
@@ -100,6 +116,7 @@ export function createServerApp(opts: ServerAppOptions): Express {
         .json({ ok: false, error: e.type.replace(/\./g, '_') });
       return;
     }
+    void reportError({ message: 'request failed', error: err, context: { kind: 'http', method: req.method, route: req.path, status: 500 } });
     if (res.headersSent) {
       next(err);
       return;
@@ -107,5 +124,5 @@ export function createServerApp(opts: ServerAppOptions): Express {
     res.status(500).json({ ok: false, error: 'internal' });
   });
 
-  return app;
+  return Object.assign(app, { mcp });
 }

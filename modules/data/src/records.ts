@@ -1,6 +1,7 @@
 /**
  * The query layer shared by the REST routes and the owner's view (the
- * `records` authority behind MCP `query_data` and the dashboard Data tab).
+ * `records` authority behind MCP `query_data`, the MCP data tools and the
+ * dashboard Data tab).
  *
  * The authority answers the app OWNER — core calls it only after it
  * authorized a drobek account for the app — so it bypasses the end-user rules;
@@ -22,6 +23,7 @@ import {
   deleteCollectionRecords,
   deleteRecord,
   docKeysMatching,
+  importBatch,
   insertRecords,
   loadRecord,
   patchRecord,
@@ -228,6 +230,54 @@ function importDocs(c: CollectionConfig, text: string): { line: number; doc: Rec
   });
 }
 
+/** A batch record that does not fit: `validation_failed` naming its index in the batch, nothing stored. */
+function batchError(index: number, message: string, errors: unknown, verb: string): DataError {
+  return new DataError('validation_failed', `Record ${index}: ${message}. Nothing was ${verb}.`, { details: { index, errors: errors ?? [] } });
+}
+
+/**
+ * The records of a batch (a module job's import, the owner's create) as
+ * stored documents: own fields only, schema + size + key checked.
+ */
+function batchDocs(
+  c: CollectionConfig,
+  records: unknown[],
+  key: string | undefined,
+  maxDocBytes: number,
+  verb = 'imported'
+): Record<string, unknown>[] {
+  const seen = new Set<string>();
+  const fail = (index: number, message: string, errors?: unknown) => batchError(index, message, errors, verb);
+  return records.map((raw, index) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw fail(index, 'is not a JSON object');
+    const doc = ownFields(raw as Record<string, unknown>);
+    if (key !== undefined) {
+      const v = doc[key];
+      if (typeof v !== 'string' && !(typeof v === 'number' && Number.isFinite(v))) {
+        throw fail(index, `its key field "${key}" is missing or not a string or number`);
+      }
+      const k = JSON.stringify(v);
+      if (seen.has(k)) throw fail(index, `its key ${k} appears twice in the batch`);
+      seen.add(k);
+    }
+    if (c.schema) {
+      try {
+        validateDocument(c.schema, doc);
+      } catch (err) {
+        if (isModuleError(err) && err.code === 'validation_failed') {
+          const errors = err.details as { path: string; message: string }[] | undefined;
+          const first = errors?.[0];
+          throw fail(index, first ? `${first.path || 'the record'} ${first.message}` : 'the record does not match the collection schema', errors);
+        }
+        throw err;
+      }
+    }
+    const bytes = docByteSize(doc);
+    if (bytes > maxDocBytes) throw fail(index, `the record is ${bytes} bytes; one record may have at most ${maxDocBytes}`);
+    return doc;
+  });
+}
+
 /** Upper bound of one owner's page (query_data caps lower itself). */
 const OWNER_MAX_LIMIT = 200;
 
@@ -267,15 +317,33 @@ export const recordsAuthority: RecordsAuthority<DataConfig> = {
     return csvLines(view.db, view.app.id, q.collection, c, q);
   },
 
-  async update(view, collection, id, fields) {
+  // The owner's edit replaces the fields wholesale, or with `merge` merges
+  // them onto the stored ones like the SDK's update; patchRecord builds the
+  // new fields from the row as it is under the write lock.
+  async update(view, collection, id, fields, opts) {
     const c = requireCollection(view.config, collection);
     const row = await loadRecord(view.db, view.app.id, collection, id);
     if (!row) return null;
-    const doc = ownFields(fields);
-    if (c.schema) validateDocument(c.schema, doc);
-    // The owner's edit replaces the fields wholesale; patchRecord re-checks the row under the write lock (NSO-322).
-    const updated = await patchRecord(view.db, { appId: view.app.id, collection, id, next: () => doc, limits: dataQuotaFromLimits(await view.limits()) });
+    const given = ownFields(fields);
+    const next = (current: Record<string, unknown>) => {
+      const doc = opts?.merge ? ownFields({ ...current, ...given }) : given;
+      if (c.schema) validateDocument(c.schema, doc);
+      return doc;
+    };
+    next(row.doc ?? {});
+    const updated = await patchRecord(view.db, { appId: view.app.id, collection, id, next, limits: dataQuotaFromLimits(await view.limits()) });
     return updated ? toRecord(updated) : null;
+  },
+
+  // The owner's new records (MCP create_records): like the import, one
+  // authorized batch that skips DATA_WRITE_RATE_LIMIT but never the schema or
+  // the quota — the batch fits as a whole or nothing is stored.
+  async create(view, collection, records) {
+    const c = requireCollection(view.config, collection);
+    const limits = dataQuotaFromLimits(await view.limits());
+    const docs = batchDocs(c, records, undefined, limits.maxDocBytes, 'stored');
+    const rows = await insertRecords(view.db, { appId: view.app.id, collection, docs, limits });
+    return rows.map(toRecord);
   },
 
   // The owner's import skips DATA_WRITE_RATE_LIMIT (one authorized batch, not
@@ -288,8 +356,22 @@ export const recordsAuthority: RecordsAuthority<DataConfig> = {
       const bytes = docByteSize(r.doc);
       if (bytes > limits.maxDocBytes) throw rowError(r.line, `the record is ${bytes} bytes; one record may have at most ${limits.maxDocBytes}`);
     }
-    const imported = await insertRecords(view.db, { appId: view.app.id, collection, docs: rows.map((r) => r.doc), limits });
-    return { imported };
+    const stored = await insertRecords(view.db, { appId: view.app.id, collection, docs: rows.map((r) => r.doc), limits });
+    return { imported: stored.length };
+  },
+
+  // A module job's batch (the sync module's scheduled import). Like
+  // the owner's import it skips DATA_WRITE_RATE_LIMIT, never the schema or the quota.
+  async importRecords(view, collection, records, opts) {
+    const c = requireCollection(view.config, collection);
+    if (opts.mode !== 'replace' && opts.mode !== 'upsert') throw new DataError('invalid_request', 'The import mode is "replace" or "upsert".');
+    if (opts.mode === 'upsert' && !opts.key) throw new DataError('invalid_request', 'An upsert import needs the key field that identifies a record.');
+    if (opts.key !== undefined && (opts.key.startsWith('_') || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(opts.key))) {
+      throw new DataError('invalid_request', `The key "${opts.key}" is not a field name (letters, digits, - and _, a letter first).`);
+    }
+    const limits = dataQuotaFromLimits(await view.limits());
+    const docs = batchDocs(c, records, opts.key, limits.maxDocBytes);
+    return importBatch(view.db, { appId: view.app.id, collection, docs, mode: opts.mode, key: opts.key, limits });
   },
 
   async dropCollection(view, collection) {
@@ -298,7 +380,7 @@ export const recordsAuthority: RecordsAuthority<DataConfig> = {
     return { records, configPatch: { collections: { [collection]: null } } };
   },
 
-  // NSO-324: records whose collection is no longer declared (a write that
+  // Records whose collection is no longer declared (a write that
   // landed while the collection was removed) — invisible to every other view,
   // yet counted by the quota until the owner purges them.
   async orphans(view) {

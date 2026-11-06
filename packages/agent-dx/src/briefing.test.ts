@@ -16,6 +16,15 @@ describe('renderBriefing', () => {
     expect(b).toContain('200 files, 512 KiB per file, 5 MiB in total');
   });
 
+  it('teaches read_file: several paths, a line range and a literal search', () => {
+    const files = b.slice(b.indexOf('## Files'), b.indexOf('## Dependencies'));
+    expect(files).toContain('up to 20 `paths` in one call');
+    expect(files).toContain('`offset` / `limit`');
+    expect(files).toContain('`total_lines`');
+    expect(files).toContain('`read_file({ app_id, search })`');
+    expect(b).toContain('read_file the template files (`paths` reads them in one call)');
+  });
+
   it('carries the pinned import map with one React version', () => {
     for (const url of Object.values(TEMPLATE_IMPORTS)) {
       expect(b).toContain(url);
@@ -35,16 +44,45 @@ describe('renderBriefing', () => {
     expect(b).toContain('Never publish on your own initiative');
   });
 
-  it('lists in the gallery only after the user said yes (NSO-340)', () => {
+  it('points to the QR codes on the dashboard app page for a phone', () => {
+    expect(b).toContain('QR code of the preview URL or of the live address on the app page of the drobek dashboard');
+  });
+
+  it('lists in the gallery only after the user said yes', () => {
     expect(b).toContain('`set_gallery_listing` ONLY after the user explicitly said yes');
     expect(b).toContain('`user_confirmed: true`');
   });
 
-  it('points at get_logs for runtime errors and names the beacon opt-out (M1-07)', () => {
+  it('unpublish, delete and making an app public only on the user\'s yes; the password stays in the dashboard', () => {
+    for (const tool of ['`unpublish`', '`delete_app`', '`set_visibility`', '`release_lease`', '`set_frame_ancestors`']) expect(b, tool).toContain(tool);
+    expect(b).toContain('with `user_confirmed: true` only after their explicit yes');
+    expect(b).toContain('`password_not_set`');
+    expect(b).toContain('never ask for it');
+    expect(b).not.toContain('the app cannot be embedded in other sites');
+  });
+
+  it('points at get_logs for runtime errors and names the beacon opt-out', () => {
     expect(b).toContain('get_logs({ app_id, kind: "runtime" })');
     expect(b).toContain('"beacon": false');
     expect(b).toContain('create_asset_upload({ app_id, path, size })');
     expect(b).toContain('player.vimeo.com');
+  });
+
+  it('says the preview reloads itself and names the reload opt-out', () => {
+    expect(b).toContain('The preview reloads itself after a write that compiled');
+    expect(b).toContain('never ask the user to refresh it');
+    expect(b).toContain('"reload": false');
+  });
+
+  it('points at get_logs kind browser for the preview\'s errors and names the opt-out', () => {
+    expect(b).toContain('get_logs({ app_id, kind: "browser" })` before guessing');
+    expect(b).toContain('previous_version_browser_errors');
+    expect(b).toContain('"browserErrors": false');
+  });
+
+  it('tells the agent to check the render signal after the user opened the preview', () => {
+    expect(b).toContain('After the user opened the preview, call `get_app` — `render`');
+    expect(b).toContain('page_loads 0 means nobody has opened that version yet');
   });
 
   it('explains the hosts, what is (not) served and the CSP', () => {
@@ -81,11 +119,19 @@ describe('renderBriefing', () => {
   });
 
   it('renders the live limits it is given', () => {
-    const live = renderBriefing({ limits: { maxFiles: 50, maxFileBytes: 64 * 1024, maxTotalBytes: 2 * 1024 * 1024, timeoutMs: 5000 } });
+    const live = renderBriefing({
+      limits: { maxFiles: 50, maxFileBytes: 64 * 1024, maxTotalBytes: 2 * 1024 * 1024, timeoutMs: 5000, maxRequestBytes: 4 * 1024 * 1024 },
+    });
     expect(live).toContain('50 files, 64 KiB per file, 2 MiB in total; a build may take 5 s');
+    expect(live).toContain('one MCP request of at most 4 MiB');
   });
 
-  it('explains installing an app on a home screen with rules the server enforces (NSO-390)', () => {
+  it('states the largest write_files request and what to do over it', () => {
+    expect(b).toContain('One write_files call travels as one MCP request of at most 10 MiB (the JSON, escaping included)');
+    expect(b).toContain('(HTTP 413) and nothing is written. Split a big write into several calls, or send `edits` instead of whole files.');
+  });
+
+  it('explains installing an app on a home screen with rules the server enforces', () => {
     const inst = b.slice(b.indexOf('## Installable app'), b.indexOf('## Files'));
     expect(inst).toContain('`manifest.webmanifest` with write_files');
     expect(inst).toContain('application/manifest+json');
@@ -96,20 +142,66 @@ describe('renderBriefing', () => {
     expect(inst).toContain('`published_url`');
   });
 
-  it('says what publish\'s assets: "draft" means (NSO-390)', () => {
+  it('explains the description, favicon, link previews and search engines — the agent writes them, drobek adds nothing', () => {
+    const head = b.slice(b.indexOf('## Browser tab, search results and shared links'), b.indexOf('## Files'));
+    expect(head).toContain('drobek adds nothing to your pages');
+    expect(head).toContain('<meta name="description" content="…">');
+    expect(head).toContain('`<link rel="icon" href="/favicon.svg" type="image/svg+xml">`');
+    expect(head).toContain('a PNG or ICO is uploaded with `create_asset_upload`');
+    expect(head).toContain('`/favicon.ico` request is a 404');
+    for (const og of ['og:title', 'og:description', 'og:type', 'og:url', 'og:image', 'summary_large_image']) expect(head, og).toContain(og);
+    expect(head).toContain('ABSOLUTE https URLs on the production address');
+    expect(head).toContain('`https://<slug>.<APPS_DOMAIN>/og.png`');
+    expect(head).toContain('social networks do not render SVG');
+    expect(head).toContain('leave `og:image` out');
+    expect(head).toContain('`X-Robots-Tag: noindex`');
+    expect(head).toContain('<meta name="robots" content="noindex">');
+    expect(head).toContain('drobek serves no robots.txt of its own');
+    for (const code of ['missing_title', 'missing_description', 'missing_favicon', 'og_image_not_absolute']) expect(head, code).toContain(code);
+  });
+
+  it('says what publish\'s assets: "draft" means', () => {
     expect(b).toContain('`assets: "draft"` means the uploads the preview shows are now live on production too');
   });
 
-  it('with the data module: per-visitor state without sign-in goes to localStorage (NSO-376)', () => {
+  it('with the data module: per-visitor state without sign-in goes to localStorage', () => {
     const withData = renderBriefing({ skills: [{ name: 'data', use_when: 'the app stores records' }] });
     expect(withData).toContain('Per-visitor state without sign-in');
     expect(withData).toContain('`localStorage`');
     expect(withData).toContain('no anonymous per-visitor identity');
     expect(renderBriefing({ skills: [{ name: 'hello', use_when: 'x' }] })).not.toContain('Per-visitor state');
   });
+
+  it('with the data module: live updates subscribe instead of polling', () => {
+    const withData = renderBriefing({ skills: [{ name: 'data', use_when: 'the app stores records' }] });
+    expect(withData).toContain('need no polling: `drobek.data.subscribe(collection, { onChange, onSync })`');
+    expect(withData).toContain('return the unsubscribe from the `useEffect`');
+    expect(renderBriefing({ skills: [{ name: 'hello', use_when: 'x' }] })).not.toContain('drobek.data.subscribe');
+  });
+
+  it('with the sync module: scheduled work and crons go to the sync module, without it no cron is promised', () => {
+    const withSync = renderBriefing({ skills: [{ name: 'sync', use_when: 'data refreshes on a schedule' }] });
+    expect(withSync).toContain("Work on a schedule (a cron, a periodic refresh of data from an external API");
+    expect(withSync).toContain("call `skill_info('sync')`");
+    expect(withSync).toContain('The server never runs app code, so there are no cron scripts of your own');
+    expect(withSync).toContain('any computation on that data happens in the browser');
+    for (const without of [renderBriefing(), renderBriefing({ skills: [{ name: 'data', use_when: 'x' }, { name: 'proxy', use_when: 'y' }] })]) {
+      expect(without).not.toMatch(/cron/i);
+      expect(without).not.toContain('Work on a schedule');
+    }
+  });
 });
 
-describe('onboarding (NSO-379)', () => {
+describe('incoming events', () => {
+  it('with the webhooks module: events from other services go to it, without it no webhook is promised', () => {
+    const withHooks = renderBriefing({ skills: [{ name: 'webhooks', use_when: 'another service notifies the app' }] });
+    expect(withHooks).toContain("call `skill_info('webhooks')`");
+    expect(withHooks).toContain('The app has no server code to receive a POST');
+    expect(renderBriefing({ skills: [{ name: 'data', use_when: 'x' }] })).not.toContain('webhooks');
+  });
+});
+
+describe('onboarding', () => {
   it('server instructions name list_apps, the start skill, preview_url and publish-on-request', () => {
     expect(SERVER_INSTRUCTIONS).toContain('Start with `list_apps`');
     expect(SERVER_INSTRUCTIONS).toContain("skill_info('start')");

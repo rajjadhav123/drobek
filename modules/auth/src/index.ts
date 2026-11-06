@@ -1,5 +1,5 @@
 /**
- * drobek-module-auth — the BUILT-IN platform module `auth` (M1-02, §5.1):
+ * drobek-module-auth — the BUILT-IN platform module `auth`:
  * end users of an app sign in with a one-time code sent to their e-mail.
  *
  *   DROBEK_MODULES=auth   → this package (`modules/auth` in the drobek repo,
@@ -12,7 +12,7 @@
  *   anyone:true, enabling a provider and changing its identity fields need
  *   the owner's confirmation.
  *
- * Sign-in providers (NSO-348): other modules contribute to the slot
+ * Sign-in providers: other modules contribute to the slot
  * `auth.provider` (OIDC, SAML, …) — they only prove an identity; this module
  * keeps the allowlist, roles, users and sessions (flow.ts). The IdP calls
  * back on the DASHBOARD host (`endUsers.callback`); a one-time handoff code
@@ -38,7 +38,7 @@ import { AUTH_CONFIG_DEFAULTS, authConfigSchema, authConfirmRequired, composeAut
 import { currentUser } from './current.js';
 import { CALLBACK_LIMIT, providerCallback } from './flow.js';
 import { ownerMethods } from './owner.js';
-import { PROVIDER_SLOT, SIGNED_IN_SLOT } from './providers.js';
+import { PROVIDER_SLOT, SIGNED_IN_SLOT, providersInfo } from './providers.js';
 import { registerRoutes } from './routes.js';
 
 export {
@@ -177,7 +177,7 @@ const auth = defineModule<AuthConfig>({
       schema: authProviderSchema,
       unique: 'id',
       description:
-        'A way for end users to sign in besides the e-mail code (OIDC, SAML, …): begin() → the IdP URL, callback() → the verified identity { subject, email, emailVerified, name? }. auth keeps the allowlist, roles, users and the session.',
+        'A way for end users to sign in besides the e-mail code (OIDC, SAML, …): declares apiVersion 2, begin() → the IdP URL, callback() → the verified identity { issuer, subject, email, emailVerified, name? }. auth keeps the allowlist, roles, users and the session.',
     },
     [SIGNED_IN_SLOT]: {
       schema: authSignedInObserverSchema,
@@ -212,6 +212,8 @@ const auth = defineModule<AuthConfig>({
     },
     { env: 'END_USERS_MAX_PER_APP', default: 1000, meaning: 'end users one app may have' },
   ],
+  // get_app's modules.auth.info: which sign-in providers are on and which operator fallbacks exist (names only).
+  appInfo: (view) => ({ providers: providersInfo(view.config) }),
   routes: registerRoutes,
   endUsers: {
     current: async ({ app, user, config, db, contributions }) => (await currentUser(db, app, config, user, contributions))?.user ?? null,

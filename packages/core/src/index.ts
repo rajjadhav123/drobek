@@ -7,6 +7,7 @@ export {
 } from './health.js';
 export { coreVersion, CORE_VERSION, type CoreVersion } from './version.js';
 export { getRedis, healthRedisPing, closeRedis } from './redis.js';
+export { hitFixedWindow, peekFixedWindow, type FixedWindowHit, type FixedWindowRedis } from './fixed-window.js';
 export { perIpLimitKey } from './client-ip.js';
 export {
   createConsoleLogger,
@@ -22,6 +23,7 @@ export {
   type SecretProblem,
 } from './secrets-config.js';
 export {
+  DASHBOARD_BODY_CAP_EXEMPT_PATHS,
   TLS_ASK_PATH,
   TLS_ASK_TOKEN_MIN_LENGTH,
   caddyConfigFromEnv,
@@ -35,3 +37,42 @@ export {
 export { CsvParseError, csvEscape, csvLine, csvUnguard, parseCsv, type CsvRow } from './csv.js';
 export { SIGNATURE_HEAD_BYTES, hasControlBytes, looksLikeSvg, sniffSignature, type SniffedType } from './sniff.js';
 export { CLOSE_LINGER_MS, closeAfterResponse, requestBodyStream } from './http-body.js';
+export {
+  DASHBOARD_MAX_BODY_BYTES_DEFAULT,
+  dashboardMaxBodyBytes,
+  withBodyLimit,
+  type BodyLimitOptions,
+} from './body-limit.js';
+export {
+  FATAL_STOP_MARGIN_MS,
+  installFatalErrorHandlers,
+  type FatalErrorHandlerOptions,
+  type FatalErrorProcess,
+} from './fatal-errors.js';
+export {
+  SHUTDOWN_GRACE_DEFAULT_MS,
+  closeGracefully,
+  shutdownGraceMs,
+  type GracefulCloseResult,
+} from './graceful-close.js';
+export {
+  ERROR_REPORTER_API_VERSION,
+  ERROR_REPORTER_ID_RE,
+  ERROR_REPORTER_MAX_PER_MINUTE_DEFAULT,
+  ERROR_REPORTER_TIMEOUT_DEFAULT_MS,
+  errorReporterConfigError,
+  errorReporterId,
+  installErrorReporter,
+  installedErrorReporterId,
+  missingReporterSecrets,
+  redactForReport,
+  reportError,
+  resetErrorReporterForTests,
+  routeForReport,
+  type ErrorReportContext,
+  type ErrorReportEvent,
+  type ErrorReportInput,
+  type ErrorReportKind,
+  type ErrorReporter,
+  type ErrorReporterContext,
+} from './error-report.js';

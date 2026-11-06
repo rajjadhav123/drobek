@@ -1,5 +1,5 @@
 /**
- * GET/POST /oauth/authorize (U5, M0-04) — the browser-facing authorization
+ * GET/POST /oauth/authorize — the browser-facing authorization
  * endpoint + consent. Server half; the consent UI lives in ./oauth.authorize.tsx.
  *
  * Validation order follows RFC 6749 §4.1.2.1: the client (a DCR client_id or
@@ -30,7 +30,7 @@ import { resolveClient } from '../client-resolve.server.js';
 import { markClientUsed, type OAuthClient } from '../clients.server.js';
 import { issueAuthCode } from '../codes.server.js';
 import { authorizationServerIssuer, isMcpResource, mcpResourceUri } from '../metadata.js';
-import { exactRedirectUriMatch } from '../redirect-uri.js';
+import { registeredRedirectUriMatch } from '../redirect-uri.js';
 import { parseScopes, serializeScopes, SCOPES, type Scope } from '../scopes.js';
 
 interface AuthorizeParams {
@@ -87,7 +87,7 @@ async function validate(params: AuthorizeParams): Promise<Validated> {
   const resolved = await resolveClient(params.clientId);
   if (!resolved.ok) return show(resolved.error, resolved.description);
   const client = resolved.client;
-  if (!exactRedirectUriMatch(params.redirectUri, client.redirectUris)) {
+  if (!registeredRedirectUriMatch(params.redirectUri, client.redirectUris)) {
     return show('invalid_request', 'redirect_uri is not registered for this client');
   }
 

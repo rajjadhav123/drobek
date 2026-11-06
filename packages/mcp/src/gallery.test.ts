@@ -1,5 +1,5 @@
 /**
- * NSO-340 over a real MCP client on a real (PGlite) database:
+ * The public gallery over a real MCP client on a real (PGlite) database:
  * set_gallery_listing lists a published app only with `user_confirmed: true`
  * (the user's explicit yes), refuses an unpublished app, a bad description,
  * an entry the operator hid, a taken-down app, a viewer and a server without
@@ -227,14 +227,31 @@ describe('set_gallery_listing', () => {
       await c.call('write_files', { app_id: app.app_id, files: [{ path: 'src/a.ts', content: 'export {}' }], reasoning: 'x' });
       await c.call('publish', { app_id: app.app_id });
       expect(await listedRow(app.app_id)).toMatchObject({ listed: false });
-      // Of every tool, only set_gallery_listing takes a gallery argument (the domain and upstream tools' user_confirmed is theirs, NSO-366, NSO-372).
+      // Of every tool, only set_gallery_listing takes a gallery argument (the lifecycle, version clean-up, data, end-user, secret, domain, upstream, member and workspace tools' user_confirmed is theirs).
       const tools = (await c.client.listTools()).tools;
       const withGallery = tools.filter((t) =>
         Object.keys((t.inputSchema.properties ?? {}) as object).some((k) => /listed|gallery/i.test(k))
       );
       expect(withGallery.map((t) => t.name)).toEqual(['set_gallery_listing']);
       const confirmed = tools.filter((t) => Object.keys((t.inputSchema.properties ?? {}) as object).includes('user_confirmed'));
-      expect(confirmed.map((t) => t.name)).toEqual(['set_gallery_listing', 'set_primary_domain', 'remove_domain', 'remove_upstream']);
+      expect(confirmed.map((t) => t.name)).toEqual([
+        'delete_versions',
+        'set_gallery_listing',
+        'unpublish',
+        'set_visibility',
+        'delete_app',
+        'delete_collection',
+        'purge_orphan_records',
+        'delete_feedback',
+        'sign_out_end_users',
+        'remove_module_secret',
+        'set_primary_domain',
+        'remove_domain',
+        'remove_upstream',
+        'invite_member',
+        'remove_member',
+        'delete_workspace',
+      ]);
     } finally {
       await c.close();
     }

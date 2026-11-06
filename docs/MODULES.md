@@ -3,7 +3,7 @@
 A **platform module** is the only way an app on drobek gets a backend. It is
 platform code the **operator** installs, never code an app author or agent
 uploads: the server still never executes app code. The contract is the
-TypeScript package `@drobek/modules` (contract version `1.1.0`, semver:
+TypeScript package `@drobek/modules` (contract version `1.3.0`, semver:
 `MODULE_CONTRACT_VERSION`).
 
 A module contributes, for every app on the server:
@@ -20,6 +20,7 @@ A module contributes, for every app on the server:
 | **Skill** | the agent-facing Markdown `skill_info('<name>')` returns |
 | **Error codes** | its own codes with meaning and fix: `skill_info('<name>').errors`, `/llms-full.txt` |
 | **Slots** | typed extension points other modules contribute to (see [Slots](#slots)) |
+| **Jobs** | scheduled work core runs on an interval, for the server or for each app (see [Scheduled jobs](#scheduled-jobs-jobs)) |
 
 This page has three audiences: **app authors** (you, or the agent building
 your app) start at [Using modules in an app](#using-modules-in-an-app);
@@ -40,9 +41,13 @@ sign-in provider), [`data`](#the-built-in-data-module) (collections of
 records with per-operation rules), [`forms`](#the-built-in-forms-module)
 (submissions stored and e-mailed to the app's owners),
 [`files`](#the-built-in-files-module) (end-user uploads),
-[`email`](#the-built-in-email-module) (e-mails to the app's owners) and
+[`email`](#the-built-in-email-module) (e-mails to the app's owners),
 [`proxy`](#the-built-in-proxy-module) (calls to an external API with its key
-added server-side). A server may run fewer or more:
+added server-side), [`sync`](#the-built-in-sync-module) (scheduled imports
+into a data collection), [`oidc`](#the-built-in-oidc-module) (company
+sign-in with an OpenID Connect provider, through `auth`) and
+[`webhooks`](#the-built-in-webhooks-module) (signed incoming webhooks stored
+in a data collection). A server may run fewer or more:
 `skill_info()` over MCP and the workspace's **Modules** tab in the dashboard
 list the ones this server runs. `skill_info('<name>')` gives the agent the
 module's code examples, SDK types, config schema, limits and error codes.
@@ -66,8 +71,10 @@ at once. `configure_module` answers `pending_confirmation` with a
 `confirm_url`, and the workspace's editors and admins are told by e-mail
 (when the server sends mail). One of them reviews the change on that
 dashboard page and confirms or rejects it; a proxy change needs a workspace
-admin ([Confirming a pending change](#confirming-a-pending-change)). Each module's
-section below lists what waits for confirmation.
+admin ([Confirming a pending change](#confirming-a-pending-change)). Another
+risky change made before that decision joins the waiting one, so both are
+confirmed or rejected together. Each module's section below lists what waits
+for confirmation.
 
 **4. Set secrets in the dashboard.** A secret value (a sign-in provider's
 client secret, an API key for the proxy) is never an MCP argument: you enter
@@ -143,11 +150,12 @@ The server **refuses to start** when anything is off: an unknown package, an
 export that is not a module, an invalid name, a short name whose package
 exports another name, defaults that fail the schema, a `contract` range the
 server's `MODULE_CONTRACT_VERSION` does not satisfy (`module "crm": it needs
-module contract ^2.0, but this server implements 1.1.0 — …`), two modules
+module contract ^2.0, but this server implements 1.3.0 — …`), two modules
 with one name, a missing `sdk.entry`, a reserved name (`sdk`, `v1`,
-`drobek`, `internal`), a module whose `requires` is not enabled
+`drobek`, `internal`, `errors`), a module whose `requires` is not enabled
 (`module "forms" requires the module "email": add it to DROBEK_MODULES
-(e.g. DROBEK_MODULES=…,email)`), two modules declaring `mail` (or
+(e.g. DROBEK_MODULES=…,email)`), a default module that requires an opt-in
+one, `requires` that form a cycle, two modules declaring `mail` (or
 `endUsers`, or `records`), one limit or error code declared by two modules,
 a slot contribution that breaks the [slot rules](#slots), an invalid
 `DROBEK_MODULE_<NAME>_DEFAULTS`, and for a module from `DROBEK_MODULES_DIR`:
@@ -155,9 +163,10 @@ a missing or mismatching `modules.lock.json` entry, changed files, a
 migration outside its namespace. Nothing is skipped silently. A module
 without `contract` still loads, with a warning naming the range to add. On
 start the log `platform modules ready` lists every module as
-`{ name, version, source, contract }` (`source`: `builtin` | `dir`) next to
-the server's contract version; `/healthz` and `/api/version` serve the same
-`modules` list (never a path on disk).
+`{ name, version, source, contract }` (`source`: `builtin` | `dir`; plus
+`operatorOnly: true` on an [operator-only module](#operator-only-modules))
+next to the server's contract version; `/healthz` and `/api/version` serve
+the same `modules` list (never a path on disk).
 
 ### Operator defaults: `DROBEK_MODULE_<NAME>_DEFAULTS`
 
@@ -193,8 +202,34 @@ active for a workspace when, in this order:
    the `workspace_modules` table, audited `module.workspace_enable` /
    `module.workspace_disable` with `meta.module`). Every other member sees
    the state on the same page read-only (who switched it on: workspace
-   admins only), and the switch answers them 403. There is no self-service
-   switch and no MCP tool.
+   admins only), and the switch answers them 403. A super-admin's agent
+   flips the same switch with the MCP tool `set_workspace_module` (scope
+   `write`, `user_confirmed: true` after their explicit yes; audited with the
+   agent as the actor); other users never see that tool. There is no
+   self-service switch.
+
+**`requires` applies per workspace.** An opt-in module is active only while
+every module it `requires` is active for the workspace too, transitively
+(a default required module always is) — whichever of the three decided its
+own state. A plan or env value that enables a module whose required opt-in
+module is off there leaves it off; so does disabling a module another one
+depends on:
+
+- **Enable** refuses while a required module is off for the workspace:
+  `409 module_requires_not_enabled` (`details.missing` lists the modules to
+  enable, in order; the dashboard shows the message with "Enable … first",
+  and the Enable button stays disabled until then). Nothing changes.
+- **Disable** always applies. The modules that depend on it keep their own
+  switch but are off at once; the dashboard names them before (the card
+  says "… depends on it: disabling it turns them off for this workspace
+  too") and after the click, and they come back on when it is enabled
+  again.
+
+The workspace Modules page, `get_app.modules.<name>.enabled`,
+`skill_info`'s `enabled_for_workspace` and every runtime check read the
+same closure, so the dashboard and MCP always agree. A default module may
+not require an opt-in one, and `requires` may not form a cycle: the server
+refuses to start on either.
 
 `ModuleRuntime.isEnabled(workspaceId, name)` answers it (a default module:
 always `true`); `enabledModules(workspaceId)` returns the whole set once per
@@ -229,11 +264,20 @@ modules); an app just gets `module_not_enabled` from their calls. Per app a
 module is "used" through its configuration, as for every module — there is
 no per-app switch.
 
-The dev compose enables the example module and every built-in module
-(`DROBEK_MODULES=hello,auth,email,forms,data,proxy,files`, `HELLO_WAVES_PER_MINUTE=5`,
+The dev compose enables both example modules and every built-in module
+(`DROBEK_MODULES=hello,auth,email,forms,data,proxy,files,sync,oidc,webhooks,drobek-module-acme-crm,drobek-module-ops-probe`,
+the last two installed into `./.modules` by `task dev`, `HELLO_WAVES_PER_MINUTE=5`,
 relaxed `AUTH_*` limits because every local request shares one client IP,
 `DATA_MAX_DOCS_PER_APP=5` so the quota e2e trips quickly); so does the e2e
-image compose.
+image compose, whose flow installs both external ones with
+`selfhost:module:add`. `drobek-module-ops-probe`
+(`tests-e2e/fixtures`) is an operator-only test fixture: its error reporter
+`capture` (`ERROR_REPORTER=capture` in both composes) hands every report to
+the e2e's `proxy-echo`, its e-mail transport `relay`
+(`EMAIL_TRANSPORT=relay` in the dev compose and in the second phase of the
+image flow, whose first phase keeps SMTP)
+sends through Mailpit's HTTP API, and its server job fails when a spec asks
+it to.
 
 ## Installing an external module
 
@@ -369,7 +413,7 @@ export default defineModule<Config>({
   name: 'hello',                 // /^[a-z][a-z0-9]{1,30}$/: URL, drobek.<name>, config key, skill name
   version: '1.0.0',              // the module's own semver
   contract: '^1.1',              // the contract versions it works with (semver range vs MODULE_CONTRACT_VERSION)
-  skill: { useWhen, markdown },  // useWhen: ONE sentence starting with the situation
+  skill: { useWhen, markdown },  // useWhen: ONE sentence starting with the situation; optional only for an operator-only module
   configSchema,                  // zod; validates configure_module + the dashboard form
   configDefaults,                // the config of an app nobody configured (must pass the schema)
   salvageConfig(merged) { return { config, issues } }, // optional: the usable part of a stored config that fails the schema
@@ -392,7 +436,8 @@ export default defineModule<Config>({
   slots: { 'hello.greeter': { schema, unique: 'id', description } }, // extension points it offers (see "Slots")
   contributes: { 'auth.provider': { … } },        // its contributions to other modules' slots
   availability: 'default',       // 'default' (every workspace) | 'opt-in'
-  dashboard: { editor: 'collections' },           // the dedicated dashboard editor its config fits
+  dashboard: { editor: 'collections', title: 'Hello', description }, // the dedicated editor its config fits; its name for people
+  jobs: [{ name: 'import', scope: 'app', every: (config) => config.every, run(ctx) {} }], // scheduled work (1.2, see "Scheduled jobs")
 });
 ```
 
@@ -404,20 +449,86 @@ declarations), like `@drobek/sdk`'s.
 Hooks run after `create_app` stored version 1, after a version was published
 (MCP or dashboard) and after the app was deleted (`onAppDelete`, the
 dashboard's delete: soft-deleted, its hosts answer 404 — the place to clean
-up what the module keeps outside the database). They are best effort: a
-failure is logged and never fails the call. `services` is
+up what the module keeps outside the database; its rows go with the app
+purge `APP_PURGE_AFTER_DAYS` later, through `ON DELETE CASCADE`). They are
+best effort: a failure is logged and never fails the call. `services` is
 `{ db, log, contributions }` (see [Slots](#slots)).
 
 The contract fields of 1.1:
 
 | Field | Rules |
 | ----- | ----- |
-| `contract` | a semver range matched against `MODULE_CONTRACT_VERSION` (`1.1.0`); not satisfied → the start is refused; missing → a warning. The built-in modules and the example declare `'^1.1'` |
+| `contract` | a semver range matched against `MODULE_CONTRACT_VERSION` (`1.3.0`); not satisfied → the start is refused; missing → a warning. The built-in modules and the example declare `'^1.1'`; `sync` (app jobs) declares `'^1.2'`; `webhooks` (config-named secrets) declares `'^1.3'` |
 | `errors` | `[{ code, meaning, fix }]`: `code` matches `^[a-z][a-z0-9_]{2,40}$`, is not a core code (`CORE_ERROR_CODES`, the catalogue in `/llms-full.txt`) and is declared by no other active module; meaning and fix are required |
 | `slots` / `contributes` | see [Slots](#slots) |
 | `availability` | `'default'` (the default: every workspace of the server) or `'opt-in'` (only the workspaces it is enabled for — [Per-workspace enabling](#per-workspace-enabling-opt-in-modules)); returned by `skill_info('<name>')` and the dashboard's module view |
 | `dashboard.editor` | `'collections'` (a `collections` config shaped like `data`'s) or `'upstreams'` (an `upstreams` config shaped like `proxy`'s): declares which dedicated dashboard editor the config fits; `data` and `proxy` declare theirs. The dashboard picks the editor by this capability only, never by the module's name — a replacement module that declares it gets the same editor, a module without it gets the generic form |
 | `hooks.onAppDelete` | `(app, services)` after the app was deleted, best effort |
+
+The contract fields of 1.2 (additive: a module declaring `'^1.1'` loads unchanged):
+
+| Field | Rules |
+| ----- | ----- |
+| `jobs` | `[{ name, scope?, every, description?, run }]` — see [Scheduled jobs](#scheduled-jobs-jobs). A module with jobs declares `contract: '^1.2'` (a 1.1 server ignores the field; the start logs a warning for a range that admits one) |
+| `ModuleContext.pendingConfig` | the config once the owner confirms the app's pending change, or `null` — see [`ModuleContext`](#modulecontext). Optional in the type: a route reads it as `ctx.pendingConfig ?? null` |
+| `AppJobContext.upstreams.fetch` / `.records.import` / `.audit` | an `app` job calls one of the app's upstreams through the module that owns them, writes a batch of records through the records module, and writes an audit row — see [Scheduled jobs](#scheduled-jobs-jobs) |
+| `upstreams` | the owner of upstream calls (the built-in `proxy`; two refuse the start): `fetch(view, name, { method?, path?, headers?, body?, maxBytes? })` → `{ status, headers, body }` — what `ctx.upstreams.fetch` of a job reaches |
+| `records.importRecords` | optional on the records authority: `(view, collection, records, { mode: 'replace' \| 'upsert', key? })` → `{ inserted, updated, deleted }`, all or nothing — what `ctx.records.import` of a job reaches |
+| `sync` | the owner of scheduled imports (the built-in `sync`; two refuse the start): `sources(view)`, `runs(view, q)`, `runNow(ctx, source)`, `resume(view, source)` — what the dashboard's sources panel, MCP `sync_now` and `get_logs({ kind: 'sync' })` call ([The built-in `sync` module](#the-built-in-sync-module)) |
+| `ConfirmContext.limits` | `confirmRequired`'s third argument may read the workspace's limits (`sync` refuses a source past its limits there) |
+| `ModuleContext.currentConfig()` / `.currentPrincipal()` | the app's config and the caller as of now, for a response that stays open — see [`ModuleContext`](#modulecontext). Optional in the type: fall back to `ctx.config` / `ctx.principal` |
+| `dashboard.title` / `dashboard.description` | the module's name for people and one line under it, for the app's owner — the dashboard shows "Scheduled imports (sync)" and the description in place of "Use when …" (written for agents). The `name` stays the identifier in URLs, the config key, MCP and `skill_info`. One line each (trimmed, no line break or control character), 1–60 / 1–200 characters, else the start is refused; a server that predates them ignores both |
+| `ConfigFieldMeta` | the keywords the dashboard's config form reads from a `configSchema` field (zod `.meta()`): `title`, `description`, `x-drobek-choices`, `x-drobek-min-interval` — [Choices of a config field](#choices-of-a-config-field-x-drobek-choices); `x-drobek-rule`, `x-drobek-unit`, `x-drobek-default-limit`, `x-drobek-hidden`, `x-drobek-order` — [How a config field is shown](#how-a-config-field-is-shown). Presentation only |
+| `OperatorModule` | a module declared without `skill` (`defineModule` types it `OperatorModule`; `DrobekModule` keeps `skill` required) — allowed only without an app surface ([Operator-only modules](#operator-only-modules)); a server that predates it refuses a module without a skill (`skill.useWhen is required`) |
+| `ModuleSlot.operatorOnly` | `true` on a slot whose contributions configure the server, not apps (the core-hosted `errors.reporter`, `email`'s `email.transport`): a module contributing only to such slots needs no skill. Default `false`; anything but a boolean refuses the start |
+
+The contract fields of 1.3 (additive: a module declaring `'^1.1'` or `'^1.2'` loads unchanged):
+
+| Field | Rules |
+| ----- | ----- |
+| `secretsFor` | `(config) => [{ name, description, required? }]`: secrets that follow the app's config (the `webhooks` module: one per endpoint), declared next to `secrets` — `ctx.secrets.get`, the dashboard's Secrets section, `get_app`'s `secrets`, `remove_module_secret` and the `secrets_missing` check of `configure_module` read both. A secret stored under a name the config no longer declares stays listed (not required) until the owner removes it |
+| `ModuleContext.records.create` | a route writes records through the records module — see [`ModuleContext`](#modulecontext) |
+| `RouteOptions.passwordGate` | `'skip'`: a non-GET route that authenticates its caller itself passes a password-protected app's gate — see [Routes](#routes-modulerouter) |
+| `webhooks` | the owner of incoming webhooks (the built-in `webhooks`; two refuse the start): `endpoints(view)` → `[{ name, url, collection, verify, signed, secret, enabled, last_delivery_at, last_status }]`, `deliveries(view, { since?, limit? })` → `[{ endpoint, status, http_status, bytes, reason, record_id, received_at }]` — what the dashboard's endpoints panel and `get_logs({ kind: 'webhooks' })` read |
+
+### Operator-only modules
+
+A module that serves only the server itself — an error reporter, an e-mail
+transport — has nothing for an agent to read, so it may leave out `skill`.
+That is allowed only while nothing of it reaches apps:
+
+- no `routes`, `sdk`, `rules`, per-app `secrets`, own `errors` or `appInfo`;
+- no app config: `configSchema` describes an empty object
+  (`configSchema: z.object({}), configDefaults: {}`), and no `salvageConfig`,
+  `confirmRequired` or `onConfirmed`;
+- no owner authority (`endUsers`, `mail`, `records`, `submissions`, `files`,
+  `upstreams`, `sync`, `webhooks`), no `availability: 'opt-in'`, no `dashboard.editor`,
+  no `scope: 'app'` job, no `compose`;
+- every slot it declares and every slot it contributes to is
+  `operatorOnly` — the core-hosted `errors.reporter` and the `email`
+  module's `email.transport` are; `auth.provider`, `auth.signedIn` and
+  `hello.greeter` are not.
+
+`limits`, `migrations`, `hooks`, `requires`, server jobs and
+`dashboard.title` / `description` are fine. `defineModule` types a module
+declared without a skill as `OperatorModule` (a module with one stays a
+`DrobekModule`, `skill` required); `AnyModule` is either. Anything else
+refuses the start and names what reaches apps — `module "x": skill is required: the module
+reaches apps through routes, secrets — add skill: { useWhen, markdown } …`,
+or for a contribution `module "x" has no skill, but contributes to the slot
+"auth.provider" (module "auth"), which reaches apps — …`.
+
+Agents and app owners never see an operator-only module: `skill_info()`
+does not list it and `skill_info('<name>')` answers `not_found` like an
+unknown name; the briefing, `/llms.txt` and `/llms-full.txt`, `create_app` /
+`get_app` (`skills`, `modules`), `configure_module` and the app's Modules tab
+and module page leave it out, and `/__drobek/v1/<name>/…` answers
+`not_found`. Nor is it named among the contributors of the slot it
+contributes to: `skill_info('email')` and the `email` module page list no
+module-provided transport under `email.transport`. Operators still see it: `/healthz`, `/api/version` and the start log
+mark it `operatorOnly: true`, and the
+[workspace Modules page](#the-workspace-modules-page) lists it, marked
+operator-only, for super-admins only.
 
 ### Error codes
 
@@ -434,7 +545,10 @@ section per active module. The built-in modules declare theirs: `auth`
 (`submitted_too_fast`, `invalid_form_token`), `data` (`validation_failed`,
 `invalid_schema`, `pending_confirmation`), `files` (`unsupported_type`), `proxy`
 (`path_not_allowed`, `ssrf_blocked`, `upstream_error`, `proxy_busy`,
-`config_error`).
+`config_error`), `webhooks` (`invalid_signature`, `webhook_secret_not_set`,
+`webhook_not_stored`); `oidc` (`oidc_discovery_failed`, `oidc_token_invalid`)
+declares codes no route answers — its failures reach the app as auth's
+`provider_error` — so agents can read the causes the server logs.
 
 ### Routes: `ModuleRouter`
 
@@ -449,6 +563,7 @@ r.post(
     maxBodyBytes: 1024,                              // default 32 KiB
     bodyTypes: ['json', 'multipart'],                // default ['json']; multipart = text fields only; 'raw' = the Buffer; ['file'] = one streamed file
     csrf: 'sdk-header',                              // default; 'same-origin' for sendBeacon-style calls
+    passwordGate: 'skip',                            // optional (1.3): a POST that authenticates its caller itself passes a password-protected app's gate
   },
   async (req, ctx) => ({ waves: 1 })                 // JSON 200, or respond(status, body, headers)
 );
@@ -494,7 +609,9 @@ route goes through the same pipeline:
    them;
 6. the handler → JSON with `Cache-Control: no-store` (or `respond(status,
    body, headers)`: a string/Buffer is sent as-is, a Node `Readable` is
-   streamed — e.g. a stored file — and destroyed unread for `HEAD`).
+   streamed — e.g. a stored file — and destroyed unread for `HEAD`; a
+   header whose value is a list is sent once per item, e.g. several
+   `Set-Cookie`).
 
 Every failure uses **one error shape**:
 
@@ -504,7 +621,9 @@ Every failure uses **one error shape**:
 
 Handlers throw `new ModuleError(code, message, { details, hint, headers })`.
 Anything else becomes `500 internal_error` without internals (logged on the
-server). Codes: `invalid_request` 400, `unauthorized` 401,
+server) — except a query the database cut off (the server's
+`DB_STATEMENT_TIMEOUT_MS` / `DB_LOCK_TIMEOUT_MS`), which answers `503
+unavailable` with `details.reason: database_timeout` and `Retry-After`. Codes: `invalid_request` 400, `unauthorized` 401,
 `password_required` 401, `forbidden` 403, `csrf_rejected` 403, `not_found`
 404, `method_not_allowed` 405, `conflict` 409, `payload_too_large` 413,
 `unsupported_media_type` 415, `rate_limited` / `limit_exceeded` 429,
@@ -513,7 +632,10 @@ agent-facing error catalogue (`/llms-full.txt`).
 
 Platform routes answer on an app host **after** the app is resolved and after
 its visibility gate: a password-protected app answers `401
-password_required` (JSON) until the visitor unlocked it. The apps-origin
+password_required` (JSON) until the visitor unlocked it — except a route
+declared with `passwordGate: 'skip'` (contract 1.3, non-GET methods only),
+which authenticates its caller itself, as the `webhooks` module's endpoint
+checks the sender's signature. The apps-origin
 security headers (CSP, `X-Content-Type-Options`, …) override whatever a module
 sets.
 
@@ -533,10 +655,12 @@ Everything a handler gets is scoped to **one app and one module**:
 | `principal` | `{ kind: 'anon' }` or `{ kind: 'user', id, email, role: 'user' \| 'admin' }`, resolved by core from the host-only end-user cookie (`__Host-drobek_eu`; plain-http dev: `drobek_eu`). A module never reads cookies, and the dashboard session is never read on an app host. |
 | `config` | this app's effective config: `configSchema.parse(merge(configDefaults, stored))` |
 | `pendingConfig` | the config this app would have once the owner confirms its pending change, or `null` (nothing pending, or it no longer validates). Never act on it — it is not in force; it lets a route say that something waits for confirmation (e.g. data's `409 pending_confirmation`). `createModuleTestContext({ pendingConfig })` sets it in tests. |
+| `currentConfig()` / `currentPrincipal()` | the config as stored NOW and the caller as of NOW (the session read again: signed out, blocked or expired → anon). `config` and `principal` are read once per request; a response that stays open (an event stream, like data's `subscribe`) checks these again before it sends what they decide; `currentConfig()` throws once the app is deleted or taken down, so the response ends. In tests they follow `setConfig(patch)` / `setPrincipal(p)` of `createModuleTestContext`, and `request(…, { stream: true })` hands the unread stream over as `res.stream`. |
 | `rules.decide(rule, ownerId?)` | `{ ok: true }` or `{ ok: false, status: 401 \| 403 }` |
 | `limits()` | this workspace's limits (env defaults or the limits provider) |
 | `rateLimit(bucket, key, max, windowMs)` | fixed-window counter in Redis, namespaced to the module and app |
-| `secrets.get(name)` | the plaintext of a **declared** secret of this app, or `null`; reading an undeclared name throws |
+| `secrets.get(name)` | the plaintext of a **declared** secret of this app (`secrets`, plus `secretsFor(config)` of this config), or `null`; reading an undeclared name throws |
+| `records.create(collection, records)` | (1.3) writes records into one of this app's collections through the records module (the built-in `data`): its schema, quotas and the app's records limits apply, its end-user rules do not — the route decided who may write. Returns the stored records; `unavailable` without a records module |
 | `audit(action, meta?)` | an audit row `<module>.<action>` for this app, actor kind `end_user` |
 | `email.send({ to, subject, text })` → `{ sent }` | `to` is one reference or a list: `{ config: 'dotted.path' }` (addresses in this app's owner-confirmed config), `{ principal: true }` (the signed-in end user), `{ appOwners: true }` (the editors and workspace-admins of the app's drobek workspace) or `{ signInAddress }` (the address a visitor typed into a sign-in form: always alone, for a sign-in code only; the module decides first that it may sign in; only the module that owns end-user sessions — `endUsers`, the built-in `auth` — may use it, any other module gets `403 forbidden` with `details.reason: sign_in_address_not_allowed`). Never an arbitrary address. Addresses are validated, lowercased and de-duplicated; each gets its own message. The subject is one line (control and line-separator characters become spaces, 200 characters at most); the text (≤ 20 000 characters) is escaped into the drobek layout. Rejects with `limit_exceeded` / `unavailable` — see [Module e-mail](#module-e-mail). |
 | `db`, `log` | the database (drizzle) and a logger |
@@ -573,11 +697,21 @@ Both are served on every app host (never on the dashboard origin):
 Changing `DROBEK_MODULES` changes the hash; apps pick up the new SDK on their
 next compile.
 
-Two core paths sit next to the modules and are never a module name: the error
+Two core paths sit next to the modules and are never a module name: the
 beacon script `/__drobek/beacon.js?v=<hash>` (same caching as `sdk.js`; the
 compiler imports it in front of every entry unless `drobek.json` has
 `"beacon": false`) and the beacon endpoint `POST /__drobek/v1/_beacon`
-(handled by core, 8 KiB cap). Every response of a MATCHED route of an active
+(handled by core, 8 KiB cap). The beacon reports a page's load (once per
+page, a count only), its uncaught errors and unhandled rejections, the files
+that failed to load and the requests the CSP blocked, each with the version
+the page was served from: every HTML response of an app host names it in
+`Server-Timing: drobek-version;desc="<N>"`, which the beacon reads from the
+page's navigation timing (a browser that does not expose it is filed under
+the version the host serves when the report arrives). Page loads are counted
+per version in `app_version_loads`, behind their own rate-limit buckets
+(`drobek:rl:beacon-load:*`, the `BEACON_RATE_LIMIT` / `BEACON_APP_RATE_LIMIT`
+values), so they never spend the error budget; only a version the app has
+is counted. Every response of a MATCHED route of an active
 module is counted per day and status class (`2xx`..`5xx`) — never a 429 (a
 throttled flood costs nothing past the limiter) nor an unknown route or
 method. The counters live in Redis (`drobek:signals:mod:<app_id>:<day>`) and
@@ -588,8 +722,9 @@ statement per table, then reads the table.
 
 Everything `get_logs` returns is kept **30 days**: browser errors (at most
 the newest `BEACON_MAX_EVENTS_PER_APP` = 500 per app, `BEACON_RETENTION_DAYS`
-= 30), compiles (the newest 200 per app) and the daily request and
-module-call stats. Reads never delete: a periodic prune in the server process
+= 30), compiles (the newest 200 per app), the daily request and
+module-call stats, and the page loads of a version (until no page of it
+loaded for 30 days). Reads never delete: a periodic prune in the server process
 (`LOGS_PRUNE_INTERVAL_MS`, default 1 h, one replica at a time via a Redis
 lease) removes older rows for every app, also for apps nobody inspects. The
 beacon stores a page URL as origin + path only: the SDK never sends the query
@@ -620,13 +755,22 @@ available ones.
 A module with tables ships a drizzle migrations folder
 (`migrations: { folder }`). On start the server applies it with the module's
 **own journal**, `drizzle.__drizzle_migrations_mod_<name>`, after the core
-migrations (`DROBEK_MIGRATE_ON_START=0` turns both off). Conventions:
+migrations (`DROBEK_MIGRATE_ON_START=0` turns both off), under the same
+migration lock. Migrations only go forward: when the journal holds migrations
+the installed module version does not ship (a newer version migrated the
+database), the server refuses to start and names the module and image
+versions to run. Conventions:
 
 - table names start with `mod_<name>_` (e.g. `mod_hello_waves`) — for a
   module from `DROBEK_MODULES_DIR` the [migration lint](#installing-an-external-module)
   enforces it;
 - every per-app row references `apps(id)` with `ON DELETE CASCADE`, so deleting
-  an app deletes its module data;
+  an app deletes its module data: a delete in the dashboard is a soft delete,
+  and `APP_PURGE_AFTER_DAYS` (30) later the app purge deletes the `apps` row
+  and, through the cascade, every module row of the app (the built-in
+  modules' records, form submissions, end users with their identities,
+  uploads and sync state). A reference without `ON DELETE` blocks the purge of
+  that app: the server logs it and retries it on every run;
 - a handler always filters by `ctx.app.id`.
 
 ### Module e-mail
@@ -698,9 +842,9 @@ Every `ctx.email.send` of every module goes through one path in core:
 The one enabled module that declares `records` (the built-in `data`; two
 refuse the start) answers the app OWNER's questions about the app's stored
 records. Core calls it only after it authorized a drobek account for the app
-— MCP `query_data` (membership, viewer+) and the dashboard's Data tab (the
-workspace role; delete is editor+) — never for an app host request, so it
-bypasses the end-user rules. Each call gets a `RecordsView`: the ONE app,
+— MCP `query_data` (membership, viewer+), the MCP data write tools
+(editor+) and the dashboard's Data tab (the workspace role; changes are
+editor+) — never for an app host request, so it bypasses the end-user rules. Each call gets a `RecordsView`: the ONE app,
 the module's effective config for it, `db` and `log`.
 
 ```ts
@@ -724,18 +868,23 @@ null and both surfaces answer 404.
 
 The dashboard's app tabs (Data, Forms, Users, Uploads, Logs) act for the
 app OWNER through the same kind of owner-facing authority — core never reads
-or writes a module's tables. Every authority call gets an `OwnerView`
+or writes a module's tables. The MCP data tools (`create_records`,
+`update_record`, `delete_record`, `delete_collection`,
+`purge_orphan_records`) reach the same `records` methods for the agent,
+editor+, refused for a taken-down app; their audit rows carry actor kind
+`agent`. Every authority call gets an `OwnerView`
 (`RecordsView` is the same type): the app, the module's effective config,
 `db`, `log` and `limits()` (the workspace's limits, memoized per call).
 Loaders are viewer+, mutations editor+ (and the dashboard origin check);
 core writes the audit row (actor kind `user`).
 
-Optional `records` methods (the built-in `data` has all five; a module
+Optional `records` methods (the built-in `data` has all of them; a module
 without one answers `unavailable`, and `orphans` lists nothing):
 
 ```ts
 records: {
-  update?(view, collection, id, fields)  // → record | null; the module validates (schema, size, quota)
+  update?(view, collection, id, fields, { merge? }?) // → record | null; the module validates (schema, size, quota)
+  create?(view, collection, records)     // → the stored records, in order; ALL or nothing
   importCsv?(view, collection, csv)      // → { imported }; ALL or nothing
   dropCollection?(view, collection)      // → { records, configPatch }
   orphans?(view)                         // → [{ name, records }]: rows of undeclared collections
@@ -753,17 +902,31 @@ records: {
   deliberate bulk action by the owner, not app traffic) but **not** the
   quotas: `DATA_MAX_DOCS_PER_APP`, the per-app bytes and the per-record size
   still apply. Dashboard: `data.import` (row count only).
+- `update`: replaces the record's own fields (the dashboard's JSON editor);
+  `merge: true` merges them onto the stored ones like the SDK's update (MCP
+  `update_record` by default). Both build the new fields from the row as it
+  is under the app's write lock.
+- `create` (MCP `create_records`, at most 500 records per call): new records
+  without an owner, every one checked (schema, per-record size) before one
+  transaction stores them all against the quotas; the first bad one is a
+  `validation_failed` with `details.index`, and nothing is stored. Like the
+  import it bypasses `DATA_WRITE_RATE_LIMIT`, never a quota. Audit
+  `data.record_create` (collection + count).
 - `dropCollection`: deletes the records and returns the config patch that
   removes the collection; core applies the patch through the same path as
   `configure_module` (config lock, merge-patch, `validateConfig`) and writes
   the records deletion, the config and the `data.collection_delete` audit in
-  ONE transaction. The dashboard asks the owner to type the collection name.
+  ONE transaction. The dashboard asks the owner to type the collection name;
+  MCP `delete_collection` needs `user_confirmed: true` (the user's explicit
+  yes) and takes the app's single-writer lease like `configure_module`.
 - `orphans` / `purgeOrphan` (NSO-324): records whose collection the config no
   longer declares — e.g. a write that landed while the collection was being
   removed — are invisible to every other view but still count towards the
   quotas. The Data tab lists them with their counts; an editor purges one
   after typing its name (under the config lock, so it cannot be declared
-  meanwhile; audit `data.collection.purge` with `orphan: true`).
+  meanwhile; audit `data.collection.purge` with `orphan: true`). MCP
+  `purge_orphan_records` purges one or every orphan collection with
+  `user_confirmed: true`.
 
 Optional `endUsers` owner methods (the built-in `auth` has them):
 
@@ -809,6 +972,123 @@ the module's sniffed type, `nosniff`, `Content-Security-Policy: default-src
 'none'; sandbox`, and `inline` only for PNG / JPEG / GIF / WebP (everything
 else, SVG and PDF included, is an attachment).
 
+The agent reaches the same bindings over MCP, with the tabs' role floors
+(viewer+ reads, editor+ changes) and audit rows (the agent as the actor):
+`list_form_submissions` / `delete_form_submission` (`submissions`),
+`list_end_users` / `set_end_user_role` / `set_end_user_blocked` /
+`sign_out_end_users` (`endUsers` and the session epoch), `list_uploads` /
+`delete_upload` (`files`; never an upload's bytes). The lists answer only
+inside an untrusted envelope, at most 100 entries and 64 KiB per call;
+`set_end_user_role` passes `surface: 'mcp'` so `end_users.role` records the
+agent, and takes the app's single-writer lease because it changes the
+config. A module error becomes the tool error the agent acts on:
+`invalid_request` → `invalid_params`, `not_found`, `conflict` (with
+`details.reason` as `reason`), `unavailable`. `remove_module_secret`
+deletes one declared secret of the app after the user's explicit yes
+(audited `module.secret_remove`); no tool sets or reads a value.
+
+## Scheduled jobs (`jobs`)
+
+The server never runs app code, so work on a schedule — refreshing an app's
+data from an API every 15 minutes, a nightly clean-up — belongs to a module:
+it declares `jobs` (contract 1.2) and core runs them in the server process.
+
+```ts
+export default defineModule<Config>({
+  name: 'scores',
+  contract: '^1.2',
+  // …
+  jobs: [
+    {
+      name: 'refresh',                    // ^[a-z][a-z0-9_]{1,39}$, unique in the module
+      scope: 'app',                       // once per app, with that app's config
+      description: 'fetches the latest scores',
+      every: (config) => (config.feedUrl ? config.every : null), // '15m', or null: not for this app
+      async run(ctx) {
+        const key = await ctx.secrets.get('SCORES_API_KEY');
+        const res = await fetch(ctx.config.feedUrl, { headers: { authorization: `Bearer ${key}` }, signal: ctx.signal });
+        if (!res.ok) throw new Error(`the feed answered ${res.status}`); // → get_logs runtime, retried with backoff
+        // write the rows with ctx.db into the module's own tables
+      },
+    },
+    { name: 'prune', every: '1d', async run(ctx) { for await (const { app, config } of ctx.apps()) { /* … */ } } },
+  ],
+});
+```
+
+| Field | Rules |
+| ----- | ----- |
+| `name` | `^[a-z][a-z0-9_]{1,39}$`, unique within the module |
+| `scope` | `'server'` (the default): one run per interval for the whole server. `'app'`: one run per interval for **each app** that has a stored config of the module (a `configure_module` call, a dashboard save or a pending change), is live (not deleted, not taken down) and has the module on for its workspace |
+| `every` | milliseconds or a count with a unit — `'30s'`, `'5m'`, `'1h'`, `'1d'` — between 1 minute and 30 days (else the start is refused). An `app` job may pass `(config, app) => interval \| null` instead: read per app on every tick, `null`/`undefined` = not for this app now, an invalid value is skipped with a warning, a value outside the range is clamped to it |
+| `description` | one line; `skill_info('<name>').jobs` lists `{ name, scope, every, description }` (`every: 'config'` for one read from the config) |
+| `run(ctx)` | the work. A throw (or a rejection) fails the run |
+
+`run` gets the module's services — `db`, `log` (tagged with module, job and
+app), `contributions`, `module`, `job` — plus `signal` (aborted at the
+timeout or on shutdown: pass it to `fetch`) and `lastSuccessAt` (when the
+last successful run of this job, for this app, started — `null` the first
+time; an import can ask its source for what changed since). A `server` job
+also gets `limits()` (the server's defaults) and `apps()`, an async iterator
+over the same apps an `app` job runs for (`{ app, config, db, log }`). An
+`app` job gets the app's context without a caller: `app`, `config`,
+`pendingConfig`, `limits()` (the workspace's), `rateLimit()` (the same
+buckets as the module's routes) and `secrets.get()` (declared names only).
+A job sends no e-mail.
+
+An `app` job also reaches the app's other capabilities through core, never
+another module's code:
+
+- `ctx.upstreams.fetch(name, { method?, path?, headers?, body?, maxBytes? })`
+  calls an upstream the app's proxy config assigns, through the module that
+  owns upstream calls (`proxy`): the registered, admin-confirmed record, its
+  method and path allow-lists, the secret injected server-side, the SSRF
+  guard, `PROXY_RESPONSE_TIMEOUT_MS` (120 s) and the lower of
+  `PROXY_MAX_RESPONSE_BYTES` and `maxBytes` (a job's answer is always
+  buffered, a `text/event-stream` one too). The
+  job never sees the secret. There is no caller, so no call rule applies — an
+  upstream assigned with `call: "none"` works. Without an enabled `proxy`:
+  ModuleError `unavailable`.
+- `ctx.records.import(collection, records, { mode, key? })` writes a batch
+  into a collection through the records module (`data`): every record passes
+  the collection's schema, the size and the app's quotas, in one transaction
+  — `replace` leaves exactly the batch, `upsert` replaces the records with
+  the same `key` and adds the rest. A bad record refuses the whole batch
+  (`validation_failed` with `details.index`); nothing changes.
+- `ctx.audit(action, meta?)` writes an audit row `<module>.<action>` about
+  the app. A scheduled run has no person behind it: the row has no user
+  (the Activity view shows "system") and `meta.by: 'schedule'`; a run a
+  person started (the sync authority's `runNow`) names them.
+
+How core runs them:
+
+- A scheduler looks for due runs every 15 seconds. Each job (for each app)
+  keeps its state in Redis — when it last ran, when it last succeeded, how
+  many runs failed in a row — so a restart or another replica continues where
+  the last run left off; a run is due one interval after the last one, the
+  first one at once.
+- A Redis lease per run makes sure it runs **once across replicas**.
+- At most `MODULE_JOBS_CONCURRENCY` (4) runs are in flight per process; a
+  due run past the cap waits for a later tick. A run is cut off after
+  `MODULE_JOBS_TIMEOUT_MS` (5 minutes): its `signal` aborts and the run
+  counts as failed. A run that ignores the signal keeps its lease a minute
+  longer, then the next run may overlap it.
+- A failed run is logged (`module job failed`, with module, job, app, the
+  failures in a row and the retry delay, secrets redacted) and retried with
+  backoff: 1 minute, doubling per failure, at most the job's interval or an
+  hour, whichever is longer; a success resets it. An `app` job's failure is
+  also in the app's `get_logs({ kind: 'runtime' })`: type `module_job` with
+  `module` and `job`, the redacted message and an empty `url` — the agent
+  sees it where it looks for errors.
+- Nothing runs before the first tick after the start, and a scheduling error
+  is logged, never thrown: a job cannot hold up the server's start or its
+  requests. `MODULE_JOBS_ENABLED=0` turns the jobs off on one process (e.g.
+  all replicas but one); a server whose modules declare no jobs starts no
+  scheduler at all.
+
+`createModuleTestContext(module, { config, secrets, … }).runJob(name)` runs a
+job once the way the scheduler does (see [Testing a module](#testing-a-module)).
+
 ## Slots
 
 A slot is a typed extension point one module (the **host**) offers the
@@ -844,11 +1124,13 @@ with a message naming the module and the slot):
 
 - a slot name is `<host name>.<name>` (`^[a-z][a-z0-9]*\.[a-z][a-zA-Z0-9]*$`)
   and starts with the name of the module that declares it; a slot has a
-  `schema` and a `description`;
+  `schema` and a `description`, and `operatorOnly: true` when its
+  contributions configure the server, not apps (a contributor without a skill
+  may contribute only to such slots — [Operator-only modules](#operator-only-modules));
 - a module contributes at most one value per slot (`contributes` maps slot
-  name → value); the slot must be declared by an ACTIVE module — a
-  contribution to a slot of a module that is not in `DROBEK_MODULES`, or that
-  it does not declare, refuses the start;
+  name → value); the slot must be declared by an ACTIVE module or hosted by
+  core (`errors.reporter`, below) — a contribution to a slot of a module that
+  is not in `DROBEK_MODULES`, or that it does not declare, refuses the start;
 - every contribution must pass the slot's schema;
 - with `unique: '<key>'`, two contributions with the same value of that key
   refuse the start (`modules "a" and "b" both contribute id "x" to the slot
@@ -881,6 +1163,79 @@ Only a module that declares slots may compose; any other key, or a throw,
 refuses the start. The declared parts stay the module's view of a server
 without contributions.
 
+### Error reporters from modules
+
+Server errors always go to the log (container stdout). A module can also
+send them somewhere else (an incident webhook, a log service, …) by
+contributing to the `errors.reporter` slot. Core hosts this slot — there is
+no `errors` module (the name is reserved), so the reporter's module is the
+only one it needs. The slot is `operatorOnly`, so the module needs no skill:
+it is [operator-only](#operator-only-modules), never shown to agents or app
+owners:
+
+```ts
+import { defineErrorReporter, defineModule, z } from '@drobek/modules';
+
+export default defineModule({
+  name: 'webhookerrors', version: '1.0.0', contract: '^1.2',
+  configSchema: z.object({}), configDefaults: {},
+  contributes: {
+    'errors.reporter': defineErrorReporter({
+      apiVersion: 1,                    // optional; 1 is the reporter API this server implements
+      id: 'webhook',                    // 2–16 lowercase letters and digits
+      label: 'Incident webhook',
+      secrets: ['ERRORS_WEBHOOK_URL'],  // operator env vars, read at start
+      async report(event, { secrets, signal }) {
+        const res = await fetch(secrets.ERRORS_WEBHOOK_URL, {
+          method: 'POST', signal,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(event),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      },
+    }),
+  },
+});
+```
+
+- **Selection.** `ERROR_REPORTER=<id>` makes the contribution with that id
+  receive the server's errors; unset or empty, errors are only logged. The
+  server refuses to start when no active module contributes the id, a
+  declared secret is unset, or two contributions take one id.
+- **What is reported**: a 5xx of the dashboard (React Router) or the Express
+  app (`kind: 'http'`), a module route that throws (`module_route`, answered
+  `500 internal_error`), a failed or timed-out module job (`module_job`), a
+  failed e-mail send through any transport (`email`), a start-up failure
+  once the reporter is installed — module migrations and everything after
+  the modules load (`startup`, `level: 'fatal'`; the server waits for the
+  report, at most the timeout, before it exits) — and an error nothing
+  caught, an uncaught exception or unhandled promise rejection (`process`,
+  `level: 'fatal'`; the server stops gracefully and exits with code 1 once
+  the report went out or timed out).
+- **The event**: `{ level, message, error?: { name, message, stack? },
+  context: { kind, route?, method?, status?, module?, job?, appId?,
+  workspaceId?, requestId? }, release, environment, timestamp, fingerprint }`.
+  `release` is `DROBEK_VERSION` (else `GIT_SHA`), `environment` is
+  `NODE_ENV`; `fingerprint` is stable for the same error at the same place.
+  It never carries request bodies, headers, cookies or query strings;
+  `route` is the path (a module route its pattern, e.g.
+  `/__drobek/v1/forms/submit`) with long opaque segments read `:param`.
+  E-mail addresses, bearer / JWT tokens, `key=value` secrets, the reporter's
+  secret values and the server's own secrets are redacted from every text;
+  a database error reads `db error <code> (constraint …, table …)` —
+  never its SQL or bound values.
+- **Never in the way.** `report` runs after the response is decided and is
+  never awaited by a request. It is cut off after `ERROR_REPORTER_TIMEOUT_MS`
+  (default 5000: `ctx.signal` aborts); whatever it throws, and a timeout,
+  is logged once per minute (secrets redacted) and dropped. At most
+  `ERROR_REPORTER_MAX_PER_MINUTE` reports (default 60) go out per minute —
+  over it, one warning per minute and the rest are only logged — and an
+  identical error (same fingerprint) goes out once per minute. An error
+  inside `report` itself is never reported.
+- **Secrets** are server-level, as for e-mail transports: env var names in
+  `secrets`, values in `ctx.secrets`, never module secrets of the dashboard,
+  never over MCP, never logged.
+
 ## Per-app configuration
 
 Stored in `module_configs` (`app_id`, `module`, `config` jsonb, `pending`
@@ -909,7 +1264,7 @@ single-writer lease, merges the patch, and validates the result. Then:
   `hint: "skill_info('hello')"`;
 - **something that looks like a secret value** (an API key, a private key, …)
   → `invalid_params`: secrets are set only in the dashboard;
-- **unchanged** → `{ applied: false, unchanged: true, … }`;
+- **unchanged** → `{ applied: true, unchanged: true, … }` (nothing written);
 `confirmRequired(before, after, context)` gets both configs VALID and
 effective, and `context = { app, db }`: the app (id, slug, workspace) and the
 configure transaction (the config row is locked) for read-only lookups — e.g.
@@ -932,8 +1287,24 @@ transaction (actor: the confirming user).
   (audit `module.pending`, actor agent), the config in force stays:
   `{ applied: false, config, pending_confirmation: ["greeting: \"Hello\" → \"Ahoj\""], confirm_url }`.
 
-A newer pending change replaces the older one. Required secrets that are not
-set yet come back as `secrets_missing: ["NAME"]` (names only).
+An app has at most one pending change per module, and a newer proposal
+never replaces it: a call whose `confirmRequired` names changes while one
+waits **joins** it. The two patches are composed (the waiting one, then the
+new one) into one patch over the config in force, the result is validated
+as a whole and `confirmRequired` runs again from the config in force to it,
+so `pending_confirmation` lists what the combined change needs (a change the
+new patch undoes drops out). It needs a workspace admin when either part or
+the combined change does. The answer adds `merged_with_pending` (the changes
+that were waiting before), the audit row `module.pending` the same key, and
+the owner sees one before → after diff: Confirm applies all of it, Reject
+drops all of it. A proposal that does not fit the waiting change answers
+`invalid_params` with the issues and `pending_confirmation` (what waits);
+nothing is stored. A dashboard save (`surface: 'web'`) joins the same way. A
+call that needs no confirmation is written at once and leaves the waiting
+change as it is.
+
+Required secrets that are not set yet come back as `secrets_missing:
+["NAME"]` (names only).
 
 `get_app` returns `modules.<name>`: `{ configured, config, pending,
 pending_confirmation?, confirm_url?, secrets: [{ name, hasSecret }], info? }`.
@@ -990,15 +1361,22 @@ module or a third-party one gets the same pages (a grep guard in
 `@drobek/dashboard` keeps it that way).
 
 `/workspaces/<ws>/apps/<slug>/modules` lists the active modules for the app
-(configured or defaults, what waits, missing required secrets); the app page
+(configured or defaults, what waits, missing required secrets; never an
+[operator-only module](#operator-only-modules), which has no module page
+either), each under
+its `dashboard.title` with its name — "Scheduled imports (sync)" — and its
+`dashboard.description` (else "Use when …"), like the module page's
+heading; the app page
 shows a "N changes await confirmation" banner (`PendingBanner` +
 `loadPendingBanner()` in `@drobek/dashboard`). The module page (the
 `confirm_url`) has, top to bottom:
 
-- **the pending change**: who proposed it and when, the module's
+- **the pending change**: who proposed it last and when, the module's
   confirmRequired strings each with a plain-language risk note, a
   before → after table of every changed path of the effective config, and
-  Confirm / Reject (the same `runtime.confirm` / `reject` as the API above);
+  Confirm / Reject (the same `runtime.confirm` / `reject` as the API above)
+  — one decision for everything listed, also when several proposals were
+  joined into it;
 - **the configuration form**, generated from the module's `configSchema`
   (zod → JSON Schema, input side) by the dashboard's own renderer: objects
   (nested), string, string enum (a select), number / integer (with
@@ -1007,10 +1385,19 @@ shows a "N changes await confirmation" banner (`PendingBanner` +
   (`z.record(…)` — `additionalProperties`) and **arrays of objects**. A
   record or list renders each entry with its own fields (recursively), a
   "Remove" checkbox per entry and one empty entry to add a new one (a record
-  entry needs a name); entries nest up to 3 levels deep, below that a value
+  entry needs a name, labelled by the `title` / `description` of the
+  record's key schema — `z.record(z.string().meta({ title: 'Form name' }), …)`
+  — else "Name"); entries nest up to 3 levels deep, below that a value
   is a JSON field. Anything else — unions, a record of anything
   (`z.record(z.string(), z.unknown())`) — is a JSON field. The zod
   `.describe()` text (JSON Schema `description`) is shown under the field.
+  A string field annotated with `x-drobek-choices` is a select of existing
+  things ([Choices of a config field](#choices-of-a-config-field-x-drobek-choices));
+  rule strings, sizes in bytes, values a control of their own sets and the
+  order of an object's keys have keywords too
+  ([How a config field is shown](#how-a-config-field-is-shown)).
+  The empty option of a select names the default ("Default (1h)"), or reads
+  "Choose…" for a required field and "(not set)" otherwise.
   No client JS: the form posts plain fields; the server
   rebuilds the config, turns it into a merge patch against the config in
   force and runs **the same configure path as `configure_module`**
@@ -1054,6 +1441,95 @@ shows a "N changes await confirmation" banner (`PendingBanner` +
 Viewers see all of it without a single control; every POST needs the editor
 role (viewer → 403).
 
+#### Choices of a config field (`x-drobek-choices`)
+
+A string field of a `configSchema` that names something existing — an
+upstream, a data collection, a schedule — gets a select in the form when it
+carries the JSON Schema keyword `x-drobek-choices` (zod `.meta()`, typed by
+`ConfigFieldMeta` from `@drobek/modules`):
+
+```ts
+import { z, type ConfigFieldMeta } from '@drobek/modules';
+
+const source = z.strictObject({
+  upstream: z.string().meta({ title: 'Upstream', 'x-drobek-choices': 'upstreams' } satisfies ConfigFieldMeta),
+  collection: z.string().meta({ title: 'Collection', 'x-drobek-choices': 'collections' } satisfies ConfigFieldMeta),
+  every: z.string().default('1h').meta({
+    title: 'Schedule',
+    'x-drobek-choices': 'intervals',
+    'x-drobek-min-interval': 'HELLO_MIN_INTERVAL_MIN',
+  } satisfies ConfigFieldMeta),
+});
+```
+
+| `x-drobek-choices` | The select offers |
+| ----- | ----- |
+| `upstreams` | the upstreams registered in the app's workspace: those assigned to the app first ("Assigned to this app"), then the rest ("Not assigned to this app yet", with a note and a link to the module declaring `dashboard.editor: 'upstreams'`, where an upstream is assigned) |
+| `collections` | the app's data collections — the `collections` of the module declaring `dashboard.editor: 'collections'` |
+| `intervals` | `5m`, `10m`, `15m`, `30m`, `1h`, `3h`, `6h`, `12h`, `24h` ("every 15 minutes"), none shorter than the workspace's value of the module limit `x-drobek-min-interval` names (the minimum itself is offered when it is not on the list) |
+| `forms` | the app's forms — those with stored submissions or settings, each with its number of submissions ("contact — 3 submissions"), from the module declaring the `submissions` authority |
+
+- A current value that is not among the choices stays selected, marked
+  ("gone — not registered in this workspace", "2h — the current value"),
+  so saving the form never changes it by accident.
+- Nothing to choose and no value yet: the form shows no select but what to
+  set up first, with a link — the workspace's Upstreams page, or the
+  module that creates collections.
+- A list that cannot be loaded leaves a text field with a note.
+- On a record's key schema (`z.record(z.string().meta({ 'x-drobek-choices':
+  'forms' }), …)`) the list only suggests a name for the new entry: the
+  names no entry uses yet, in a list on the name input and in words under
+  it ("Suggested: newsletter (1 submission)"); any other name can still be
+  typed. `forms` uses it: the form-name entry suggests the forms that
+  received submissions but have no settings yet.
+- The keyword is presentation only: `configure_module`, the dashboard's save
+  and the `configSchema` validate the same with or without it, so an agent
+  may still set a value outside the choices. An unknown source, a
+  non-string field or an enum ignore it; the lists are found by
+  capability, never by a module's name.
+
+#### How a config field is shown
+
+More `ConfigFieldMeta` keywords change how the form shows a field and reads
+it back — never what the `configSchema` accepts, so `configure_module`
+validates the same. A field the form shows unchanged saves unchanged.
+
+```ts
+import { isValidRule, z, type ConfigFieldMeta } from '@drobek/modules';
+
+const rule = z.string().refine(isValidRule, 'a rule like "user|admin"');
+
+const config = z.strictObject({
+  rules: z.strictObject({
+    upload: rule.default('user').meta({ title: 'Who may upload', 'x-drobek-rule': ['public', 'user', 'admin'] } satisfies ConfigFieldMeta),
+    read: rule.default('user').meta({ title: 'Who may download', 'x-drobek-rule': true } satisfies ConfigFieldMeta),
+  }),
+  maxBytes: z.int().min(1).optional().meta({
+    title: 'Largest file',
+    'x-drobek-unit': 'bytes',
+    'x-drobek-default-limit': 'HELLO_MAX_BYTES',
+  } satisfies ConfigFieldMeta),
+  paused: z.boolean().optional().meta({ 'x-drobek-hidden': true } satisfies ConfigFieldMeta),
+  provider: z
+    .strictObject({ issuer: z.string().optional(), enabled: z.boolean() })
+    .meta({ 'x-drobek-order': ['enabled'] } satisfies ConfigFieldMeta),
+});
+```
+
+| Keyword | On | The form |
+| ----- | ----- | ----- |
+| `x-drobek-rule` | a rule string (`public`, `user`, `owner`, `admin`, `none`, alternatives joined with `\|`) | one checkbox per principal — Anyone, Signed-in users, Record owner, App admins — like the collections editor; rule fields next to each other share one table, a row each with the rule in force. Nothing checked saves `none`. `true` offers all four, a list only those (a principal the current rule names is offered too). A rule saved untouched keeps its exact text (`admin\|user` stays `admin\|user`); a changed one is written in the column order |
+| `x-drobek-unit: 'bytes'` | a number | entered in MB (1 MB = 1,048,576 bytes, decimals allowed) and saved as whole bytes; the bounds read in MB ("At most 1024 MB.") and a value outside them is refused at the field in MB. A value that is not a whole number of MB shows exactly, so it saves unchanged |
+| `x-drobek-default-limit` | any field | the env name of one of the module's `limits` that applies while the field is empty: the hint says the workspace's value ("Left empty: 10 MB, the limit in force.") |
+| `x-drobek-hidden: true` | any field | not shown: a hidden input carries the current value through a save, so the form never changes it — for a key the page sets with a control of its own (`sync`'s Pause / Resume). Agents set it with `configure_module` as before |
+| `x-drobek-order` | an object | the listed keys first, in that order; the others follow in the schema's order — e.g. a switch before the fields it turns on, where `.extend()` put it last |
+
+The built-in modules use them: `files` shows `rules.upload` / `rules.read`
+as checkboxes (upload without Record owner — the uploader is the owner) and
+`maxBytes` in MB with `FILES_MAX_BYTES` as what empty means; `sync`'s
+`paused` is hidden (Pause schedule / Resume schedule under Sources set
+it); every `auth` sign-in provider shows its On switch first.
+
 ### The workspace Modules page
 
 `/workspaces/<ws>/modules` (the workspace's **Modules** tab, every member —
@@ -1065,11 +1541,17 @@ value of each contribution), its own contributions, the limits it declares
 with the value in force for this workspace (the limits provider's plan,
 else the server's env / default) and its error codes. Never a path on disk,
 never a secret. The facts come from `ModuleRuntime.moduleFacts()`; agents
-get the same fields from `skill_info('<name>')`.
+get the same fields from `skill_info('<name>')`. An
+[operator-only module](#operator-only-modules) is listed for super-admins
+only, its card marked operator-only (`operatorOnly` in the facts) and
+named among the contributors of the slots it contributes to; the other
+members never see it, not even there.
 
 The page leads with a search (`?q=`, every word must appear in the name,
-"use when", a slot or a limit name — a GET form, no client JS) and a jump
-list. Each card shows what the module is for, its version, availability
+the `dashboard.title` or `description`, "use when", a slot or a limit name
+— a GET form, no client JS) and a jump list. Each card is headed by the
+module's title and name ("Scheduled imports (sync)") and shows what the
+module is for, its version, availability
 and requirements; the limits and the technical facts (source, contract,
 slots, contributions, error codes) are collapsed sections. A limit's value
 is shown in human units read from its env name or meaning (`…_BYTES` /
@@ -1077,7 +1559,9 @@ is shown in human units read from its env name or meaning (`…_BYTES` /
 underneath (`10,485,760 bytes`); a count is shown as is.
 
 An opt-in module's card also shows its state for this workspace — enabled
-or not, and what decides it (the plan, the env, or a super-admin's switch) —
+or not, and what decides it (the plan, the env, or a super-admin's switch),
+the required modules still off for it and the enabled modules that depend
+on it —
 and, for a super-admin only, the Enable / Disable switch
 ([Per-workspace enabling](#per-workspace-enabling-opt-in-modules)). The
 switch is mounted through `<WorkspaceModules availabilityControls={…}>`
@@ -1106,7 +1590,8 @@ It never returns a secret value or any app's config.
 
 Two sources feed one list:
 
-- **module skills**: every active module's `skill`;
+- **module skills**: every active module's `skill` (an
+  [operator-only module](#operator-only-modules) has none and is not listed);
 - **general skills**: `skills/<name>/SKILL.md` with frontmatter `name` and
   `description` (the description is the "use when …" sentence). The directory
   is `DROBEK_SKILLS_DIR`, else `<cwd>/skills` (the image copies the repo's
@@ -1128,17 +1613,21 @@ verbatim:
 > external APIs), call `skill_info` and follow the skill; `create_app`/`get_app`
 > list the available skills.
 
-The repo ships four general skills: `start` (how an app works: files,
+The repo ships five general skills: `start` (how an app works: files,
 `drobek.json`, the write_files → compile → preview → publish loop, the lease,
 what the server never runs), `debug` (reading `compile.errors` and
 `get_logs`, typical causes and fixes), `ui` (Tailwind v4's browser build
 from esm.sh, responsive layout, the accessibility minimum, forms and
-loading/error states) and `port-artifact` (moving a Claude artifact to
+loading/error states), `port-artifact` (moving a Claude artifact to
 drobek: text files unchanged with `write_files`, every binary through
 `create_asset_upload` at the same path, what the app CSP changes, no
-`window.claude.*`). With every built-in module enabled `skill_info()` lists
-10 skills: `auth, email, forms, data, proxy, files, debug, port-artifact,
-start, ui` (plus `hello` in the dev stack).
+`window.claude.*`) and `port-app` (moving a Lovable, Bolt, v0 or Vite + React
+project to drobek: pinned esm.sh imports with one React, the `@/` alias
+through `drobek.json` `paths`, Tailwind's browser build, Supabase calls
+replaced by modules). With every built-in module enabled `skill_info()` lists
+14 skills: `auth, email, forms, data, proxy, files, sync, oidc, webhooks, debug,
+port-app, port-artifact, start, ui` (plus `hello` and the opt-in `acmecrm` in the dev
+stack).
 
 ### The skill format (NSO-308)
 
@@ -1155,7 +1644,8 @@ lines (frontmatter included) and exactly these `##` sections under one
 4. `## 4. Rules and limits` — what the server enforces (confirmations,
    limits by env name and default);
 5. `## 5. Errors → fix` — a table `| error | cause | fix |`; a backticked
-   code in the first column must exist in the error catalogue.
+   code in the first column must exist in the error catalogue, the module's
+   `errors` or those of a module it `requires`.
 
 `checkSkill(module)` from `@drobek/modules/testing` enforces the format
 (and a one-sentence "use when" of 30–220 characters) and that the code does
@@ -1174,7 +1664,8 @@ declarations; `json` blocks must parse, a `configure_module` payload
 blocks; `html` is compiled and its `<script src>` must satisfy the apps CSP;
 `css` is compiled; `sh`/`text` are prose; a block without a language fails.
 A module skill needs a `ts api` block per import it offers and one
-`configure_module` payload. A failure names the SKILL.md line, the skill and
+`configure_module` payload — of the module itself or of a module it
+`requires` (a sign-in provider shows the auth config). A failure names the SKILL.md line, the skill and
 the block. The e2e module specs run the FIRST ```` ```tsx ```` block of a
 module skill as a live app — keep its visible texts stable.
 
@@ -1185,15 +1676,20 @@ skills?) is `tests-eval/` (`task eval`, manual, not CI).
 
 Every limit is its env var (`HELLO_WAVES_PER_MINUTE=5`) or the module's
 default. Besides every active module's `limits`, the catalogue holds the
-**core limits** (`CORE_LIMITS` from `@drobek/modules`, which core enforces
-itself and a module may not declare):
+**core limits** (which core enforces itself and a module may not declare):
 
 | Name | Default | Semantics |
 | --- | --- | --- |
 | `APPS_MAX_PER_WORKSPACE` | 50 | live apps one workspace may hold (soft-deleted apps do not count); `create_app` beyond it answers `limit_exceeded` with `limit` / `value` |
 | `DOMAINS_MAX_PER_APP` | 3 | custom domains per app, pending + verified; the next add answers `limit_exceeded`. `0` is valid and turns custom domains off: the dashboard's Domains tab says so and every add is refused |
+| `UPSTREAMS_MAX_PER_WORKSPACE` | 20 | proxy upstreams one workspace may hold; `register_upstream` and the Upstreams page beyond it answer `limit_exceeded` with `limit` / `value` (existing upstreams over a lowered limit stay) |
 | `APP_ASSET_MAX_BYTES` | 104857600 | bytes of one app asset (100 MiB — video, audio, image, font at `/<path>`); `create_asset_upload` / the upload URL answer `asset_too_large` |
 | `APP_ASSETS_QUOTA` | 1073741824 | bytes of all assets of one app (1 GiB); past it `asset_quota_exceeded` |
+| `VERSIONS_PER_APP_HOUR` | 600 | new versions of one app within the last hour — `write_files`, `create_app`, `restore_version`, `duplicate_app` and the dashboard's Restore together; past it `rate_limited` with `limit` / `value` / `retry_after_seconds`, nothing stored |
+| `VERSIONS_PER_USER_HOUR` | 1200 | new versions one person makes within the last hour, in every app and workspace (the plan of the workspace being written applies); past it `rate_limited` like above |
+| `APP_VERSIONS_KEEP` | 200 | the newest versions of each app the hourly history retention keeps; older ones are deleted, except the published one, the one the preview serves, the kept ones, those kept for a rollback and those from the last hour. While the provider does not answer for a workspace, the retention leaves it alone |
+| `APP_VERSIONS_KEPT_MAX` | 20 | versions of one app its members may keep; keeping one more answers `limit_exceeded` with `limit` / `value`; a lower value leaves the versions already kept alone |
+| `WORKSPACE_SOURCE_QUOTA` | 1073741824 | bytes of the unique files (sources and build output) the versions of a workspace's live apps store (1 GiB); a version whose new bytes do not fit answers `limit_exceeded` with `limit` / `value` / `used_bytes`, nothing stored |
 
 `ModuleRuntime.workspaceLimits(workspaceId)` returns a workspace's effective
 limits (core and module) for core callers. An operator with plans sets:
@@ -1223,7 +1719,7 @@ protocol is the same; a value other than `0` / `1` is ignored.
 Answers are cached in Redis for 60 s (`drobek:limits:<workspace_id>`). When
 the provider is down, slower than 2 s or answers garbage, the env defaults
 apply for 10 s and a warning is logged: a provider outage never takes apps
-down. `signLimitsRequest(secret, ts, path)` is exported for the provider side.
+down.
 The server refuses to start with a URL but a missing or weak secret.
 
 ## Testing a module
@@ -1249,14 +1745,21 @@ t.audits;   // [{ action: 'hello.…', meta }]
 t.emails;   // [{ to, subject, text, kind, fromName?, replyTo? }] (owners: ['…'] feeds { appOwners: true })
 t.setPrincipal({ kind: 'anon' });
 await t.confirm({}, { greeting: 'Ahoj' });   // confirmRequired over two config patches → ['greeting: …']
+await t.runJob('refresh');                   // one run of a scheduled job → { ran, intervalMs }
 ```
 
 Mutating requests send the app's `Origin` and `X-Drobek-SDK: 1` by default;
 pass `headers` to test the CSRF guard. `contributions: { '<slot>': [value, …] }`
-sets what `ctx.contributions(slot)` returns. `request()` rejects where
+sets what `ctx.contributions(slot)` returns. A response's list-valued
+header is joined with `, ` in `headers`; `setCookies` lists every
+`Set-Cookie` apart. `request()` rejects where
 production answers `500 internal_error`: an exception that is not a
 ModuleError, or a ModuleError with a code that is neither core nor in the
-module's `errors`.
+module's `errors`. `runJob(name, { signal?, lastSuccessAt? })` runs one of
+the module's `jobs` once: an `app` job for the test app with the test config,
+secrets and limits (`{ ran: false }` when its `every(config)` gives no
+interval), a `server` job with `apps()` yielding the test app; it rejects
+with the job's own error.
 
 The database for `db` needs no other drobek package:
 
@@ -1278,7 +1781,9 @@ expect((await checkSkill(hello)).map(formatSkillIssue)).toEqual([]);   // the SK
 in this repo, a copy inside the published package). `checkSkill(module,
 { modules?, file?, root? })` returns the issues of the module's skill:
 `modules` adds other modules whose SDK the examples use (e.g. the `auth`
-module for `drobek.auth`), `root` is the directory whose `node_modules`
+module for `drobek.auth`; the set is composed like a server's, so a sign-in
+provider's `configure_module('auth', { providers: { <id>: … } })` payload
+passes), `root` is the directory whose `node_modules`
 resolve the examples' bare imports (default: the working directory; an
 unresolved one is typed `any`). It needs `typescript` installed (an
 optional peer dependency).
@@ -1287,8 +1792,8 @@ optional peer dependency).
 
 A module outside this repository is an npm package written against the
 published contract. Every drobek release publishes, with the image's
-version, three npm packages: **`@freema/drobek-modules`** (the contract,
-the registry's checks, the test kit), **`@freema/drobek-sdk`** (the browser
+version, three npm packages: **`@freema/drobek-modules`** (the public
+contract and the test kit, see [Public API and semver](#public-api-and-semver)), **`@freema/drobek-sdk`** (the browser
 `SdkCore` a module's SDK entry receives) and **`create-drobek-module`**
 (the scaffold). All three are AGPL-3.0-only, like the rest of drobek
 ([`LICENSING.md`](./LICENSING.md) → Modules).
@@ -1340,7 +1845,8 @@ is the scaffold's output plus the slot demo.
 - `contract` is a semver range against the server's `MODULE_CONTRACT_VERSION`;
   a server whose version does not satisfy it refuses to start. Declare the
   lowest contract whose fields the module uses (`'^1.1'` for `errors`,
-  `slots`, `contributes`, `availability`, `dashboard`, `onAppDelete`).
+  `slots`, `contributes`, `availability`, `dashboard`, `onAppDelete`;
+  `'^1.2'` for `jobs`).
 - `@drobek/modules` and `drizzle-orm` are **peer dependencies** (and dev
   dependencies for the tests — `@drobek/modules` through the npm alias);
   `zod` comes as `z` from `@drobek/modules`.
@@ -1354,6 +1860,49 @@ is the scaffold's output plus the slot demo.
   (`ctx.db`). It keeps to its own tables (`mod_<name>` / `mod_<name>_*`,
   foreign keys only to `apps(id)` / `workspaces(id)`), never alters another
   table, never reads secrets of other modules, and never executes app code.
+
+### Public API and semver
+
+`@freema/drobek-modules` publishes two entry points, and they are its whole
+public API:
+
+- `@drobek/modules`: the contract. `defineModule` and the slot helpers
+  (`defineAuthProvider`, `defineSignInObserver`, `defineEmailTransport`),
+  `z`, `respond`, `ModuleError` and the error helpers, the rule helpers,
+  `perIpLimitKey`, the byte-sniffing helpers, the contract constants and
+  every type a module names (`ModuleContext`, `HookApp`, `DB`, `Logger`,
+  `SdkCore`, the limit and error types, …);
+- `@drobek/modules/testing`: the test kit. `createModuleTestContext`,
+  `createTestApp`, `coreMigrationsDir`, `checkSkill` with the skill-check
+  helpers, `memoryMailGuard`, and `loadModules` / `buildSdk` (the server's
+  loader and SDK build, to assert that the module loads next to others and
+  its SDK slice builds).
+
+The runtime, the registry and loader, the limits provider, end-user
+sessions and the secret and config storage are internal to the server and
+not published. The contract entry never imports them (a test walks its
+import graph), the examples and the scaffold import only these two entries,
+and the published declarations of both are snapshotted in the repository
+(`packages/create-drobek-module/src/__snapshots__/`), so every change to
+the API shows in review.
+
+The package version is the drobek release version, and semver applies to
+this API:
+
+- **breaking**: anything that can stop a module that compiled and passed
+  its tests from doing so — removing or renaming an export, a required
+  field or parameter added, a parameter type narrowed or a return type
+  widened, a documented behaviour changed, a new major
+  `MODULE_CONTRACT_VERSION`. It needs a new major version; while drobek is
+  `0.x`, the minor plays that part (`^0.Y.Z` never crosses it);
+- **additive**: a new export, an optional field or parameter, a new error
+  code, a contract minor (`1.1` → `1.2`). A minor version, or a patch
+  while drobek is `0.x`;
+- **patch**: no change to the declarations.
+
+A deprecated export keeps working until the next breaking version and is
+marked `@deprecated` in its declaration: `loadModules` and `buildSdk`
+imported from `@drobek/modules` (use `@drobek/modules/testing`).
 
 ### Publish
 
@@ -1385,7 +1934,9 @@ pinned counter module against candidate core packages before release.
 | Module contract (`MODULE_CONTRACT_VERSION`) | drobek image / npm packages | A module declaring |
 | --- | --- | --- |
 | `1.0.0` | v0.1.0 – v0.1.4 | `'^1.0'` (or no `contract`) |
-| `1.1.0` | v0.2.0 – | `'^1.1'` or `'^1.0'` |
+| `1.1.0` | v0.2.0 – v0.5.x | `'^1.1'` or `'^1.0'` |
+| `1.2.0` | v0.6.0 – v0.8.x | `'^1.2'` (a module with `jobs`), `'^1.1'` or `'^1.0'` |
+| `1.3.0` | v0.9.0 – | `'^1.3'` (a module with `secretsFor`, `records.create` or `passwordGate`), `'^1.2'`, `'^1.1'` or `'^1.0'` |
 
 `@freema/drobek-modules@X.Y.Z` is the contract of the image `ghcr.io/freema/drobek:vX.Y.Z`
 (both come from one tag). Additive contract changes raise the minor version
@@ -1394,11 +1945,19 @@ change raises the major, and such a server refuses `'^1.x'` modules with a
 message naming both versions. The server logs the version at start
 (`platform modules ready`, `contract`).
 
-One change within `1.1.0` is not additive: since v0.3.0 a sign-in provider's
-`callback()` must return `issuer` (see
-[Auth providers](#auth-providers)). A provider module written for v0.2.x
-still loads, but its sign-ins fail with `provider_error`; add `issuer` to its
-identity before upgrading the server.
+A sign-in provider has its own compatibility boundary besides `contract`:
+the auth provider API it declares in its `auth.provider` contribution as
+`apiVersion` (`AUTH_PROVIDER_API_VERSION`, now `2`). API 2 requires
+`callback()` to return the verified `issuer`. A provider written before
+that declares no `apiVersion`, and the server refuses to start with it —
+`module "<name>": its contribution to the slot "auth.provider" (module
+"auth") does not pass the slot's schema — apiVersion: missing — …` — instead
+of failing each sign-in with `provider_error`. To migrate a provider,
+return the `issuer` it verified (OIDC: the `iss` of the validated ID token;
+SAML: the assertion's Issuer), add `apiVersion: 2` next to its `id`, and
+publish a new version. The module's `contract` range stays as it is
+(`'^1.1'` keeps loading); modules without an `auth.provider` contribution
+are not affected.
 
 ### Published modules
 
@@ -1413,6 +1972,7 @@ its license and where its source is.
 | Package | What it does | Contract | Source |
 | --- | --- | --- | --- |
 | `drobek-module-hello` | the scaffold's output plus the slot demo — a starting point, not for production; not on npm, install it from a tarball `npm pack` writes in the example | `^1.1` | [`examples/drobek-module-hello`](../examples/drobek-module-hello) |
+| `drobek-module-acme-crm` | an opt-in example (module `acmecrm`): contacts per app, one written on every end-user sign-in through the `auth.signedIn` slot; not on npm, install its `npm pack` tarball with `selfhost:module:add` | `^1.2` | [`examples/drobek-module-acme-crm`](../examples/drobek-module-acme-crm) |
 | `drobek-module-counter` | named counters per app (page views, likes, downloads): `drobek.counter.hit(key)` / `get(key)` / `list()`, per-IP and per-app hit limits, `maxKeys`; on npm as `drobek-module-counter` (`task selfhost:module:add -- drobek-module-counter@<version>`), each version also as a tarball on its [GitHub release](https://github.com/freema/drobek-module-counter/releases) | `^1.1` | [`freema/drobek-module-counter`](https://github.com/freema/drobek-module-counter) |
 
 ## End-user sessions (core)
@@ -1432,6 +1992,9 @@ auth module:
 - the app's epoch `drobek:eu-epoch:<app_id>`: a session whose epoch differs is
   dead. Raising it signs every user of the app out on every host of the app
   (preview, production, version hosts);
+- the app purge (`APP_PURGE_AFTER_DAYS` after a delete) removes the app's
+  session records and its epoch (`forgetEndUserSessions`, one `SCAN` pass per
+  run), after the user rows went with the app;
 - **the record is never the principal on its own**: for every module request
   that carries a live session, core asks the module that owns end-user
   sessions (`endUsers.current`, the auth module) who the user is NOW, with
@@ -1453,6 +2016,7 @@ auth module:
   title, message, link? }`; a throw is a generic 500 page;
 - helpers: `createEndUserSession`, `loadEndUserSession`,
   `renewEndUserSession`, `destroyEndUserSession`, `revokeEndUserSessions`,
+  `forgetEndUserSessions`,
   `endUserCookieHeader`, `readEndUserToken`, `cookiePrincipalResolver({
   redis, secure, current })` (fails closed: any Redis error is an anonymous
   visitor).
@@ -1513,9 +2077,11 @@ an app sign in with a 6-digit code e-mailed to them. Its `SKILL.md` is what
   the app (a one-line, capped name) and goes to `{ signInAddress }`; logs mask
   addresses (`maskEmail`). The per-IP, per-address and per-app code counters
   are only read before the send and charged after the code went out
-  (`checkOtpRequest` / `chargeOtpRequest`): an attempt the module e-mail
-  guard refuses (paused, a share used up) costs nothing, so a user who
-  retried during a pause is not limited after it.
+  (`checkOtpRequest` / `chargeOtpRequest`): an attempt that sent nothing —
+  the module e-mail guard refused it (paused, a share used up) or the mail
+  transport failed — costs nothing but the route's per-IP attempt limit, so
+  a user who retried during a pause or a mail outage gets a code as soon as
+  mail works again.
 - **verify** decides the allowlist again (it may have changed since the code
   was sent), upserts the user (role from the config), creates the session and
   writes the audit `auth.sign_in` (actor end_user).
@@ -1556,11 +2122,14 @@ an app sign in with a 6-digit code e-mailed to them. Its `SKILL.md` is what
 Other modules add ways to sign in through the auth module's slot
 `auth.provider` (`defineAuthProvider` from `@drobek/modules`). A provider
 only **proves an identity**; auth keeps the allowlist, roles, users,
-sessions and audits.
+sessions and audits. A provider declares `apiVersion: 2` (the auth
+provider API it implements, see [Compatibility](#compatibility)); a
+contribution without it, or with another value, refuses the server start.
 
 ```ts
 contributes: {
   'auth.provider': defineAuthProvider({
+    apiVersion: 2,                      // AUTH_PROVIDER_API_VERSION: callback() answers the issuer
     id: 'oidc',                         // ^[a-z][a-z0-9]{1,15}$, not "email"
     label: 'Company SSO',               // "Continue with Company SSO"
     configSchema: z.strictObject({ issuer: z.url(), clientId: z.string() }), // no `enabled`
@@ -1591,7 +2160,14 @@ method off never waits.
 (`providers.emailCode.enabled`). A stored config naming a provider the
 server no longer runs is salvaged: that entry is dropped (or a broken one
 turned off), never the e-mail code switched back on — with nothing on,
-nobody can sign in until the owner fixes it.
+nobody can sign in until the owner fixes it. A provider whose configSchema
+declares `label` lets each app name its button: `<LoginGate>`,
+`drobek.auth.providers()` and the sign-in pages show `providers.<id>.label`
+instead of the contribution's `label` (the built-in `oidc`: "Continue with
+Acme"). `get_app` → `modules.auth.info.providers` lists every provider of
+the server as `{ id, enabled, serverEnv }` — `serverEnv` names the
+operator's `AUTH_<ID>_*` variables that are set, never a value; whether the
+app has its own secret is `modules.auth.secrets[].hasSecret`.
 
 **Secrets.** A provider's secrets are per-app secrets of the auth module
 (set in the dashboard, never through MCP); names start with `<ID>_`. A
@@ -1632,7 +2208,8 @@ GET /__drobek/v1/auth/complete?code= ◄── 302
 - the handoff code (32 random bytes) lives 60 s, works once, and only on the
   app host that began the sign-in, in the browser holding the flow cookie
   (`__Host-drobek_eu_flow`: Secure, `Path=/`, no `Domain`, HttpOnly,
-  SameSite=Lax, 10 min; `drobek_eu_flow` on plain-http dev) — a callback
+  SameSite=Lax, 10 min; `drobek_eu_flow` on plain-http dev; `complete`
+  expires it with the session cookie) — a callback
   link handed to someone else signs nobody in, and another app host under
   `APPS_DOMAIN` cannot plant the cookie: a browser refuses a `__Host-`
   cookie with a `Domain`, and `complete` reads no other name. A sign-in begun
@@ -1725,6 +2302,74 @@ policy and a way to reach the app's owners. `skill_info('email')`.
   the app sends — form notifications and sign-in codes included.
 - **Limits**: `EMAIL_PER_APP_PER_DAY` 50, `EMAIL_NOTIFY_ADMINS_PER_DAY` 20
   (notifyAdmins calls per app per day; the 21st is `429 limit_exceeded`).
+- **Slot** `email.transport` (unique `id`, `operatorOnly`): another e-mail
+  provider for the whole server, see below.
+
+### E-mail transports from modules
+
+SMTP and Resend are built into core (`@drobek/email`), so sign-in codes and
+invites never depend on an installed module. Any other provider (SES,
+Postmark, a company relay, …) comes as a module contributing to the
+`email.transport` slot, which the `email` module hosts. The slot is
+`operatorOnly`, so the module needs no skill: it is
+[operator-only](#operator-only-modules), never shown to agents or app owners:
+
+```ts
+import { EmailSendError, defineEmailTransport, defineModule, z } from '@drobek/modules';
+
+export default defineModule({
+  name: 'postmark', version: '1.0.0', contract: '^1.2',
+  configSchema: z.object({}), configDefaults: {},
+  requires: ['email'],
+  contributes: {
+    'email.transport': defineEmailTransport({
+      apiVersion: 1,                // optional; 1 is the transport API this server implements
+      id: 'postmark',               // 2–16 lowercase letters and digits; not smtp or resend
+      label: 'Postmark',
+      secrets: ['POSTMARK_TOKEN'],  // operator env vars, read at start
+      async send(msg, { secrets, signal }) {
+        const res = await fetch('https://api.postmarkapp.com/email', {
+          method: 'POST',
+          signal,
+          headers: { 'X-Postmark-Server-Token': secrets.POSTMARK_TOKEN, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            From: `"${msg.from.name}" <${msg.from.address}>`, To: msg.to, Subject: msg.subject,
+            HtmlBody: msg.html, TextBody: msg.text, ReplyTo: msg.replyTo,
+          }),
+        });
+        if (res.status === 429) throw new EmailSendError('rate_limited', `HTTP ${res.status}`, { status: 429 });
+        if (!res.ok) throw new EmailSendError(res.status >= 500 ? 'unavailable' : 'rejected', `HTTP ${res.status}`, { status: res.status });
+      },
+    }),
+  },
+});
+```
+
+- **Selection.** `EMAIL_TRANSPORT=<id>` makes the contribution with that id
+  carry every message of the server: dashboard sign-in codes, workspace
+  invites, platform notices and every module's `ctx.email.send`. The server
+  refuses to start when no active module contributes the id (the `email`
+  module and the transport's module must both be in `DROBEK_MODULES`), when
+  a contribution takes the id `smtp` or `resend`, or when two take one id.
+  An opt-in transport module still carries the whole server's mail.
+- **The message** is what the built-in transports send: `from` (`{ name,
+  address }`: `EMAIL_FROM`'s address under a one-line display name), one
+  `to` address, `subject`, `text`, `html` and an optional `replyTo`.
+- **Secrets** are server-level, never per app: the env var names in
+  `secrets` (UPPER_SNAKE) must all be set in the server env or the start is
+  refused; `send` gets their values in `ctx.secrets`. They are not module
+  secrets of the dashboard, never pass through MCP, and the server never
+  logs them.
+- **Errors.** `send` resolves once the provider accepted the message. Throw
+  an `EmailSendError` (`rate_limited`, `unauthorized`, `rejected`,
+  `unavailable`, `timeout`) to keep its code; any other throw becomes
+  `unavailable`. Every secret value is redacted from the message the caller
+  sees and logs. The callers answer as for SMTP and Resend: the module route
+  `503 unavailable`, the sign-in form its "could not be sent" error.
+- **Timeout.** A send is aborted after `EMAIL_TRANSPORT_TIMEOUT_MS` (default
+  10000): `ctx.signal` aborts and the send fails with `timeout`. The rate
+  limits (`OTP_*`, `EMAIL_GLOBAL_*`, the per-app limits) apply above the
+  transport, unchanged.
 
 ## The built-in `forms` module
 
@@ -1819,7 +2464,10 @@ of JSON records with per-operation rules. `skill_info('data')`.
     `{ id, deleted: true }`;
   - `GET :collection/export.csv?filter=&sort=&dir=` (rule `admin`) →
     `text/csv` attachment through `@drobek/core` `csvLine` (formulas
-    neutralized), audit `data.export`.
+    neutralized), audit `data.export`;
+  - `GET :collection/events` (rule `read`, like a list) → a
+    `text/event-stream` of the collection's committed changes (see
+    **Live subscriptions** below).
   A record is `{ _id, _owner, _created_at, _updated_at, …fields }`. The `_…`
   fields are the server's: sent by a client they are dropped. `_owner` is the
   principal's id at create time (null for a visitor) and never changes;
@@ -1859,9 +2507,56 @@ of JSON records with per-operation rules. `skill_info('data')`.
   `{read: owner|admin, create: user, update / delete: owner|admin}`), every
   live document a record; then the old tables and enum are dropped. Every
   statement is re-runnable.
+- **Live subscriptions** (`live.ts`, `live-feed.ts`). The store publishes
+  every committed write — the SDK routes, the owner's MCP writes and Data
+  tab, CSV imports, module imports (`sync`) — so no caller publishes on its
+  own. Over Redis: one pub/sub channel per app + collection fans the event
+  out to every process, and a Redis stream per app + collection keeps the
+  last `DATA_SUBSCRIBE_BACKLOG` (100) events for 10 minutes after the last
+  write (Redis 7: a resume checks the stream's `max-deleted-entry-id`). A
+  batch of more than 50 records (an import, a big `create_records`) and a
+  lost subscriber connection send `reset` instead. A collection removed
+  with its records sends nothing: its open streams end with `not_found` at
+  the next heartbeat.
+  The stream sends `retry: 2000`, then `event: ready` (its `id` is where it
+  starts, the Redis clock) — or, with a `Last-Event-ID` (or
+  `?last_event_id=`) younger than the backlog and nothing trimmed after it,
+  the missed events; otherwise `event: reset`. Then `event: change` with
+  `{ op: 'create' | 'update', record, at }` or `{ op: 'delete', id, at }`
+  (the id of the stream entry as `id:`), `event: reset` (load the list
+  again), `: ping` every 25 s, and a last `event: error` `{ error, message }`
+  when the stream ends for a reason (`unauthorized`, `forbidden`,
+  `not_found`, `unavailable`, `slow_client`).
+  **Authorization** is the list's, at the subscribe and for every event:
+  the collection's read rule is read again from the stored config
+  (`ctx.currentConfig()`, once per event and process) and the caller's
+  session (`ctx.currentPrincipal()`) at most every 10 s and on every
+  heartbeat; under a rule that admits the caller only through `owner` an
+  event is sent only for a record whose stored `_owner` is the caller (a
+  delete carries only the id); a visitor never gets `_owner`. A rule that
+  no longer admits the caller, a removed collection, or an app deleted or
+  taken down ends the stream (the heartbeat checks it too).
+  **Limits** (in each process, like the proxy's slots):
+  `DATA_SUBSCRIBE_MAX_PER_APP` (200) open streams per app,
+  `DATA_SUBSCRIBE_MAX_PER_CALLER` (4) per signed-in user or visitor IP →
+  `429 limit_exceeded` (`details.limit`); a stream ends after
+  `DATA_SUBSCRIBE_MAX_MS` (1 h) and the SDK resumes it; one whose client
+  leaves 1 MiB unread ends with `slow_client`. Every end — the client
+  leaving, the lifetime, an error, the server's graceful stop
+  (`endModuleStreams`, then new subscribes answer `503 unavailable`) —
+  releases its slots, timers and channel.
 - **SDK** `drobek.data.collection<T>(name)` → `list(opts)`, `get(id)`,
-  `create(fields)`, `update(id, fields)`, `remove(id)`, `exportCsvUrl(opts)`;
-  the types (`Doc<T>`, `Filter<T>`, `Page<T>`) are in `/__drobek/sdk.d.ts`.
+  `create(fields)`, `update(id, fields)`, `remove(id)`, `exportCsvUrl(opts)`,
+  `subscribe({ onChange, onSync?, onError? })` (also
+  `drobek.data.subscribe(name, opts)`) → the unsubscribe function. It reads
+  the stream with `fetch` (`@drobek/sdk` `openEventStream`): `ready` and
+  `reset` call `onSync` (load the list), `change` calls `onChange`; a dropped
+  connection, an ended stream (an `error` event too), a 429 or a 5xx
+  reconnect with backoff (≤ 30 s) and `Last-Event-ID`; only a 4xx answer to
+  that request stops and calls `onError` — so a session check that failed
+  for a moment does not end the subscription, while a signed-out caller or
+  a tightened rule gets its `401` / `403` on the reconnect. The types (`Doc<T>`, `Filter<T>`, `Page<T>`, `ChangeEvent<T>`,
+  `SubscribeOptions<T>`) are in `/__drobek/sdk.d.ts`.
 
 ## The built-in `proxy` module
 
@@ -1905,8 +2600,10 @@ calls an external API without holding its secret. `skill_info('proxy')`.
   `PROXY_CALLS_PER_MIN` (60 per app, all upstreams) and the assignment's
   `rateLimit` (`429 rate_limited` + `Retry-After`); a slot among the calls in
   flight — `PROXY_MAX_CONCURRENT` (32, the whole server) and
-  `PROXY_MAX_CONCURRENT_PER_APP` (8), each call holds up to 5 MiB for up to
-  20 s (`429 proxy_busy` + `Retry-After: 1`, nothing queues); registered in
+  `PROXY_MAX_CONCURRENT_PER_APP` (8) and `PROXY_MAX_CONCURRENT_PER_CALLER` (2
+  per signed-in end user, or per client IP for an anonymous caller); a
+  buffered call holds its slot until it is answered, a streamed one until the
+  stream ends (`429 proxy_busy` + `Retry-After: 1`, nothing queues); registered in
   the app's workspace (`404 not_found`, `upstream_not_registered`); the
   record the assignment is bound to (`403 forbidden`, `upstream_replaced`);
   the app on the upstream's allow-list (`403 forbidden`,
@@ -1919,15 +2616,27 @@ calls an external API without holding its secret. `skill_info('proxy')`.
   decrypted in memory and injected (`Authorization: Bearer …` or the named
   header), the client's `Cookie`, `Authorization`, hop-by-hop, `X-Forwarded-*`,
   `Forwarded`, `Via`, `Origin`, `Referer`, `Sec-*` and `X-Drobek-SDK` stripped,
-  `Accept-Encoding: identity`, a request body sent with `Content-Length`
+  `Accept-Encoding: identity`, `User-Agent: drobek
+  (+https://github.com/freema/drobek)` when the caller sent none (a sync run,
+  a module job), a request body sent with `Content-Length`
   (never chunked); the SSRF guard (DNS resolved once + pinned IP,
   private/reserved ranges blocked unless on `PROXY_ALLOWED_HOSTS` — IPv6
   includes 6to4 `2002::/16`, local-use NAT64 `64:ff9b:1::/48`, site-local
-  `fec0::/10` and discard `100::/64` — ports 80/443, **no redirects** — a 3xx
-  is returned as-is, 20 s deadline, 5 MiB response cap; a HEAD answer's
+  `fec0::/10` and discard `100::/64` — ports 80/443, a connect timeout
+  (`PROXY_CONNECT_TIMEOUT_MS`, only until the TCP / TLS connection stands),
+  the `PROXY_RESPONSE_TIMEOUT_MS` deadline (120 s) and the 5 MiB response cap,
+  both for the whole redirect chain; a HEAD answer's
   `Content-Length` is not held to the cap → `ssrf_blocked` 403 (audited as
-  `proxy.blocked`) / `upstream_error` 502). A `Content-Encoding` the upstream
-  sends anyway (`gzip`, `deflate`, `br`) is decoded and the DECODED body must
+  `proxy.blocked`) / `upstream_error` 502). A 301/302/303/307/308 is
+  followed — at most 3 hops, each through the SSRF guard again with the
+  secret injected — only when its target keeps the base URL's scheme, host
+  and port, stays under the base path and the allowed path prefixes and the
+  resulting method is allowed (301/302/303 turn a non-GET/HEAD request into a
+  GET without a body, 307/308 resend method and body). Any other redirect —
+  another origin, a path outside the prefixes, a fourth hop, a loop — and any
+  other 3xx but 304 is `upstream_redirect` 502 with `details.location_path`
+  (the target's path, never its host); no 3xx but 304 reaches the app.
+  A `Content-Encoding` the upstream sends anyway (`gzip`, `deflate`, `br`) is decoded and the DECODED body must
   fit the 5 MiB cap (else `upstream_error`). The response keeps the
   upstream's status; its headers pass through an **allow-list**
   (`Content-Type`, `Content-Language`, `Content-Range`, `Accept-Ranges`,
@@ -1937,10 +2646,25 @@ calls an external API without holding its secret. `skill_info('proxy')`.
   HTML, `Location` only when relative) — so `Set-Cookie`, `Access-Control-*`,
   `Clear-Site-Data`, `Refresh`, `Link`, HSTS, `Service-Worker-Allowed` and an
   absolute `Location` never reach the app origin — with
-  `Cache-Control: no-store`.
+  `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+  **Streaming**: on an upstream a workspace admin enabled streaming for
+  (`allow_streaming`, off by default), a final answer (after any followed
+  redirect) that is `text/event-stream`, not encoded, not a 3xx and not
+  HEAD / 204 / 304 is relayed chunk by chunk instead of buffered, with
+  `X-Accel-Buffering: no`; the response deadline then covers only its
+  headers. Every other upstream's SSE answer is buffered like any answer. The
+  stream is cut after `PROXY_STREAM_IDLE_TIMEOUT_MS` (60 s) between two
+  chunks from the upstream (a slowly reading client holds the upstream back
+  and is not cut for it), `PROXY_STREAM_MAX_MS` (5 min) in total or past
+  `PROXY_STREAM_MAX_BYTES` (32 MiB): the upstream
+  connection is closed and a last SSE event is appended — `event: error`,
+  `data: {"error":"upstream_error","message":…,"details":{"reason":
+  "stream_idle" | "stream_too_long" | "stream_too_large"}}`. A client that
+  leaves closes the upstream connection. The `proxy call` log line of a stream
+  is written when it ends, with `bytes`, `streamed: true` and `end_reason`.
 - **Info**: `get_app` → `modules.proxy.info.upstreams: [{ name, registered,
-  assigned, call?, rateLimit?, hasSecret, allowedMethods?, allowedPathPrefixes?
-  }]` (never the secret or the base URL).
+  assigned, call?, rateLimit?, hasSecret, allowedMethods?, allowedPathPrefixes?,
+  allowStreaming? }]` (never the secret or the base URL).
 - **SDK**: `drobek.proxy.fetch(upstream, path?, init?)` → the standard
   `Response` (same-origin fetch with `X-Drobek-SDK: 1`).
 - The old dashboard-host route `/:ws/api/proxy/:name/*` (workspace members
@@ -2011,7 +2735,8 @@ people who use an app upload. `skill_info('files')`.
 - **Sweep** (`startFilesSweep`, run by the server's background jobs when
   `files` is active; every `FILES_SWEEP_INTERVAL_MS` = 1 h, one replica per
   interval via a Redis lease): removes the rows of apps deleted at least
-  `FILES_SWEEP_RETENTION_MS` (24 h) ago (an app delete is a soft delete),
+  `FILES_SWEEP_RETENTION_MS` (24 h) ago (an app delete is a soft delete;
+  the app purge removes any row left `APP_PURGE_AFTER_DAYS` after it),
   temp uploads `FILES_DIR/tmp/*.part` untouched for that long, and blobs
   older than that which no `mod_files` row of ANY app references — each
   under its per-sha256 advisory lock with a fresh reference count, the
@@ -2026,6 +2751,188 @@ people who use an app upload. `skill_info('files')`.
   through the SDK core), `url(id)`, `remove(id)`, `list({ limit?, cursor? })`.
 - **Not in v1**: image transformations, EXIF stripping, object storage (S3),
   public galleries.
+
+## The built-in `sync` module
+
+[`modules/sync`](../modules/sync) (`drobek-module-sync`, contract `^1.2`,
+requires `proxy` and `data`): an app's data collection filled from an
+external API on a schedule — scores, prices, fixtures, a feed — without app
+code on the server and without the API key leaving the dashboard.
+`skill_info('sync')`. The dashboard calls it **Scheduled imports (sync)**
+("works like a cron job"); the identifier stays `sync`.
+
+- **Config** — `sources: { <name>: { upstream, path, method, body?, every,
+  collection, items, key?, mode, paused? } }`: `upstream` is assigned to the
+  app in the proxy config, `path` (default `/`, with a query) is below its
+  base URL, `method` `GET` (default) or `POST` with `body`, `every` `'5m'` …
+  `'30d'` (default `'1h'`), `collection` is declared in the data config,
+  `items` the dotted path of the array in the answer (`''` = the answer),
+  `mode` `replace` (default) or `upsert` by `key`. A new source, or a changed
+  upstream, path, method, body, collection or mode, waits for the owner's
+  confirmation; `every`, `items`, `key` and `paused` apply at once.
+  `configure_module` refuses a source past `SYNC_MAX_SOURCES_PER_APP` and an
+  `every` below `SYNC_MIN_INTERVAL_MIN` (only where the change sets it).
+  In the dashboard form the upstream, the collection, the schedule (`5m` …
+  `24h` from `SYNC_MIN_INTERVAL_MIN`, a custom `every` kept) and the mode
+  are selects; `items` and `key` are optional fields with a hint each.
+- **Runs** — the module's app job (every minute while the app has a source)
+  runs each due source: it takes the source's lease in `mod_sync_sources`
+  (one run of a source at a time, across replicas), counts it against
+  `SYNC_RUNS_PER_HOUR_PER_APP`, fetches through `ctx.upstreams.fetch`
+  (`SYNC_MAX_RESPONSE_BYTES`), takes the array at `items`
+  (`SYNC_MAX_RECORDS_PER_RUN`) and writes it with `ctx.records.import`. A
+  failed run (a non-2xx answer, no JSON, no array, a record the schema
+  refuses, a quota) changes nothing. Every run is stored (the newest 50 per
+  source in `mod_sync_runs`, what `get_logs({ kind: 'sync' })` reads). A run
+  by hand and a failed scheduled run are also audited `sync.run`
+  (`{ source, trigger, status, records, error?, paused? }` — `paused: true`
+  on the run that paused the source; no user for a scheduled run); a
+  successful scheduled run is not. Its error text names the problem, never the upstream's data or the
+  secret.
+- **Failures** — a failed run backs the next scheduled one off (the
+  interval, doubling, at most a day or the interval); after
+  `SYNC_PAUSE_AFTER_FAILURES` failures in a row the source pauses: the app
+  page, its Modules tab and the module page show a banner. A successful Run
+  now, the owner's Resume (audited `sync.resume`) or a change of the source's
+  config starts it again.
+- **The owner** — the module page lists the sources (what they fetch and
+  write, the schedule, the last and the next run) with Run now and Pause /
+  Resume (Pause sets the source's `paused` without a confirmation), and the
+  latest runs. Over MCP: `sync_now({ app_id, source })` (editor+,
+  `SYNC_NOW_PER_MINUTE` per source) and `get_logs({ app_id, kind: 'sync' })`;
+  `get_app` shows each source's state under `modules.sync.info.sources`.
+- `duplicate_app` never copies the sources (they would start calling an
+  external API from the copy); deleting the app removes its sources and runs.
+
+## The built-in `webhooks` module
+
+[`modules/webhooks`](../modules/webhooks) (`drobek-module-webhooks`, contract
+`^1.3`, requires `data`): another service — payments, code hosting, a form
+service — notifies the app with webhooks; drobek verifies each delivery and
+stores it as a record of a data collection the app reads with
+`drobek.data`. No app code runs on the server. `skill_info('webhooks')`. The
+dashboard calls it **Incoming webhooks**.
+
+- **Config** — `endpoints: { <name>: { collection, verify, header?, secret?,
+  id_header?, max_bytes?, enabled } }`: `name` matches `^[a-z][a-z0-9_-]{0,39}$`
+  and is the last path segment of the address
+  `https://<app host>/__drobek/v1/webhooks/<name>`; `collection` is declared
+  in the data config; `verify` is `hmac-sha256` (an HMAC-SHA256 of the raw
+  body in `header`, default `X-Webhook-Signature`: hex, `sha256=<hex>` or
+  base64), `stripe` (the `Stripe-Signature` scheme with a signed timestamp,
+  300 s tolerance), `github` (`X-Hub-Signature-256`) or `none-with-token`
+  (a shared token in `header`, default `X-Webhook-Token`, or `?token=` — no
+  signature); `secret` names the app secret (default
+  `WEBHOOK_SECRET_<NAME>`); `id_header` names the header with the sender's
+  event id (default `Webhook-Id`); `max_bytes` lowers
+  `WEBHOOKS_MAX_BODY_BYTES` for the endpoint. A new endpoint, a changed
+  collection, or a change from a signed scheme to `none-with-token` waits
+  for the owner's confirmation; `configure_module` refuses an endpoint past
+  `WEBHOOKS_MAX_ENDPOINTS_PER_APP`. Each endpoint's secret is declared
+  through `secretsFor` and set only in the dashboard.
+- **A delivery** — `POST` on the app host; the app's password gate does not
+  apply and no SDK header is needed. In order: the endpoint exists and is
+  enabled (`404`), `WEBHOOKS_PER_APP_PER_MINUTE` (`429`), the size
+  (`WEBHOOKS_MAX_BODY_BYTES`, at most 1 MiB, `413`), the secret is set
+  (`503 webhook_secret_not_set` — the sender retries), the signature over
+  the raw body in constant time (`401 invalid_signature` with
+  `details.reason`: `missing_signature`, `bad_signature`,
+  `timestamp_out_of_tolerance`), the sender's event id (a retry of a stored
+  delivery answers `200 { ok, duplicate: true }`; ids are kept 7 days), then
+  one record `{ source, event_type?, event_id?, received_at, payload }`
+  through `ctx.records.create` → `200 { ok, id }`. A JSON body is stored
+  parsed, a form body as its fields, anything else as text. A record over
+  the data module's `DATA_MAX_DOC_BYTES` answers `413 payload_too_large`
+  (`too_large`, reason `record_too_large`: a retry cannot fit either). A
+  record the collection refuses otherwise (its schema, a quota) answers
+  `503 webhook_not_stored` and frees the event id, so the sender's retry can
+  land.
+- **The log** — every delivery past the endpoint check is logged without
+  its body, headers or secret (`mod_webhooks_deliveries`: endpoint, status
+  `accepted` / `rejected_signature` / `duplicate` / `too_large` /
+  `rate_limited` / `collection_error`, HTTP status, bytes, reason, record
+  id; a flood of refusals costs one row per minute). The module's daily
+  job keeps 30 days and at most 1000 deliveries per app, and drops expired
+  event ids.
+- **The owner** — the module page lists the endpoints (the copyable
+  address, the verification, the secret and whether it is set, the
+  collection, the last delivery) and the latest deliveries, above the
+  Secrets form. Over MCP: `get_logs({ app_id, kind: 'webhooks' })` and
+  `get_app`'s `modules.webhooks.info.endpoints`; secrets stay
+  dashboard-only.
+- `duplicate_app` proposes the endpoints through the copy's confirmation
+  (never their secrets: the copy refuses deliveries until its owner sets
+  them); deleting the app removes its deliveries and event ids.
+
+## The built-in `oidc` module
+
+[`modules/oidc`](../modules/oidc) (`drobek-module-oidc`, contract `^1.1`,
+requires `auth`): company sign-in with any OpenID Connect provider —
+Google, Microsoft Entra ID, Okta, Keycloak, Auth0 — as the `auth.provider`
+`oidc`, without per-IdP code. `skill_info('oidc')`. The module has no
+config, routes, SDK or tables of its own; auth keeps state, nonce, PKCE,
+the allowlist, users and sessions ([Auth providers](#auth-providers)).
+
+- **Config** — in the AUTH config, `providers.oidc: { enabled, issuer?,
+  clientId?, scopes (["openid","email","profile"], must include openid),
+  trustEmail (false), label ("Company account"), claims?: { email? },
+  prompt? (select_account | login | consent), relinkByEmail? }`.
+  `identityFields: ['issuer', 'clientId', 'trustEmail', 'claims']` —
+  enabling it and changing any of them wait for the owner (`trustEmail` and
+  `claims` decide which address a person may claim). The issuer is https (http only outside production),
+  without query or fragment.
+- **Secrets and the env fallback** — `OIDC_CLIENT_SECRET` (the auth module's
+  per-app secret, env fallback `AUTH_OIDC_CLIENT_SECRET`). An app without
+  an `issuer` uses the operator's `AUTH_OIDC_ISSUER` with
+  `AUTH_OIDC_CLIENT_ID` (or its own `clientId`); the server's client never
+  pairs with an app's own issuer. The redirect URI to register at the IdP is
+  `<PUBLIC_APP_URL>/__drobek/auth/callback/oidc`.
+- **begin** — discovery at `<issuer>/.well-known/openid-configuration`: its
+  `issuer` must equal the configured one exactly (a Microsoft `/common`
+  issuer never does: use the tenant's), the endpoints must be https, and a
+  document that lists `code_challenge_methods_supported` without `S256` is
+  refused (one that lists none — Entra ID — gets S256 all the same). The
+  answer is the `authorization_endpoint` with `response_type=code`,
+  `client_id`, `redirect_uri`, `scope`, `state`, `nonce`,
+  `code_challenge`, `code_challenge_method=S256` and `prompt`. Without a
+  client secret it fails at once unless the IdP lists
+  `token_endpoint_auth_methods_supported: none`.
+- **callback** — an IdP `error` or an `iss` parameter naming another issuer
+  (RFC 9207) fails; the code is exchanged at `token_endpoint` with the PKCE
+  verifier and `client_secret_basic` (else `client_secret_post`, as the
+  document lists; `client_secret_basic` when it lists nothing). The ID
+  token: `alg` RS256, ES256 or PS256 and advertised in
+  `id_token_signing_alg_values_supported` (RS256 when absent; `none` and
+  HS* never), no `crit`, a signature by a key of `jwks_uri` (`kid`, `kty`,
+  `use`, `alg` matching; RSA ≥ 2048 bits, EC P-256; `node:crypto`, no JOSE
+  library), `iss` = the issuer, `aud` names the client (with several
+  audiences, or any `azp`, `azp` = the client), `exp` in the future, `iat`
+  within 5 minutes, `nonce` = the sign-in's. The address is the `email`
+  claim (or `claims.email`) of the ID token, else of `userinfo` (Bearer
+  access token; its `sub` must match); `email_verified` (`true` or
+  `"true"`) from the same source, or `trustEmail`. The identity is `{
+  issuer: iss, subject: sub, email (lower case), emailVerified, name? }`.
+- **Network** — every IdP call goes through the `@drobek/proxy` SSRF guard
+  (resolved once and pinned, private and reserved addresses refused, no
+  redirects), 5 s, at most 64 KiB, ports 443 / `PROXY_ALLOWED_PORTS`;
+  `PROXY_ALLOWED_HOSTS` never applies. Only the host of the operator's
+  `AUTH_OIDC_ISSUER` may be private and on any port, and — outside
+  production — the exact origins in `AUTH_OIDC_DEV_ORIGINS` also over http.
+- **Caches** — in process memory (a provider gets no Redis): the discovery
+  document per issuer `OIDC_DISCOVERY_CACHE_SEC` (3600, read from the
+  server's env: the provider gets no workspace limits), the keys per issuer
+  1 hour; a token with an unknown `kid` refetches them at most once a
+  minute.
+- **Failures** — an `OidcError` named `oidc_discovery_failed` or
+  `oidc_token_invalid`: auth logs the name and answers `provider_error`;
+  the module logs `oidc: sign-in begin|callback failed { app_id, error,
+  reason }` with addresses masked. No log line or error carries the client
+  secret, a code or a token.
+- **Testing** — `tests-e2e/mock-oidc.mjs` (`task mock:oidc`, port 3050) is a
+  dependency-free IdP: discovery, `/jwks`, an RS256 ID token from a key made
+  at start, the nonce and the PKCE verifier checked. The dev stack reaches it
+  over http through `AUTH_OIDC_DEV_ORIGINS`; the e2e image flow runs it behind
+  its Caddy over https as the server's `AUTH_OIDC_ISSUER`.
 
 ## The example: `drobek-module-hello`
 
@@ -2061,3 +2968,27 @@ drobek.hello.ping().then((h) => (document.body.textContent = h.message));
 ```
 
 and open the `preview_url`.
+
+## The example: `drobek-module-acme-crm`
+
+[`examples/drobek-module-acme-crm`](../examples/drobek-module-acme-crm) is the
+scaffold's output for `acme-crm` turned into an opt-in module `acmecrm`
+(contract `^1.2`, requires `auth`). It is never a dependency of
+`apps/server`: `task dev` packs it and installs it into `./.modules` with
+`task module:add`, the e2e image flow installs it with
+`selfhost:module:add`, and `DROBEK_MODULES` names it by its package,
+`drobek-module-acme-crm`, so `/healthz` lists it with `source: dir`.
+
+- `GET /__drobek/v1/acmecrm` → `{ contacts, upstream }`, `POST` `{ email, name?, fields? }`
+  → the new contact; both need a signed-in end user (rule `user`);
+- an `auth.signedIn` contribution adds every end user who signs in
+  (`source: "sign-in"`);
+- config `{ tags, fields }` (a list and a record, so the dashboard's generic
+  form shows both kinds of field);
+- the own error `crm_duplicate` (409, `details.email`), the limit
+  `ACMECRM_CONTACTS_PER_APP` (default 1000), the optional secret
+  `ACMECRM_API_KEY` (`upstream: true` once the owner set it);
+- table `mod_acmecrm_contacts` under the journal
+  `__drizzle_migrations_mod_acmecrm`;
+- off for every workspace until a super-admin enables it, or the limits
+  provider's plan says `MODULE_ENABLED_ACMECRM=1`.

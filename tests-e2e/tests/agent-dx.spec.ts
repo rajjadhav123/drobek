@@ -4,16 +4,13 @@ import { skipUnlessLocal } from './helpers/auth';
 import { FULL_SCOPE, mcpClient } from './helpers/mcp';
 
 /**
- * M1b Agent DX acceptance (PHY-124): the agent-facing docs are served + in sync
- * with the real tools. /llms.txt + /llms-full.txt render from the @drobek/agent-dx
- * manifest; the same content is reachable over MCP as docs resources + guided
- * prompts; and the human build page carries the install command + MCP URL.
- *
- * The "fresh agent builds a todo app from the skill" acceptance is a MANUAL
- * operator demo — here we assert the INGREDIENTS.
+ * The agent-facing docs are served and in sync with the real tools: /llms.txt
+ * + /llms-full.txt render from the @drobek/agent-dx manifest, the same content
+ * is reachable over MCP as docs resources + prompts, and the build page carries
+ * the install command + MCP URL.
  */
 
-/** Exactly the MCP tool set: M0-05 core tools (NSO-283) + publish (NSO-285) + skill_info/configure_module (NSO-287) + query_data (NSO-300) + get_logs (NSO-290) + set_gallery_listing and duplicate_app (NSO-340) + the asset tools (NSO-358) + the custom-domain tools (NSO-366) + the upstream tools (NSO-372); set_workspace_publishing is a super-admin's only. */
+/** Exactly the MCP tool set; set_workspace_publishing, set_workspace_module, takedown_app, restore_app and set_gallery_hidden are a super-admin's only. */
 const ALL_TOOLS = [
   'list_apps',
   'create_app',
@@ -22,15 +19,46 @@ const ALL_TOOLS = [
   'read_file',
   'write_files',
   'restore_version',
+  'list_versions',
+  'keep_version',
+  'delete_versions',
   'publish',
   'set_gallery_listing',
+  'unpublish',
+  'set_visibility',
+  'set_frame_ancestors',
+  'release_lease',
+  'delete_app',
   'skill_info',
   'configure_module',
   'query_data',
+  'create_records',
+  'update_record',
+  'delete_record',
+  'delete_collection',
+  'purge_orphan_records',
   'get_logs',
+  'get_analytics',
+  'list_feedback',
+  'get_feedback_screenshot',
+  'resolve_feedback',
+  'delete_feedback',
+  'request_screenshot',
+  'get_screenshot',
+  'sync_now',
   'create_asset_upload',
   'list_assets',
   'delete_asset',
+  'list_form_submissions',
+  'delete_form_submission',
+  'list_end_users',
+  'set_end_user_role',
+  'set_end_user_blocked',
+  'sign_out_end_users',
+  'list_uploads',
+  'delete_upload',
+  'remove_module_secret',
+  'list_activity',
   'list_domains',
   'add_domain',
   'verify_domain',
@@ -38,10 +66,17 @@ const ALL_TOOLS = [
   'remove_domain',
   'list_upstreams',
   'register_upstream',
+  'set_upstream_streaming',
   'remove_upstream',
+  'create_workspace',
+  'list_members',
+  'invite_member',
+  'set_member_role',
+  'remove_member',
+  'delete_workspace',
 ];
 
-/** Removed tools (deploy pipeline NSO-281, data/insight tools NSO-283) — never advertised. */
+/** Retired tools — never advertised. */
 const REMOVED_TOOLS = [
   'deploy_init', // doc-lint: allow — retired tool, asserted absent
   'deploy_commit', // doc-lint: allow — retired tool, asserted absent
@@ -64,7 +99,8 @@ test('GET /llms.txt → 200 text/plain with the title + section links @smoke', a
   expect(body.startsWith('# drobek')).toBe(true);
   expect(body).toContain('## Docs');
   expect(body).toContain('/llms-full.txt');
-  expect(body).toContain('https://github.com/freema/drobek/blob/main/docs/AGENT.md');
+  // The repo's AGENT.md, or `<DOCS_URL>/agent.md` on a server that sets DOCS_URL.
+  expect(body).toMatch(/\]\((https:\/\/github\.com\/freema\/drobek\/blob\/main\/docs\/AGENT\.md|https:\/\/[^)]+\/agent\.md)\)/);
   expect(body).toContain('/build-with-your-agent');
 });
 
@@ -96,11 +132,12 @@ test('GET /llms-full.txt → 200 with every tool, no deploy pipeline, the limits
   expect(body).toContain('app_locked');
   expect(body).toContain('secret_in_source');
   expect(body).toContain('redirect_uri');
-  // …then one section per active module with its own codes (NSO-344).
+  // …then one section per active module with its own codes.
   expect(body).toContain('### Module auth');
   expect(body).toContain('- invalid_code — module route (auth) — ');
   expect(body).toContain('### Module proxy');
   expect(body).toContain('- upstream_error — module route (proxy) — ');
+  expect(body).toContain('- upstream_redirect — module route (proxy) — ');
 
   // Limits: the compile caps + the tool contract limits.
   expect(body).toContain('COMPILE_MAX_FILES');
@@ -127,12 +164,12 @@ test('build-with-your-agent page renders with the plugin + skill install command
   for (const name of REMOVED_TOOLS) expect(html, name).not.toContain(name);
 });
 
-test('MCP tools/list is exactly the 23 tools; docs resources + the build-an-app prompt are populated @local', async ({
+test('MCP tools/list is exactly the documented tools; docs resources + the build-an-app prompt are populated @local', async ({
   page,
   request,
 }) => {
   skipUnlessLocal();
-  // Every scope → tools/list is exactly the 23 tools.
+  // Every scope → tools/list is exactly the documented tools.
   const { client, transport } = await mcpClient(page, request, {
     tag: 'agent-dx',
     scope: FULL_SCOPE,

@@ -1,9 +1,10 @@
 /**
- * @drobek/apps — apps and their immutable versions (M0-02): create (global
+ * @drobek/apps — apps and their immutable versions: create (global
  * slugs), write a version, publish (pointer move), restore (new version from
- * an old one), and blob GC; since M2-01 also unpublish, soft delete + slug
- * release, visibility / frame-ancestors settings, the single-writer lease
- * read/release and version ZIPs; since NSO-358 app assets (binary files at
+ * an old one), the hourly rate of new versions, the history retention and the
+ * workspace's source quota, blob GC, unpublish, soft delete + slug
+ * release + purge, visibility / frame-ancestors settings, the single-writer lease
+ * read/release and version ZIPs, and app assets (binary files at
  * `/<name>` next to the app's files, upload URLs). The MCP tools and the dashboard call these.
  */
 export { AppsError, type AppsErrorCode } from './errors.js';
@@ -22,6 +23,7 @@ export {
   getVersion,
   latestVersionNumber,
   listVersions,
+  pinnedVersions,
   publish,
   readBlobs,
   readVersionFile,
@@ -29,6 +31,47 @@ export {
   versionZip,
   type CreateVersionOptions,
 } from './versions.server.js';
+// The rate limit on new versions (VERSIONS_PER_APP_HOUR / VERSIONS_PER_USER_HOUR).
+export {
+  DEFAULT_VERSIONS_PER_APP_HOUR,
+  DEFAULT_VERSIONS_PER_USER_HOUR,
+  VERSION_RATE_WINDOW_SEC,
+  assertVersionRate,
+  versionRateLimits,
+  versionRateLimitsOf,
+  type VersionRateLimits,
+} from './version-rate.server.js';
+// The history retention (APP_VERSIONS_KEEP), a member's clean-up, the kept cap (APP_VERSIONS_KEPT_MAX),
+// the history page (APP_VERSIONS_PAGE) and the workspace's source quota (WORKSPACE_SOURCE_QUOTA).
+export {
+  DEFAULT_APP_VERSIONS_KEEP,
+  DEFAULT_APP_VERSIONS_KEPT_MAX,
+  DEFAULT_APP_VERSIONS_PAGE,
+  DEFAULT_WORKSPACE_SOURCE_QUOTA,
+  VERSION_RETENTION_INTERVAL_MS,
+  assertSourceQuota,
+  deleteVersions,
+  missingVersionMessage,
+  planVersionDeletion,
+  pruneVersionHistory,
+  startVersionRetention,
+  versionRanges,
+  versionRetention,
+  versionsPageSize,
+  versionStorageLimits,
+  versionStorageLimitsOf,
+  workspaceSourceBytes,
+  type PruneVersionHistoryOptions,
+  type VersionDeletion,
+  type VersionDeletionOptions,
+  type VersionProtection,
+  type VersionPruneResult,
+  type VersionRetentionInfo,
+  type VersionStorageLimits,
+} from './version-retention.server.js';
+export { keepVersion, type KeepVersionOptions, type KeepVersionResult } from './version-keep.server.js';
+export { versionReadiness, versionSources, type VersionReadinessOptions } from './readiness.server.js';
+export { scheduleVersionTypecheck } from './typecheck.server.js';
 export { crc32, zipStream, type ZipEntry } from './zip.js';
 export {
   SLUG_RELEASE_AFTER_MS,
@@ -45,13 +88,27 @@ export {
   type VisibilityInput,
 } from './lifecycle.server.js';
 export {
+  DEFAULT_APP_PURGE_AFTER_DAYS,
+  DEFAULT_APP_PURGE_INTERVAL_MS,
+  appPurgeSettingsFromEnv,
+  deletionWindow,
+  purgeApp,
+  purgeDeletedApps,
+  startAppPurge,
+  type AppPurgeResult,
+  type PurgedApp,
+} from './purge.server.js';
+export {
   LEASE_KEY_PREFIX,
   leaseKey,
   parseLease,
   readAppLease,
   releaseAppLease,
+  redisTakeLeaseHeldBy,
+  releaseUserAppLeases,
   type Lease,
   type LeaseRedis,
+  type TakeLeaseHeldBy,
 } from './lease.server.js';
 export {
   BLOB_GC_GRACE_MS,
@@ -67,6 +124,7 @@ export {
   onLocalAppChanged,
   parseAppChangedEvent,
   type AppChangedEvent,
+  type ScreenshotSignal,
 } from './events.js';
 export {
   DEV_APPS_DOMAIN,
@@ -89,14 +147,16 @@ export {
   type HostClass,
   type HostConfig,
 } from './host.js';
-// M4-02 (NSO-293): abuse reports, super-admin takedown/restore, publish heuristic.
+// Abuse reports, super-admin takedown/restore, publish heuristic.
 export {
   ABUSE_QUEUE_PATH,
+  DEFAULT_ABUSE_REPORTS_RETENTION_DAYS,
   LOCK_REASONS,
   REPORT_DETAILS_MAX,
   REPORT_FORM_PATH,
   REPORT_REASONS,
   REPORT_WELL_KNOWN_PATH,
+  abuseReportsRetentionDays,
   isLockReason,
   isReportReason,
   lockCategory,
@@ -117,6 +177,8 @@ export {
   type HeuristicFinding,
 } from './heuristic.js';
 export {
+  ABUSE_REPORT_APP_FILTERS,
+  ABUSE_REPORT_SORTS,
   appLockState,
   createAbuseReport,
   findAppByReportedHost,
@@ -124,6 +186,7 @@ export {
   listAbuseReports,
   listLockedApps,
   lockedByAdminError,
+  pruneResolvedAbuseReports,
   reportIpHash,
   resolveAbuseReport,
   restoreApp,
@@ -141,7 +204,8 @@ export {
   type ScreenResult,
   type TakedownPreview,
 } from './moderation.server.js';
-// NSO-358: app assets — binary files served at /<name> next to the app's files, upload URLs, the sweep.
+export { mailOwnersAboutModeration } from './moderation-mail.server.js';
+// App assets — binary files served at /<name> next to the app's files, upload URLs, the sweep.
 export * from './assets/index.js';
 export type {
   Actor,
@@ -150,11 +214,13 @@ export type {
   VersionFile,
   VersionFileInput,
   VersionFileKind,
+  VersionPage,
   VersionSummary,
 } from './types.js';
-// NSO-340: the public gallery (owner opt-in, super-admin hide, the public list).
+// The public gallery (owner opt-in, super-admin hide, the public list).
 export {
   GALLERY_DESCRIPTION_MAX,
+  GALLERY_OPENS_PRUNE_MARGIN_DAYS,
   GALLERY_OPENS_WINDOW_DAYS,
   GALLERY_PAGE_MAX,
   GALLERY_PAGE_SIZE,
@@ -188,7 +254,7 @@ export {
   type GalleryPage,
   type GalleryModerationEntry,
 } from './gallery.server.js';
-// NSO-340: duplicating a gallery app into the caller's workspace (the files half).
+// Duplicating a gallery app into the caller's workspace (the files half).
 export {
   DEFAULT_DUPLICATES_PER_USER_HOUR,
   DUPLICATE_NAME_MAX,
@@ -200,16 +266,17 @@ export {
   type DuplicateFilesInput,
   type DuplicationSource,
 } from './duplicate.server.js';
-// NSO-340: gallery likes (signed-in accounts) and opens (the counting link).
+// Gallery likes (signed-in accounts) and opens (the counting link).
 export {
   galleryCounts,
   galleryEntryBySlug,
   galleryLikeState,
+  pruneGalleryOpens,
   recordGalleryOpen,
   setGalleryLike,
   type GalleryEntry,
 } from './gallery-engagement.server.js';
-// NSO-366: who may publish (PUBLISH_APPROVAL + a super-admin's per-workspace state) and the operator's publish e-mails (PUBLISH_NOTIFY).
+// Who may publish (PUBLISH_APPROVAL + a super-admin's per-workspace state) and the operator's publish e-mails (PUBLISH_NOTIFY).
 export {
   PUBLISH_APPROVAL_MODES,
   PUBLISH_APPROVAL_PATH,
@@ -232,6 +299,7 @@ export {
 } from './publish-approval.js';
 export {
   PUBLISHING_FILTERS,
+  PUBLISHING_SORTS,
   listWorkspacePublishing,
   publishPermission,
   publishPermissions,
@@ -244,3 +312,99 @@ export {
   type WorkspacePublishingEntry,
 } from './publish-approval.server.js';
 export { notifyOperatorOfPublish, type PublishKind, type PublishNotifyResult } from './publish-notify.server.js';
+export {
+  DEFAULT_FEEDBACK_MAX_OPEN_PER_APP,
+  DEFAULT_FEEDBACK_PER_USER_HOUR,
+  DEFAULT_FEEDBACK_SCREENSHOT_RETENTION_DAYS,
+  DEFAULT_FEEDBACK_SCREENSHOTS_MAX_PER_APP,
+  FEEDBACK_BODY_MAX,
+  FEEDBACK_PAGE_MAX,
+  FEEDBACK_PATH_MAX,
+  FEEDBACK_RESOLUTION_NOTE_MAX,
+  FEEDBACK_SELECTOR_MAX,
+  FEEDBACK_LABEL_MAX,
+  FEEDBACK_STATUSES,
+  feedbackLimits,
+  isFeedbackId,
+  mayDeleteFeedback,
+  normalizeFeedbackPath,
+  parseFeedbackAnchor,
+  parseFeedbackFilter,
+  validateFeedbackBody,
+  type FeedbackAnchor,
+  type FeedbackLimits,
+  type FeedbackStatus,
+} from './feedback.js';
+export {
+  createFeedback,
+  deleteFeedback,
+  feedbackCounts,
+  getFeedback,
+  getFeedbackScreenshot,
+  listFeedback,
+  pruneResolvedFeedbackScreenshots,
+  setFeedbackResolved,
+  type CreateFeedbackInput,
+  type FeedbackNote,
+  type FeedbackPage,
+  type FeedbackScreenshot,
+  type FeedbackScreenshotInfo,
+  type ListFeedbackOptions,
+  type SetFeedbackResolvedResult,
+} from './feedback.server.js';
+export {
+  DEFAULT_MCP_IMAGE_MAX_BYTES,
+  DEFAULT_SCREENSHOT_MAX_BYTES,
+  IMAGE_INPUT_MAX_PIXELS,
+  IMAGE_MIME_TYPES,
+  MCP_IMAGE_MAX_SIDE,
+  SCREENSHOT_MAX_SIDE,
+  imageLimits,
+  reencodeForMcp,
+  reencodeImage,
+  reencodeScreenshot,
+  sniffImageType,
+  type EncodedImage,
+  type ImageInputType,
+  type ImageLimits,
+  type ImageOutputFormat,
+  type ReencodeOptions,
+} from './image.server.js';
+export {
+  DEFAULT_SCREENSHOT_REQUEST_TTL_SEC,
+  DEFAULT_SCREENSHOT_REQUESTS_PER_APP_HOUR,
+  DEFAULT_SCREENSHOTS_RETENTION_DAYS,
+  SCREENSHOT_LIST_MAX,
+  SCREENSHOT_NOTE_MAX,
+  SCREENSHOT_RETRY_AFTER_SECONDS,
+  SCREENSHOT_UPLOAD_PATH_PREFIX,
+  isScreenshotRequestId,
+  screenshotLimits,
+  screenshotUploadMaxBytes,
+  validateScreenshotNote,
+  type ScreenshotLimits,
+} from './screenshots.js';
+export {
+  captureScreenshot,
+  declineScreenshot,
+  getAppScreenshot,
+  listAppScreenshots,
+  lookupScreenshot,
+  memoryScreenshotRequestStore,
+  openScreenshotRequest,
+  pruneOldScreenshots,
+  redisScreenshotRequestStore,
+  requestScreenshot,
+  screenshotEvent,
+  screenshotOriginAllowed,
+  screenshotRequestStore,
+  screenshotRequestedSignal,
+  type AppScreenshot,
+  type AppScreenshotInfo,
+  type ScreenshotDeps,
+  type ScreenshotLookup,
+  type ScreenshotRequest,
+  type ScreenshotRequestState,
+  type ScreenshotRequestStore,
+} from './screenshots.server.js';
+export { createScreenshotUploadHandler, type ScreenshotUploadHandlerOptions } from './screenshot-upload.server.js';

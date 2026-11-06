@@ -1,11 +1,11 @@
 /**
- * /workspaces/:slug/apps — client half (U8, PHY-74 slice; filters NSO-288):
+ * /workspaces/:slug/apps — client half:
  * the workspace's apps with name / status / visibility / published state /
  * latest version, a search + published filter + sort (a plain GET form, so
  * the filtered list is a shareable URL). Each app links to its page. Server
  * code lives in ./workspaces.$slug.apps.server.ts.
  *
- * NSO-342: the workspace's landing page inside the shared workspace layout,
+ * The workspace's landing page inside the shared workspace layout,
  * and every app has a small THUMBNAIL — its published (else preview) host in
  * a scaled-down iframe that is sandboxed (`allow-scripts allow-same-origin`
  * only: the app keeps its own origin, which is never the dashboard's, and can
@@ -190,7 +190,7 @@ function Thumbnail({ slug, thumbnail, to }: { slug: string; thumbnail: AppThumbn
 }
 
 export default function WorkspaceAppsRoute() {
-  const { nav, workspace, apps, total, filters, deletedSlug, slugReleaseDays, publishApproval, canRequestApproval } =
+  const { nav, workspace, apps, total, filters, deletedSlug, slugReleaseDays, purgeDays, publishApproval, canRequestApproval } =
     useLoaderData<typeof loader>();
   const location = useLocation();
   const filtered = filters.q !== '' || filters.status !== 'all';
@@ -200,7 +200,8 @@ export default function WorkspaceAppsRoute() {
       <PublishApprovalNotice approval={publishApproval} canRequest={canRequestApproval} />
       {deletedSlug ? (
         <p style={styles.notice} role="status" data-testid="apps-deleted-notice">
-          <strong>{deletedSlug}</strong> was deleted. Its address stays reserved for {slugReleaseDays} days.
+          <strong>{deletedSlug}</strong> was deleted. Its address stays reserved for {slugReleaseDays} days; its versions and
+          data are deleted for good after {purgeDays} days.
         </p>
       ) : null}
 

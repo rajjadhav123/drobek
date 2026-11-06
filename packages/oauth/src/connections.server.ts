@@ -1,10 +1,10 @@
 /**
- * The user's OAuth connections (M2-04, NSO-284): which OAuth clients (DCR or
+ * The user's OAuth connections: which OAuth clients (DCR or
  * CIMD) currently hold a live grant for a user, and revoking one.
  *
  * A "connection" is a (user, client) pair with at least one LIVE token: an
  * unrevoked, unexpired access token or an unused, unexpired refresh token.
- * Tokens are user-bound (M0-04) and carry their client's internal id, so the
+ * Tokens are user-bound and carry their client's internal id, so the
  * whole view is a read over the two token tables — no extra schema.
  *
  * `lastUsedAt` = the newest token issued to the pair (the consent exchange or
@@ -171,15 +171,16 @@ export interface RevokedConnection {
 
 /**
  * Revoke `userId`'s grant for one client: delete all of the pair's access
- * tokens, refresh tokens and authorization codes in one transaction. Returns
- * null when the client is unknown or the user holds nothing for it (another
- * user's connection is indistinguishable from an unknown one).
+ * tokens, refresh tokens and authorization codes in one transaction; the
+ * client's next MCP request answers 401. Returns null when the client is unknown
+ * or the user holds nothing for it (another user's connection is
+ * indistinguishable from an unknown one).
  */
 export async function revokeConnection(
   userId: string,
   oauthClientId: string
 ): Promise<RevokedConnection | null> {
-  return getDb().transaction(async (tx) => {
+  return getDb().transaction(async (tx): Promise<RevokedConnection | null> => {
     const [client] = await tx
       .select({
         id: oauthClients.id,

@@ -1,6 +1,5 @@
-# drobek — production / self-host stack (M0-07, M4-03): drobek + postgres +
-# redis + caddy (TLS). For self-hosters and the SaaS VPS. The whole procedure
-# (clean VPS → dashboard with TLS → MCP → published app, backups, upgrades) is
+# Production / self-host stack: drobek + postgres + redis + caddy (TLS). The
+# whole procedure (clean VPS → published app, backups, upgrades) is
 # docs/SELF-HOSTING.md.
 #
 #   1. task selfhost:init          → .env.production (secrets generated) +
@@ -18,12 +17,20 @@
 # COMPOSE_PROJECT_NAME overrides it (the rehearsal script runs throwaway ones).
 name: drobek-prod
 
-x-restart: &restart
+# Every service restarts unless stopped, and its container log (`docker
+# compose logs`) rotates: at most CONTAINER_LOG_MAX_FILES files of
+# CONTAINER_LOG_MAX_SIZE each (100 MB per service by default).
+x-service: &service
   restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: ${CONTAINER_LOG_MAX_SIZE:-20m}
+      max-file: '${CONTAINER_LOG_MAX_FILES:-5}'
 
 services:
   postgres:
-    <<: *restart
+    <<: *service
     image: postgres:17-alpine
     environment:
       POSTGRES_USER: drobek
@@ -38,7 +45,7 @@ services:
       retries: 12
 
   redis:
-    <<: *restart
+    <<: *service
     image: redis:7-alpine
     # Sessions, caches, rate limits, leases, un-flushed request counters — not
     # part of `task backup` (after a restore everyone signs in again); AOF keeps
@@ -53,10 +60,13 @@ services:
       retries: 12
 
   drobek:
-    <<: *restart
+    <<: *service
     # Release tags: vX.Y.Z (pin one), latest (newest release), previous (the
     # release before it — the rollback target). linux/amd64 only.
     image: ghcr.io/freema/drobek:${DROBEK_IMAGE_TAG:-latest}
+    # On a stop drobek lets requests in flight finish for SHUTDOWN_GRACE_MS
+    # (20 s) before it exits; Docker must not kill it sooner.
+    stop_grace_period: 30s
     # Everything drobek reads (SMTP_*, SUPERADMIN_EMAIL, limits, …) comes from
     # .env.production; the entries below are the ones compose must see (fail
     # fast) or that this topology fixes.
@@ -81,10 +91,10 @@ services:
       # Behind Caddy: only its X-Real-IP (the TCP peer) identifies the client.
       TRUST_PROXY: x-real-ip
       # All six built-in platform modules (forms requires email).
-      DROBEK_MODULES: ${DROBEK_MODULES:-auth,email,forms,data,proxy,files}
+      DROBEK_MODULES: ${DROBEK_MODULES:-auth,email,forms,data,proxy,files,sync,oidc,webhooks}
       # The files module's uploads live on the files_data volume below.
       FILES_DIR: /data/files
-      # App assets (video, audio, images, fonts; NSO-358) on the assets_data volume.
+      # App assets (video, audio, images, fonts) on the assets_data volume.
       ASSETS_DIR: /data/assets
       # Modules the operator installed (<name>/ + modules.lock.json), checked
       # against the lockfile at start — the modules_data volume below
@@ -112,7 +122,7 @@ services:
         condition: service_healthy
 
   caddy:
-    <<: *restart
+    <<: *service
     # The stock Caddy image, pulled like the others — unless you use DNS-01
     # (TLS_DNS_PROVIDER): then CADDY_IMAGE=drobek-caddy:dns,
     # CADDY_BUILD_TARGET=dns, CADDY_DNS_MODULE=github.com/caddy-dns/<provider>

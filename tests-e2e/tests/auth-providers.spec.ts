@@ -5,25 +5,24 @@ import { skipUnlessLocal } from './helpers/auth';
 import { callTool, mcpClient, type McpClient } from './helpers/mcp';
 
 /**
- * NSO-348 (EXT-06): the auth module's sign-in provider slot on the dev stack.
+ * The auth module's sign-in provider slot on the dev stack.
  *
- * The dev stack runs no sign-in provider module (DROBEK_MODULES =
- * hello,auth,email,forms,data,proxy,files), so this spec covers what exists
- * without one:
+ * The dev stack runs the oidc provider module (DROBEK_MODULES =
+ * hello,auth,email,forms,data,proxy,files,sync,oidc,webhooks), off for every app until
+ * its auth config turns it on, so this spec covers an app without a provider:
  *
  *  - GET /__drobek/v1/auth/providers lists only the e-mail code;
- *  - POST begin for a provider the server does not run → 404
+ *  - POST begin for a provider that is off for the app → 404
  *    provider_not_enabled (and still needs the SDK header);
  *  - the ONE IdP callback on the dashboard host answers a small no-store HTML
  *    page under a strict CSP for a bad state, GET and cross-site POST (the
  *    Origin check exempts it), and never sets a cookie;
  *  - GET complete with a bogus handoff code → 400 page, no session.
  *
- * The full begin → IdP → callback → handoff → complete flow needs a provider
- * module in the stack (the OIDC provider of EXT-07 against a mock IdP): it is
- * the `test.fixme` below, for EXT-09 to finish. The unit suite
- * (modules/auth/src/providers.test.ts) drives that flow with a fixture
- * provider and no network.
+ * The full begin → IdP → callback → handoff → complete flow against the mock
+ * IdP (tests-e2e/mock-oidc.mjs) is auth-oidc.spec.ts. The
+ * unit suite (modules/auth/src/providers.test.ts) drives that flow with a
+ * fixture provider and no network.
  */
 
 interface Created {
@@ -37,7 +36,7 @@ function sdkHeaders(host: string): Record<string, string> {
 
 test.describe.configure({ mode: 'serial' });
 
-test.describe('auth sign-in providers (NSO-348) @local', () => {
+test.describe('auth sign-in providers @local', () => {
   let mcp: McpClient;
   let host: string;
 
@@ -102,12 +101,4 @@ test.describe('auth sign-in providers (NSO-348) @local', () => {
     expect(r.headers['content-type']).toContain('text/html');
     expect(r.headers['set-cookie']).toBeUndefined();
   });
-
-  // EXT-09: run with a provider module in DROBEK_MODULES (EXT-07's OIDC
-  // provider against a mock IdP): <LoginGate> shows "Continue with <label>",
-  // the browser goes begin → IdP → /__drobek/auth/callback/<id> → complete,
-  // lands on return_to signed in (host-only cookie), and a replayed complete
-  // URL, the code on the production host and a link opened in another browser
-  // context (no flow cookie) all answer the 400 page.
-  test.fixme('full provider sign-in through a real IdP redirect (needs a provider module in the stack — EXT-09)', async () => {});
 });

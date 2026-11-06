@@ -1,6 +1,6 @@
 import { transformSync } from 'esbuild';
 import { describe, expect, it } from 'vitest';
-import { Compiler, compile } from './index.js';
+import { Compiler, compile, feedbackWidgetEnabled, previewScriptOptions } from './index.js';
 import type { SourceFiles } from './index.js';
 
 const REACT_TS: Array<[string, string]> = [
@@ -83,7 +83,7 @@ describe('compile — happy path', () => {
     expect(r.outputs.has('main.js')).toBe(true);
   });
 
-  it('maps `drobek` to the versioned SDK URL it is given (M1-01)', async () => {
+  it('maps `drobek` to the versioned SDK URL it is given', async () => {
     const r = await compile(
       new Map([['src/main.ts', "import { drobek } from 'drobek';\nconsole.log(drobek);"]]),
       { sdkUrl: '/__drobek/sdk.js?v=0123456789abcdef' }
@@ -92,7 +92,7 @@ describe('compile — happy path', () => {
     expect(text(r.outputs.get('main.js'))).toContain('from "/__drobek/sdk.js?v=0123456789abcdef"');
   });
 
-  describe('the browser error beacon (M1-07)', () => {
+  describe('the browser error beacon', () => {
     const BEACON = '/__drobek/beacon.js?v=00112233aabbccdd';
 
     it('every JS entry imports the beacon FIRST when a beaconUrl is given', async () => {
@@ -132,7 +132,57 @@ describe('compile — happy path', () => {
     });
   });
 
-  describe('drobek/<module> platform sources (M1-02)', () => {
+  describe('the feedback widget flag', () => {
+    it('"feedback": false compiles; anything but a boolean is invalid_config', async () => {
+      const deps = { react: 'https://esm.sh/react@19', 'react-dom': 'https://esm.sh/react-dom@19' };
+      expect((await compile(app([['drobek.json', JSON.stringify({ imports: deps, feedback: false })]]))).ok).toBe(true);
+      const r = await compile(app([['drobek.json', JSON.stringify({ imports: deps, feedback: 'off' })]]));
+      expect(r.ok).toBe(false);
+      expect(r.errors[0]).toMatchObject({ code: 'invalid_config', file: 'drobek.json' });
+      expect(r.errors[0].text).toContain('"feedback" must be true or false');
+    });
+
+    it('feedbackWidgetEnabled: only an explicit false turns the widget off', () => {
+      expect(feedbackWidgetEnabled(undefined)).toBe(true);
+      expect(feedbackWidgetEnabled('{}')).toBe(true);
+      expect(feedbackWidgetEnabled('{"feedback":true}')).toBe(true);
+      expect(feedbackWidgetEnabled('{"feedback":false}')).toBe(false);
+      expect(feedbackWidgetEnabled('{"feedback":"false"}')).toBe(true);
+      expect(feedbackWidgetEnabled('not json')).toBe(true);
+    });
+  });
+
+  describe('the preview script flags', () => {
+    it('"reload": false compiles; anything but a boolean is invalid_config', async () => {
+      const deps = { react: 'https://esm.sh/react@19', 'react-dom': 'https://esm.sh/react-dom@19' };
+      expect((await compile(app([['drobek.json', JSON.stringify({ imports: deps, reload: false })]]))).ok).toBe(true);
+      const r = await compile(app([['drobek.json', JSON.stringify({ imports: deps, reload: 'no' })]]));
+      expect(r.ok).toBe(false);
+      expect(r.errors[0].text).toContain('"reload" must be true or false');
+      const e = await compile(app([['drobek.json', JSON.stringify({ imports: deps, browserErrors: 0 })]]));
+      expect(e.ok).toBe(false);
+      expect(e.errors[0].text).toContain('"browserErrors" must be true or false');
+      expect((await compile(app([['drobek.json', JSON.stringify({ imports: deps, browserErrors: false })]]))).ok).toBe(true);
+      const s = await compile(app([['drobek.json', JSON.stringify({ imports: deps, screenshots: 'off' })]]));
+      expect(s.ok).toBe(false);
+      expect(s.errors[0].text).toContain('"screenshots" must be true or false');
+      expect((await compile(app([['drobek.json', JSON.stringify({ imports: deps, screenshots: false })]]))).ok).toBe(true);
+    });
+
+    it('previewScriptOptions: only an explicit false turns a switch off', () => {
+      const on = { reload: true, browserErrors: true, screenshots: true };
+      expect(previewScriptOptions(undefined)).toEqual(on);
+      expect(previewScriptOptions('{}')).toEqual(on);
+      expect(previewScriptOptions('{"reload":false}')).toEqual({ ...on, reload: false });
+      expect(previewScriptOptions('{"browserErrors":false}')).toEqual({ ...on, browserErrors: false });
+      expect(previewScriptOptions('{"screenshots":false}')).toEqual({ ...on, screenshots: false });
+      expect(previewScriptOptions('{"reload":"false"}')).toEqual(on);
+      expect(previewScriptOptions('[]')).toEqual(on);
+      expect(previewScriptOptions('not json')).toEqual(on);
+    });
+  });
+
+  describe('drobek/<module> platform sources', () => {
     const GATE = [
       "import { useState } from 'react';",
       "import { drobek } from 'drobek';",
@@ -214,7 +264,7 @@ describe('compile — happy path', () => {
     expect(text(r.outputs.get('main.js'))).not.toContain('sourceMappingURL');
   });
 
-  // @drobek/serving splits exactly this trailer off on the production hosts (NSO-381, sourcemap.ts).
+  // @drobek/serving splits exactly this trailer off on the production hosts (sourcemap.ts).
   it('ends every JS/CSS bundle with the inline source map trailer the production hosts split off', async () => {
     const r = await compile(app());
     const b64 = '[A-Za-z0-9+/]+={0,2}';
@@ -227,28 +277,9 @@ describe('compile — happy path', () => {
   });
 
   it('treats an app without src/main.* as static (nothing to bundle)', async () => {
-    const r = await compile(new Map([['index.html', '<html><h1>hi</h1></html>']]));
+    const r = await compile(new Map([['index.html', '<h1>hi</h1>']]));
     expect(r).toMatchObject({ ok: true, errors: [] });
     expect(r.outputs.size).toBe(0);
-    expect(r.warnings.map((warning) => warning.code)).toEqual(
-      expect.arrayContaining(['html_missing_lang', 'html_missing_viewport', 'html_missing_title', 'missing_favicon'])
-    );
-  });
-
-  it('checks favicon files across the version and returns HTML warnings for bundled apps', async () => {
-    const staticResult = await compile(
-      new Map([
-        ['index.html', '<html lang="en"><meta name="viewport"><title>App</title></html>'],
-        ['assets/favicon.svg', '<svg></svg>'],
-      ])
-    );
-    expect(staticResult.warnings.map((warning) => warning.code)).not.toContain('missing_favicon');
-
-    const bundledResult = await compile(app());
-    expect(bundledResult.warnings.map((warning) => warning.code)).toEqual(
-      expect.arrayContaining(['html_missing_lang', 'html_missing_viewport', 'html_missing_title', 'missing_favicon'])
-    );
-    expect(bundledResult.warnings.every((warning) => warning.file === 'index.html')).toBe(true);
   });
 
   it('compiles an import cycle without hanging', async () => {
@@ -259,6 +290,64 @@ describe('compile — happy path', () => {
       ])
     );
     expect(r.ok).toBe(true);
+  });
+});
+
+describe('drobek.json paths (import aliases onto app files)', () => {
+  const shadcn = (paths: unknown, extra: Array<[string, string]> = []): SourceFiles =>
+    new Map<string, string | Buffer>([
+      ['drobek.json', JSON.stringify({ imports: { react: 'https://esm.sh/react@19.1.0' }, paths })],
+      ['src/main.tsx', "import { cn } from '@/lib/utils';\nimport { Button } from '@/components/ui/button';\nimport cfg from '~config';\nconsole.log(cn('a', cfg.title), Button);"],
+      ['src/lib/utils.ts', "export const cn = (...c: string[]): string => c.join(' ');"],
+      ['src/components/ui/button/index.tsx', "import { cn } from '@/lib/utils';\nexport const Button = () => <button className={cn('btn')} />;"],
+      ['config/app.json', '{ "title": "Guestbook" }'],
+      ...extra,
+    ]);
+
+  it('"@/*" resolves to src/* (extensions and /index.* as for relative imports); an exact alias maps one file', async () => {
+    const r = await compile(shadcn({ '@/*': ['./src/*'], '~config': 'config/app.json' }));
+    expect(r.errors).toEqual([]);
+    expect(r.inputs.sort()).toEqual(['config/app.json', 'src/components/ui/button/index.tsx', 'src/lib/utils.ts', 'src/main.tsx']);
+    expect(text(r.outputs.get('main.js'))).toContain('Guestbook');
+  });
+
+  it('tries the targets in order and the longest alias prefix wins', async () => {
+    const r = await compile(
+      shadcn(
+        { '@/*': ['missing/*', 'src/*'], '@/components/ui/*': ['ui/*'], '~config': ['config/app.json'] },
+        [['ui/button.tsx', 'export const Button = () => <b>ui</b>;']]
+      )
+    );
+    expect(r.errors).toEqual([]);
+    expect(r.inputs).toContain('ui/button.tsx');
+    expect(r.inputs).not.toContain('src/components/ui/button/index.tsx');
+  });
+
+  it('an alias whose file is missing names the paths it tried; an alias never leaves the app', async () => {
+    const missing = await compile(shadcn({ '@/*': ['src/*'], '~config': ['config/nope.json'] }));
+    expect(missing.errors[0]).toMatchObject({ code: 'unresolved_import', specifier: '~config' });
+    expect(missing.errors[0].text).toContain('drobek.json paths → config/nope.json');
+    const escape = await compile(
+      new Map([
+        ['drobek.json', JSON.stringify({ paths: { '@/*': ['src/*'] } })],
+        ['src/main.ts', "import '@/../../etc/passwd';"],
+      ])
+    );
+    expect(escape.errors[0]).toMatchObject({ code: 'unresolved_import' });
+    expect(escape.errors[0].text).toContain('(outside the app)');
+  });
+
+  it('without "paths" an @/ import says to add the alias, not a package', async () => {
+    const r = await compile(new Map([['src/main.ts', "import { cn } from '@/lib/utils';\nconsole.log(cn);"], ['src/lib/utils.ts', 'export const cn = 1;']]));
+    expect(r.errors[0]).toMatchObject({ code: 'unresolved_import', specifier: '@/lib/utils' });
+    expect(r.errors[0].text).toContain('"paths": { "@/*": ["src/*"] }');
+  });
+
+  it('refuses a malformed "paths" as invalid_config', async () => {
+    for (const paths of [['src/*'], { '@/*': ['../outside/*'] }, { '@/*': 'src' }, { './x': ['src/x.ts'] }, { drobek: ['src/fake.ts'] }, { 'a*b': ['src/*'] }, { '@/*': [42] }]) {
+      const r = await compile(new Map([['drobek.json', JSON.stringify({ paths })], ['src/main.ts', '']]));
+      expect(r.errors[0], JSON.stringify(paths)).toMatchObject({ code: 'invalid_config', file: 'drobek.json' });
+    }
   });
 });
 
@@ -297,7 +386,7 @@ describe('compile — errors', () => {
   it('tells the agent exactly how to add an unknown package', async () => {
     const r = await compile(new Map([['src/main.ts', "import { format } from 'date-fns/format';\nconsole.log(format);"]]));
     expect(r.errors[0].text).toContain('"date-fns": "https://esm.sh/date-fns@<version>"');
-    // The specifier travels structured, so a caller can attach a hint (M1-01: firebase → skill_info('data')).
+    // The specifier travels structured, so a caller can attach a hint (firebase → skill_info('data')).
     expect(r.errors[0].specifier).toBe('date-fns/format');
   });
 

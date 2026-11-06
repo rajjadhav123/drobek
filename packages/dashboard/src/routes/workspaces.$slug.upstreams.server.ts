@@ -1,16 +1,18 @@
 /**
- * GET/POST /workspaces/:slug/upstreams — server half (PHY-59). The workspace-level
- * BFF proxy config: list registered upstreams, register a new one, delete one.
+ * GET/POST /workspaces/:slug/upstreams — server half. The workspace-level
+ * BFF proxy config: list registered upstreams, register a new one, turn
+ * streaming passthrough on or off for one, delete one.
  *
  * workspace-admin / super-admin ONLY (editor/viewer → 403, non-member → 404) via
  * requireWorkspaceRole('workspace-admin'). The secret input is WRITE-ONLY — it is
  * accepted on create, encrypted by @drobek/proxy, and NEVER read back: the loader
  * returns only `hasSecret`, never the value.
  *
- * NSO-372: register_upstream over MCP links an upstream that needs a key here
+ * register_upstream over MCP links an upstream that needs a key here
  * with its fields in the query (`name`, `baseUrl`, `methods`, `paths`,
- * `authType`, `header`) — the form starts filled in; a secret is never read
- * from the URL.
+ * `authType`, `header`, `streaming`) — the form starts filled in; a secret is never read
+ * from the URL. Registering stops at the workspace's UPSTREAMS_MAX_PER_WORKSPACE
+ * and UPSTREAM_REGISTRATIONS_PER_HOUR; the page shows the refusal's message.
  */
 import {
   data,
@@ -23,10 +25,18 @@ import {
   deleteUpstream,
   listUpstreams,
   proxyAllowedPorts,
+  proxyStreamLimits,
+  setUpstreamStreaming,
   ProxyError,
   proxyErrorStatus,
 } from '@drobek/proxy';
+import { moduleRuntime } from '@drobek/modules';
 import { requireWorkspaceRole, workspaceNav } from '@drobek/tenancy';
+
+/** The workspace's UPSTREAMS_MAX_PER_WORKSPACE (limits provider plan or env default). */
+async function maxUpstreams(workspaceId: string): Promise<number> {
+  return (await (await moduleRuntime()).workspaceLimits(workspaceId)).UPSTREAMS_MAX_PER_WORKSPACE;
+}
 
 function splitList(raw: string): string[] {
   return String(raw ?? '')
@@ -35,7 +45,7 @@ function splitList(raw: string): string[] {
     .filter((s) => s !== '');
 }
 
-const PREFILL_KEYS = ['name', 'baseUrl', 'methods', 'paths', 'authType', 'header'] as const;
+const PREFILL_KEYS = ['name', 'baseUrl', 'methods', 'paths', 'authType', 'header', 'streaming'] as const;
 
 type Prefill = Partial<Record<(typeof PREFILL_KEYS)[number], string>>;
 
@@ -47,6 +57,7 @@ function prefillOf(url: string): Prefill | null {
     if (v !== null && v.length <= 2048) out[k] = v;
   }
   if (out.authType !== undefined && !['none', 'bearer', 'header'].includes(out.authType)) delete out.authType;
+  if (out.streaming !== undefined && out.streaming !== '1') delete out.streaming;
   return Object.keys(out).length > 0 ? out : null;
 }
 
@@ -64,13 +75,16 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   });
   return {
     workspace: { slug: access.workspace.slug, name: access.workspace.name },
-    /** NSO-342: the shared workspace chrome (breadcrumb, badges, tabs). */
+    /** The shared workspace chrome (breadcrumb, badges, tabs). */
     nav: await workspaceNav(access),
     upstreams,
+    maxUpstreams: await maxUpstreams(access.workspace.id),
     prefill: prefillOf(request.url),
     role: access.effectiveRole,
-    // PHY-76 #8: the destination ports a base_url may use (PROXY_ALLOWED_PORTS, default 80/443).
+    // The destination ports a base_url may use (PROXY_ALLOWED_PORTS, default 80/443).
     allowedPorts: [...proxyAllowedPorts()].sort((a, b) => a - b),
+    /** PROXY_STREAM_MAX_MS in whole minutes, for the streaming option's copy. */
+    streamMaxMinutes: Math.max(1, Math.round(proxyStreamLimits().maxMs / 60_000)),
   };
 }
 
@@ -95,6 +109,10 @@ export async function action({ request, params }: ActionFunctionArgs) {
       await deleteUpstream(actor, String(form.get('id') ?? ''));
       return redirect(back);
     }
+    if (intent === 'streaming') {
+      await setUpstreamStreaming(actor, String(form.get('id') ?? ''), form.get('allowStreaming') === '1');
+      return redirect(back);
+    }
     if (intent === 'create') {
       await createUpstream({
         ...actor,
@@ -104,8 +122,10 @@ export async function action({ request, params }: ActionFunctionArgs) {
         allowedPathPrefixes: splitList(String(form.get('pathPrefixes') ?? '')),
         authType: String(form.get('authType') ?? 'none'),
         authHeaderName: String(form.get('authHeaderName') ?? '') || null,
+        allowStreaming: form.get('allowStreaming') === '1',
         // Write-only: consumed here, encrypted, never returned.
         secret: String(form.get('secret') ?? '') || null,
+        maxUpstreams: await maxUpstreams(access.workspace.id),
       });
       return redirect(back);
     }
@@ -113,7 +133,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
   } catch (err) {
     if (err instanceof ProxyError) {
       // `code` is the stable reason (e.g. invalid_request for a base_url port
-      // outside 80/443 — PHY-76 #8); the message is secret-free.
+      // outside 80/443); the message is secret-free.
       return data({ error: err.message, code: err.code }, { status: proxyErrorStatus(err.code) });
     }
     throw err;

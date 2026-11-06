@@ -1,5 +1,5 @@
 /**
- * The Activity view's reading aids (NSO-371), pure and client-safe:
+ * The Activity view's reading aids, pure and client-safe:
  *
  *  - `activitySummary` — one readable sentence per audit event, built only
  *    from the secret-free fields each writer records (versions, counts,
@@ -13,6 +13,7 @@
  *
  * Stored audit rows are never rewritten: this only reads them.
  */
+import { redactAuditMeta } from '@drobek/audit/redact';
 
 export interface ActivityEvent {
   action: string;
@@ -62,6 +63,46 @@ const SUMMARIES: Record<string, Summarize> = {
     const from = num(m, 'restoredFrom');
     return `Restored the files of ${from !== null ? `version ${from}` : 'an earlier version'}${v !== null ? ` as version ${v}` : ''}`;
   },
+  'app.versions.prune': (m) => {
+    const count = num(m, 'versions');
+    const from = num(m, 'from');
+    const to = num(m, 'to');
+    const range = from !== null && to !== null ? (from === to ? ` (version ${from})` : ` (versions ${from}–${to})`) : '';
+    return `The history retention deleted ${count !== null ? plural(count, 'old version') : 'old versions'}${range}`;
+  },
+  'app.versions.delete': (m) => {
+    const count = num(m, 'count');
+    const from = num(m, 'from');
+    const to = num(m, 'to');
+    const range = from !== null && to !== null ? (from === to ? ` (version ${from})` : ` (versions ${from}–${to})`) : '';
+    const what = m.failedOnly === true ? 'failed build' : 'old version';
+    return `Deleted ${count !== null ? plural(count, what) : `${what}s`}${range}`;
+  },
+  'app.version.keep': (m) => {
+    const v = num(m, 'version');
+    return `Kept ${v !== null ? `version ${v}` : 'a version'} — the history clean-up leaves it alone`;
+  },
+  'app.version.unkeep': (m) => {
+    const v = num(m, 'version');
+    return `Stopped keeping ${v !== null ? `version ${v}` : 'a version'}`;
+  },
+  'app.feedback.create': (m) => {
+    const v = num(m, 'version');
+    const label = str(m, 'label');
+    return `Left a feedback note on the preview${v !== null ? ` of version ${v}` : ''}${label ? ` about ${label}` : ''}${m.screenshot === true ? ' with a screenshot' : ''}`;
+  },
+  'app.feedback.resolve': () => 'Resolved a feedback note',
+  'app.feedback.reopen': () => 'Reopened a feedback note',
+  'app.feedback.delete': () => 'Deleted a feedback note',
+  'app.screenshot.request': (m) => {
+    const v = num(m, 'version');
+    return `Asked the preview${v !== null ? ` of version ${v}` : ''} for a screenshot`;
+  },
+  'app.screenshot.capture': (m) => {
+    const v = num(m, 'version');
+    return `Sent a screenshot of the preview${v !== null ? ` of version ${v}` : ''} to the agent that asked for it`;
+  },
+  'app.screenshot.decline': () => 'Declined to send a screenshot of the preview (Not now)',
   'app.publish': (m) => {
     const v = num(m, 'version');
     const prev = num(m, 'previousVersion');
@@ -75,6 +116,7 @@ const SUMMARIES: Record<string, Summarize> = {
   'deploy.rollback': () => 'Rolled back to an earlier deploy (earlier upload pipeline)',
   'app.delete': () => 'Deleted the app',
   'app.slug_release': () => 'Released the deleted app’s address for reuse',
+  'app.purge': () => 'Deleted the app’s versions and data for good',
   'app.lock.release': () => 'Released the agent’s edit lock on the app',
   'app.visibility.public': () => 'Made the app public (no password)',
   'app.visibility.password': (m) =>
@@ -94,6 +136,12 @@ const SUMMARIES: Record<string, Summarize> = {
     const to = str(m, 'to') ?? str(m, 'role');
     return `Changed a member’s role${from ? ` from ${from}` : ''}${to ? ` to ${to}` : ''}`;
   },
+  'member.remove': (m) => `Removed a member${str(m, 'role') ? ` (${str(m, 'role')})` : ''} from the workspace`,
+  'member.leave': (m) =>
+    str(m, 'reason') === 'account_deleted'
+      ? `A member${str(m, 'role') ? ` (${str(m, 'role')})` : ''} deleted their account and left the workspace`
+      : `A member${str(m, 'role') ? ` (${str(m, 'role')})` : ''} left the workspace`,
+  'member.invite_revoke': (m) => `Revoked a pending invite${str(m, 'role') ? ` for the ${str(m, 'role')} role` : ''}`,
   'module.configure': (m) => {
     const keys = Array.isArray(m.keys) ? m.keys.filter((k): k is string => typeof k === 'string') : [];
     return `Changed the ${mod(m)} module’s settings${keys.length ? ` (${keys.join(', ')})` : ''}`;
@@ -129,6 +177,10 @@ const SUMMARIES: Record<string, Summarize> = {
     const c = str(m, 'collection');
     return `Exported ${c ? `the ${c} collection` : 'a collection'} as CSV${rows !== null ? ` (${plural(rows, 'row')})` : ''}`;
   },
+  'data.record_create': (m) => {
+    const n = num(m, 'records');
+    return `Added ${n !== null ? plural(n, 'record') : 'records'}${str(m, 'collection') ? ` to ${str(m, 'collection')}` : ''}`;
+  },
   'data.record_update': (m) => `Edited a record${str(m, 'collection') ? ` in ${str(m, 'collection')}` : ''}`,
   'data.record_delete': (m) => `Deleted a record${str(m, 'collection') ? ` from ${str(m, 'collection')}` : ''}`,
   'data.import': (m) => {
@@ -144,9 +196,26 @@ const SUMMARIES: Record<string, Summarize> = {
     return `Purged the records of the removed collection ${str(m, 'collection') ?? ''}${n !== null ? ` (${plural(n, 'record')})` : ''}`.replace('  ', ' ');
   },
   'files.delete': () => 'Deleted an uploaded file',
+  'sync.run': (m) => {
+    const name = str(m, 'source') ? ` ${str(m, 'source')}` : '';
+    const n = num(m, 'records');
+    const result =
+      str(m, 'status') === 'failed'
+        ? `failed${str(m, 'error') ? `: ${str(m, 'error')}` : ''}`
+        : `wrote ${n !== null ? plural(n, 'record') : 'its records'}`;
+    const paused = m.paused === true ? ' — the import is paused' : '';
+    return m.by === 'schedule' ? `The scheduled import${name} ${result}${paused}` : `Ran the import${name} now — it ${result}${paused}`;
+  },
+  'sync.resume': (m) => `Resumed the scheduled import ${str(m, 'source') ?? ''} after failed runs`.replace('  ', ' '),
   'asset.upload': (m) => `${m.replaced === true ? 'Replaced' : 'Uploaded'} the asset ${str(m, 'name') ?? ''}`.trim(),
   'asset.delete': (m) => `Deleted the asset ${str(m, 'name') ?? ''}`.trim(),
   'proxy.upstream.create': (m) => `Registered the proxy upstream ${str(m, 'name') ?? ''}`.trim(),
+  'proxy.upstream.update': (m) => {
+    const name = str(m, 'name') ?? '';
+    if (m.allowStreaming === true) return `Turned streaming on for the proxy upstream ${name}`.trim();
+    if (m.allowStreaming === false) return `Turned streaming off for the proxy upstream ${name}`.trim();
+    return `Changed the proxy upstream ${name}`.trim();
+  },
   'proxy.upstream.delete': (m) => `Deleted the proxy upstream ${str(m, 'name') ?? ''}`.trim(),
   'proxy.blocked': (m) => {
     const up = str(m, 'upstream');
@@ -192,6 +261,18 @@ const SUMMARIES: Record<string, Summarize> = {
   'workspace.publish_revoke': () => 'The server operator took the publishing approval back',
   'workspace.publish_block': () => 'The server operator turned publishing off for this workspace',
   'workspace.publish_unblock': () => 'The server operator turned publishing back on for this workspace',
+  'workspace.delete': (m, e) => {
+    const apps = num(m, 'apps');
+    const what = `${e.subject ? `the workspace /${e.subject}` : 'the personal workspace'}${apps !== null ? ` with ${apps} app${apps === 1 ? '' : 's'}` : ''}`;
+    return m.with_account === true ? `Deleted ${what} together with the account` : `Deleted ${what}`;
+  },
+  'account.delete': () => 'Deleted the account',
+  'account.email_change': (m) => {
+    const superAdmin = str(m, 'super_admin');
+    if (superAdmin === 'gained') return 'Changed the sign-in e-mail to an address with super-admin rights';
+    if (superAdmin === 'lost') return 'Changed the sign-in e-mail; the new address has no super-admin rights';
+    return 'Changed the sign-in e-mail';
+  },
 };
 
 /** One readable sentence for an audit event (unknown actions fall back to their name). */
@@ -219,6 +300,11 @@ export type ActivityRef =
 const VERSION_KEY: Record<string, string> = {
   'app.version.write': 'version',
   'app.version.restore': 'version',
+  'app.version.keep': 'version',
+  'app.version.unkeep': 'version',
+  'app.feedback.create': 'version',
+  'app.screenshot.request': 'version',
+  'app.screenshot.capture': 'version',
   'app.publish': 'version',
   'app.unpublish': 'previousVersion',
 };
@@ -230,8 +316,8 @@ export function activityRefs(e: ActivityEvent): ActivityRef[] {
   const appId = str(m, 'app_id') ?? str(m, 'appId');
   switch (e.subjectType) {
     case 'app': {
-      // A released slug's app was renamed to its tombstone: nothing to link.
-      if (e.action === 'app.slug_release') return [];
+      // A released slug's app was renamed to its tombstone, a purged one is gone: nothing to link.
+      if (e.action === 'app.slug_release' || e.action === 'app.purge') return [];
       const refs: ActivityRef[] = [{ kind: 'app', slug: subject!, appId }];
       const key = VERSION_KEY[e.action];
       const n = key ? num(m, key) : null;
@@ -372,27 +458,11 @@ export function resolveActivityRefs(
 
 // ── technical details ────────────────────────────────────────────────────────
 
-const SENSITIVE_KEY = /secret|passw|token|authorization|cookie|api[_-]?key|private[_-]?key|credential/i;
-
-/** A copy of `meta` with every non-boolean value under a credential-like key replaced. */
-function redactMeta(value: unknown, depth = 0): unknown {
-  if (depth > 6) return '[…]';
-  if (Array.isArray(value)) return value.map((v) => redactMeta(v, depth + 1));
-  if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Meta)) {
-      out[k] = SENSITIVE_KEY.test(k) && typeof v !== 'boolean' && v !== null ? '[redacted]' : redactMeta(v, depth + 1);
-    }
-    return out;
-  }
-  return value;
-}
-
 /** The stored context of an event as indented JSON (redacted), or null when there is none. */
 export function activityDetails(meta: unknown): string | null {
   if (meta === null || meta === undefined) return null;
   if (typeof meta === 'object' && !Array.isArray(meta) && Object.keys(meta).length === 0) return null;
-  return JSON.stringify(redactMeta(meta), null, 2);
+  return JSON.stringify(redactAuditMeta(meta), null, 2);
 }
 
 // ── time range ───────────────────────────────────────────────────────────────

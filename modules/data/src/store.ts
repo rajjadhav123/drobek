@@ -6,7 +6,9 @@
  * query are always bound parameters (query-build.ts validated them first).
  *
  * Writes of one app are serialized by a transaction-scoped advisory lock, so
- * the quota (records and bytes per app) holds under concurrency.
+ * the quota (records and bytes per app) holds under concurrency. Every
+ * committed write is published to the change feed (live-feed.ts) here, so
+ * subscribers see the writes of every caller.
  */
 import { createId } from '@paralleldrive/cuid2';
 import { and, eq, sql, type SQL } from 'drizzle-orm';
@@ -16,6 +18,7 @@ import { encodeCursor } from './query-build.js';
 import { DataError } from './errors.js';
 import { docByteSize, enforceWriteQuota, type DataQuotaLimits } from './quota.js';
 import { dataRecords, type DataRecordRow } from './schema.js';
+import { changeFeed, type ChangeEvent } from './live-feed.js';
 
 /** A record as every API returns it: the server's fields first, then the record's own. */
 export type DataRecord = { _id: string; _owner: string | null; _created_at: string; _updated_at: string } & Record<string, unknown>;
@@ -31,6 +34,18 @@ export function toRecord(row: Pick<DataRecordRow, 'id' | 'ownerId' | 'doc' | 'cr
   };
   for (const [k, v] of Object.entries(row.doc ?? {})) if (!SYSTEM_FIELDS.has(k)) out[k] = v;
   return out;
+}
+
+/** A batch with more changes than this is published as one `reset` (subscribers load the list again). */
+const BATCH_EVENTS_MAX = 50;
+
+function announce(appId: string, collection: string, events: ChangeEvent[]): Promise<void> {
+  return changeFeed().publish(appId, collection, events);
+}
+
+function changed(op: 'create' | 'update', row: DataRecordRow): ChangeEvent {
+  const record = toRecord(row);
+  return { op, record, at: record._updated_at };
 }
 
 function newRecordId(): string {
@@ -82,7 +97,7 @@ export async function insertRecord(
   input: { appId: string; collection: string; ownerId: string | null; doc: Record<string, unknown>; limits: DataQuotaLimits }
 ): Promise<DataRecordRow> {
   const bytes = docByteSize(input.doc);
-  return withAppWriteLock(db, input.appId, async (tx) => {
+  const stored = await withAppWriteLock(db, input.appId, async (tx) => {
     const u = await usage(tx, input.appId);
     enforceWriteQuota({ limits: input.limits, newDocBytes: bytes, liveDocCount: u.count, liveBytesExcludingTarget: u.bytes, isCreate: true });
     // A JS timestamp (millisecond precision): cursors compare it exactly.
@@ -93,6 +108,8 @@ export async function insertRecord(
       .returning();
     return row;
   });
+  await announce(input.appId, input.collection, [changed('create', stored)]);
+  return stored;
 }
 
 export async function loadRecord(db: DB, appId: string, collection: string, id: string): Promise<DataRecordRow | null> {
@@ -105,7 +122,7 @@ export async function loadRecord(db: DB, appId: string, collection: string, id: 
 }
 
 /**
- * Update a record from its CURRENT fields (NSO-322 M1): the row is re-read
+ * Update a record from its CURRENT fields: the row is re-read
  * `FOR UPDATE` inside the app's write lock, `next(doc)` builds the new fields
  * from it (merge + validate — a throw rolls back), then the quota check and
  * the UPDATE. Two concurrent PATCHes of one record therefore both land
@@ -122,7 +139,7 @@ export async function patchRecord(
     limits: DataQuotaLimits;
   }
 ): Promise<DataRecordRow | null> {
-  return withAppWriteLock(db, input.appId, async (tx) => {
+  const updated = await withAppWriteLock(db, input.appId, async (tx) => {
     const [current] = await tx
       .select()
       .from(dataRecords)
@@ -141,20 +158,23 @@ export async function patchRecord(
       .returning();
     return row ?? null;
   });
+  if (updated) await announce(input.appId, input.collection, [changed('update', updated)]);
+  return updated;
 }
 
 /**
- * Insert many records at once (the owner's CSV import): ONE transaction under
- * the app's write lock, the quota checked for the whole batch first — either
- * every record is stored or none. `created_at` rises by a millisecond per
- * record, so the file's order is the creation order.
+ * Insert many records at once (the owner's CSV import, the MCP
+ * create_records): ONE transaction under the app's write lock, the quota
+ * checked for the whole batch first — either every record is stored or
+ * none. `created_at` rises by a millisecond per record, so the given order is
+ * the creation order. Returns the stored rows in that order.
  */
 export async function insertRecords(
   db: DB,
   input: { appId: string; collection: string; docs: Record<string, unknown>[]; limits: DataQuotaLimits }
-): Promise<number> {
+): Promise<DataRecordRow[]> {
   const sized = input.docs.map((doc) => ({ doc, bytes: docByteSize(doc) }));
-  return withAppWriteLock(db, input.appId, async (tx) => {
+  const rows = await withAppWriteLock(db, input.appId, async (tx) => {
     const u = await usage(tx, input.appId);
     const total = sized.reduce((a, d) => a + d.bytes, 0);
     for (const d of sized) {
@@ -163,21 +183,145 @@ export async function insertRecords(
     if (u.count + sized.length > input.limits.maxDocsPerApp) {
       throw new DataError(
         'quota_exceeded',
-        `The import would store ${u.count + sized.length} records; this app may store at most ${input.limits.maxDocsPerApp} (${u.count} stored).`,
+        `Storing ${sized.length} more records would leave ${u.count + sized.length} in this app; it may store at most ${input.limits.maxDocsPerApp} (${u.count} stored).`,
         { details: { limit: 'DATA_MAX_DOCS_PER_APP', value: input.limits.maxDocsPerApp } }
       );
     }
     enforceWriteQuota({ limits: input.limits, newDocBytes: total, liveDocCount: 0, liveBytesExcludingTarget: u.bytes, isCreate: false });
     const base = Date.now();
+    const stored: DataRecordRow[] = [];
     for (let i = 0; i < sized.length; i += 500) {
       const chunk = sized.slice(i, i + 500).map((d, j) => {
         const at = new Date(base + i + j);
         return { id: newRecordId(), appId: input.appId, collection: input.collection, ownerId: null, doc: d.doc, bytes: d.bytes, createdAt: at, updatedAt: at };
       });
+      stored.push(...(await tx.insert(dataRecords).values(chunk).returning()));
+    }
+    // Every record has its own created_at: that is the given order, whatever order RETURNING used.
+    return stored.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  });
+  if (rows.length > 0) {
+    await announce(
+      input.appId,
+      input.collection,
+      rows.length > BATCH_EVENTS_MAX ? [{ op: 'reset', at: new Date().toISOString() }] : rows.map((r) => changed('create', r))
+    );
+  }
+  return rows;
+}
+
+/**
+ * Write a whole batch into one collection (a module job's import):
+ * ONE transaction under the app's write lock, the quota checked for the
+ * state after the batch first — either everything lands or nothing does.
+ *
+ *  - `replace`: every stored record of the collection is deleted and the
+ *    batch inserted (the file's order is the creation order);
+ *  - `upsert`: a batch record whose `key` value equals a stored record's
+ *    replaces that record's fields (its `_owner` and `_created_at` stay), the
+ *    others are inserted, stored records the batch does not name stay.
+ *
+ * `key` values are compared as JSON (a string "7" is not the number 7).
+ */
+export async function importBatch(
+  db: DB,
+  input: { appId: string; collection: string; docs: Record<string, unknown>[]; mode: 'replace' | 'upsert'; key?: string; limits: DataQuotaLimits }
+): Promise<{ inserted: number; updated: number; deleted: number }> {
+  const sized = input.docs.map((doc) => ({ doc, bytes: docByteSize(doc) }));
+  for (const d of sized) {
+    enforceWriteQuota({ limits: input.limits, newDocBytes: d.bytes, liveDocCount: 0, liveBytesExcludingTarget: 0, isCreate: false });
+  }
+  const result = await withAppWriteLock(db, input.appId, async (tx) => {
+    const u = await usage(tx, input.appId);
+    const [inColl] = await tx
+      .select({ n: sql<string>`count(*)`, b: sql<string>`coalesce(sum(${dataRecords.bytes}), 0)` })
+      .from(dataRecords)
+      .where(scope(input.appId, input.collection));
+    const collCount = Number(inColl?.n ?? 0);
+    const collBytes = Number(inColl?.b ?? 0);
+
+    const toInsert: { doc: Record<string, unknown>; bytes: number }[] = [];
+    const toUpdate: { id: string; doc: Record<string, unknown>; bytes: number }[] = [];
+    let keptCount = u.count - collCount;
+    let keptBytes = u.bytes - collBytes;
+    if (input.mode === 'replace') {
+      toInsert.push(...sized);
+    } else {
+      const key = input.key!;
+      const stored = await tx
+        .select({ id: dataRecords.id, value: sql<string | null>`(${dataRecords.doc} -> ${key}::text)::text`, bytes: dataRecords.bytes })
+        .from(dataRecords)
+        .where(scope(input.appId, input.collection));
+      const byKey = new Map<string, { id: string; bytes: number }>();
+      for (const r of stored) {
+        const v = r.value === null ? null : parseJsonb(r.value);
+        if (v !== null && v !== undefined) byKey.set(JSON.stringify(v), { id: r.id, bytes: r.bytes });
+      }
+      const matched = new Set<string>();
+      for (const d of sized) {
+        const hit = byKey.get(JSON.stringify(d.doc[key]));
+        if (hit) {
+          matched.add(hit.id);
+          toUpdate.push({ id: hit.id, doc: d.doc, bytes: d.bytes });
+        } else toInsert.push(d);
+      }
+      // Stored records the batch does not replace stay.
+      for (const r of stored) {
+        if (matched.has(r.id)) continue;
+        keptCount += 1;
+        keptBytes += r.bytes;
+      }
+    }
+    const finalCount = keptCount + toInsert.length + toUpdate.length;
+    const finalBytes = keptBytes + [...toInsert, ...toUpdate].reduce((a, d) => a + d.bytes, 0);
+    if (finalCount > input.limits.maxDocsPerApp) {
+      throw new DataError(
+        'quota_exceeded',
+        `The import would leave ${finalCount} records in this app; it may store at most ${input.limits.maxDocsPerApp}.`,
+        { details: { limit: 'DATA_MAX_DOCS_PER_APP', value: input.limits.maxDocsPerApp } }
+      );
+    }
+    if (finalBytes > input.limits.maxBytesPerApp) {
+      throw new DataError('quota_exceeded', `The import would exceed the app's storage limit of ${input.limits.maxBytesPerApp} bytes.`, {
+        details: { limit: 'DATA_MAX_BYTES_PER_APP', value: input.limits.maxBytesPerApp },
+      });
+    }
+
+    let deleted = 0;
+    if (input.mode === 'replace') {
+      const rows = await tx.delete(dataRecords).where(scope(input.appId, input.collection)).returning({ id: dataRecords.id });
+      deleted = rows.length;
+    }
+    const now = new Date();
+    for (const d of toUpdate) {
+      await tx
+        .update(dataRecords)
+        .set({ doc: d.doc, bytes: d.bytes, updatedAt: now })
+        .where(and(scope(input.appId, input.collection), eq(dataRecords.id, d.id)));
+    }
+    const base = now.getTime();
+    for (let i = 0; i < toInsert.length; i += 500) {
+      const chunk = toInsert.slice(i, i + 500).map((d, j) => {
+        const at = new Date(base + i + j);
+        return { id: newRecordId(), appId: input.appId, collection: input.collection, ownerId: null, doc: d.doc, bytes: d.bytes, createdAt: at, updatedAt: at };
+      });
       await tx.insert(dataRecords).values(chunk);
     }
-    return sized.length;
+    return { inserted: toInsert.length, updated: toUpdate.length, deleted };
   });
+  if (result.inserted + result.updated + result.deleted > 0) {
+    await announce(input.appId, input.collection, [{ op: 'reset', at: new Date().toISOString() }]);
+  }
+  return result;
+}
+
+/** A jsonb value's text form (`"p1"`, `7`) as a JS value. */
+function parseJsonb(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -195,8 +339,10 @@ export async function deleteRecord(db: DB, appId: string, collection: string, id
   const rows = await db
     .delete(dataRecords)
     .where(and(scope(appId, collection), eq(dataRecords.id, id)))
-    .returning({ id: dataRecords.id });
-  return rows.length > 0;
+    .returning({ id: dataRecords.id, ownerId: dataRecords.ownerId });
+  if (rows.length === 0) return false;
+  await announce(appId, collection, [{ op: 'delete', id, owner: rows[0].ownerId, at: new Date().toISOString() }]);
+  return true;
 }
 
 // ── queries ─────────────────────────────────────────────────────────────────
@@ -312,7 +458,7 @@ export async function countMatching(db: DB, input: Omit<QueryInput, 'sort' | 'li
 /**
  * The distinct own keys of every matching record (the columns of a schemaless
  * CSV export), in JS sort order — one statement, so the export reads the
- * records once (NSO-323 M5).
+ * records once.
  */
 export async function docKeysMatching(db: DB, input: Omit<QueryInput, 'sort' | 'limit' | 'cursor'>): Promise<string[]> {
   const rows = await db

@@ -32,9 +32,9 @@ export interface AppListRow {
   latestVersion: number | null;
   /** When the newest version was written. */
   lastChangeAt: Date | null;
-  /** NSO-342: some version compiled (the preview host has something to serve). */
+  /** Some version compiled (the preview host has something to serve). */
   compiled?: boolean;
-  /** NSO-293: the takedown category; non-null = taken down by a super-admin. */
+  /** The takedown category; non-null = taken down by a super-admin. */
   lockedReason?: string | null;
 }
 
@@ -80,7 +80,7 @@ export function shapeApps(rows: AppListRow[]): AppListItem[] {
 }
 
 /**
- * The app-list thumbnail (NSO-342): the URL the dashboard frames — the
+ * The app-list thumbnail: the URL the dashboard frames — the
  * published host, else the preview host — or why it shows a placeholder
  * instead: a password gate (the frame would only show the password page), a
  * takedown (451), an app that is not live, or nothing compiled yet.
@@ -112,6 +112,10 @@ export interface VersionHistoryRow {
   compileStatus: CompileStatusName;
   createdAt: Date;
   published: boolean;
+  /** The version the preview host serves (the newest that compiled). */
+  preview?: boolean;
+  /** A member kept it: neither the retention nor a clean-up deletes it. */
+  kept?: boolean;
 }
 
 export interface VersionHistoryItem {
@@ -122,6 +126,8 @@ export interface VersionHistoryItem {
   compileStatus: CompileStatusName;
   createdAt: string;
   published: boolean;
+  preview: boolean;
+  kept: boolean;
   /** A version that compiled and is not the published one → can be published. */
   publishable: boolean;
 }
@@ -142,9 +148,57 @@ export function shapeVersionHistory(rows: VersionHistoryRow[]): VersionHistoryIt
       compileStatus: r.compileStatus,
       createdAt: r.createdAt.toISOString(),
       published: r.published,
+      preview: r.preview ?? false,
+      kept: r.kept ?? false,
       publishable: r.compileStatus === 'ok' && !r.published,
     }));
 }
+
+/** A history entry: one version, or a run of failed builds shown collapsed. */
+export type VersionHistoryEntry<T> =
+  | { kind: 'version'; item: T }
+  | { kind: 'failedRun'; from: number; to: number; items: T[] };
+
+/**
+ * Collapse 2+ consecutive failed builds of one history page (newest first)
+ * into a `failedRun` (`from` = its oldest number, `to` = its newest). A single
+ * failure stays a row, and so does a failed build a member kept. Only rows of
+ * the given page are grouped, so a run that crosses a page edge splits there.
+ */
+export function groupFailedRuns<T extends { number: number; compileStatus: CompileStatusName; kept?: boolean }>(
+  rows: readonly T[]
+): VersionHistoryEntry<T>[] {
+  const out: VersionHistoryEntry<T>[] = [];
+  let run: T[] = [];
+  const flush = () => {
+    if (run.length >= 2) {
+      out.push({ kind: 'failedRun', from: run[run.length - 1].number, to: run[0].number, items: run });
+    } else {
+      for (const item of run) out.push({ kind: 'version', item });
+    }
+    run = [];
+  };
+  for (const row of rows) {
+    if (row.compileStatus === 'error' && !row.kept) {
+      run.push(row);
+    } else {
+      flush();
+      out.push({ kind: 'version', item: row });
+    }
+  }
+  flush();
+  return out;
+}
+
+/** The reasons a clean-up leaves a version in place, in the order the confirm panel lists them. */
+export const VERSION_PROTECTION_LABEL = {
+  published: 'live',
+  preview: 'the preview',
+  kept: 'kept',
+  rollback_assets: 'kept for a rollback',
+  newest: 'the newest version',
+  recent: 'from the last hour',
+} as const;
 
 // ── Publish authorization (pure) ─────────────────────────────────────────────
 
@@ -161,7 +215,7 @@ export function canPublish(effectiveRole: WorkspaceRole | null): boolean {
 }
 
 /**
- * The Data-tab delete authorization (M1b, PHY-121), same rule as publish:
+ * The Data-tab delete authorization, same rule as publish:
  * editor / workspace-admin (and super-admin ⇒ workspace-admin) may delete a
  * record; a viewer or non-member may NOT. Gates whether the delete affordance
  * renders; the action re-enforces it server-side via requireWorkspaceRole
@@ -171,7 +225,7 @@ export function canDeleteRecord(effectiveRole: WorkspaceRole | null): boolean {
   return effectiveRole !== null && roleAtLeast(effectiveRole, 'editor');
 }
 
-// ── Activity / audit view (PHY-85) ───────────────────────────────────────────
+// ── Activity / audit view ───────────────────────────────────────────
 
 /** A raw audit row handed to the Activity shaping (db-free; from listActivity). */
 export interface ActivityRowInput {
@@ -193,7 +247,8 @@ export interface ActivityItem {
   actorBadge: AuditActorKind;
   /**
    * Which human/agent: the actor's email, 'app end user' for an end-user row
-   * (no drobek actor), or 'system' when there is no actor at all.
+   * (no drobek actor), 'someone on the preview' for a screenshot answer (the
+   * preview posts it without a session), or 'system' when there is no actor at all.
    */
   actorLabel: string;
   subjectType: string | null;
@@ -209,6 +264,9 @@ export interface ActivityItem {
  * actor's email (or 'system' for an actor-less row). No secrets/PII beyond the
  * email that the admin viewer is already entitled to see.
  */
+/** Audit actions written by the preview's screenshot bar, which answers without a drobek session. */
+const PREVIEW_ANSWERS = new Set(['app.screenshot.capture', 'app.screenshot.decline']);
+
 export function shapeActivity(rows: ActivityRowInput[]): ActivityItem[] {
   return [...rows]
     .sort(
@@ -221,8 +279,8 @@ export function shapeActivity(rows: ActivityRowInput[]): ActivityItem[] {
       action: r.action,
       actorKind: r.actorKind,
       actorBadge: r.actorKind,
-      // End users (M1-01) are not drobek users: their rows carry no actor id.
-      actorLabel: r.actorEmail ?? (r.actorKind === 'end_user' ? 'app end user' : 'system'),
+      // End users are not drobek users: their rows carry no actor id.
+      actorLabel: r.actorEmail ?? (r.actorKind === 'end_user' ? 'app end user' : PREVIEW_ANSWERS.has(r.action) ? 'someone on the preview' : 'system'),
       subjectType: r.subjectType,
       subject: r.subject,
       time: formatTimestamp(r.createdAt.toISOString()),

@@ -1,10 +1,11 @@
 /**
- * The files sweep (NSO-325): what the upload and delete paths cannot clean up
+ * The files sweep: what the upload and delete paths cannot clean up
  * themselves, removed on a timer in the server process (apps/server jobs):
  *
  *  1. the `mod_files` rows of apps deleted at least RETENTION ago — an app
- *     delete is a soft delete (the row cascade never fires), and a deleted
- *     app's files are unreachable (its hosts answer 404);
+ *     delete is a soft delete (the row cascade fires only with the app purge,
+ *     APP_PURGE_AFTER_DAYS later), and a deleted app's files are unreachable
+ *     (its hosts answer 404);
  *  2. temp uploads (`<FILES_DIR>/tmp/*.part`) untouched for RETENTION — a
  *     crash between the first chunk and the commit/abort leaves them behind;
  *  3. blobs on disk older than RETENTION (mtime) that NO `mod_files` row of

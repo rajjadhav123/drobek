@@ -16,15 +16,15 @@ import { callTool, connectBearer, mcpClient } from './helpers/mcp';
 import { userIdByEmail, withDb } from './helpers/seed';
 
 /**
- * M0-06 (NSO-285) acceptance, end to end against the local compose stack:
+ * App origins end to end against the local compose stack:
  * every app is its own origin under APPS_DOMAIN (dev: apps.localhost:3041).
  *   - <slug>--preview.<APPS_DOMAIN> = the newest version that compiled,
  *     <slug>.<APPS_DOMAIN> = the published one (404 "not published" before),
  *     <slug>--v<N>.<APPS_DOMAIN> = exactly version N;
  *   - built files win, sources (*.tsx) are never served, SPA fallback, ETag/304,
  *     the Cache-Control policy, the security header set (CSP, noindex on
- *     preview/version hosts, no-referrer, nosniff, frame-ancestors = only the
- *     dashboard origin (NSO-342, the app-list thumbnail));
+ *     preview/version hosts, strict-origin-when-cross-origin, nosniff, frame-ancestors = only the
+ *     dashboard origin (the app-list thumbnail));
  *   - MCP publish (scope `publish`, only ok versions, rollback, audited);
  *   - the cache is busted on publish / a new version (no stale first request);
  *   - the dashboard never serves an app, app hosts never read or set the
@@ -62,7 +62,7 @@ function cookieNames(header: string): string[] {
     .filter(Boolean);
 }
 
-/** An app's CSP: only the dashboard may frame it (the app-list thumbnail, NSO-342). */
+/** An app's CSP: only the dashboard may frame it (the app-list thumbnail). */
 const cspWithAncestors = (frameAncestors: string): string =>
   "default-src 'self'; script-src 'self' https://esm.sh 'unsafe-inline'; " +
   "style-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; " +
@@ -119,7 +119,7 @@ async function announceAppChanged(appId: string, slug: string): Promise<void> {
 function expectAppSecurityHeaders(r: Raw, opts: { noindex: boolean; csp?: string }): void {
   expect(r.headers['content-security-policy']).toBe(opts.csp ?? EXPECTED_CSP);
   expect(r.headers['x-content-type-options']).toBe('nosniff');
-  expect(r.headers['referrer-policy']).toBe('no-referrer');
+  expect(r.headers['referrer-policy']).toBe('strict-origin-when-cross-origin');
   if (opts.noindex) expect(r.headers['x-robots-tag']).toBe('noindex');
   else expect(r.headers['x-robots-tag']).toBeUndefined();
   expect(r.headers['set-cookie']).toBeUndefined();
@@ -166,8 +166,10 @@ test('app hosts: preview / publish / rollback / --vN, served files, headers, cac
     expect(html.headers['content-type']).toMatch(/^text\/html/);
     expect(html.body).toContain('<script type="module" src="/main.js"></script>');
     expect(html.headers['cache-control']).toBe('public, max-age=0, must-revalidate');
-    expect(html.headers.etag).toMatch(/^"[0-9a-f]{64}"$/);
-    expectAppSecurityHeaders(html, { noindex: true });
+    expect(html.headers.etag).toMatch(/^"[0-9a-f]{64}-fb\d+-[0-9a-f]+-pv\d+res?-[0-9a-f]+"$/);
+    expect(html.body).toContain('<script src="/__drobek/feedback.js" defer');
+    const prodBody = html.body.replace(/<script src="\/__drobek\/preview\.js"[^>]*><\/script><script src="\/__drobek\/feedback\.js"[^>]*><\/script>/, '');
+    expectAppSecurityHeaders(html, { noindex: true, csp: EXPECTED_CSP.replace("connect-src 'self' https://esm.sh;", `connect-src 'self' https://esm.sh ${DASHBOARD_ORIGIN}/api/screenshots/;`) });
 
     const js = await hostRequest(previewHost(slug), '/main.js');
     expect(js.status).toBe(200);
@@ -216,10 +218,17 @@ test('app hosts: preview / publish / rollback / --vN, served files, headers, cac
       published_url: urlOf(prodHost(slug)),
       domains: [prodHost(slug)],
       assets: 'draft',
+      // The template has a <title>; its description and icon are the agent's to add. The .tsx type check runs in the background.
+      readiness: {
+        ready: true,
+        blocking: [],
+        warnings: [expect.objectContaining({ code: 'missing_description' }), expect.objectContaining({ code: 'missing_favicon' })],
+        typecheck: expect.stringMatching(/^(pending|checked)$/),
+      },
     });
     const prod1 = await hostRequest(prodHost(slug));
     expect(prod1.status).toBe(200);
-    expect(prod1.body).toBe(html.body);
+    expect(prod1.body).toBe(prodBody);
     expectAppSecurityHeaders(prod1, { noindex: false });
 
     // ── A new version: preview follows at once (bust), production does not. ─
@@ -231,7 +240,7 @@ test('app hosts: preview / publish / rollback / --vN, served files, headers, cac
     expect(v2.isError, v2.text).toBe(false);
     expect(v2.json).toMatchObject({ version: 2, compile: { ok: true } });
     expect((await hostRequest(previewHost(slug))).body).toContain('<p id="marker">second</p>');
-    expect((await hostRequest(prodHost(slug))).body).toBe(html.body);
+    expect((await hostRequest(prodHost(slug))).body).toBe(prodBody);
     // A stale ETag no longer matches.
     expect(
       (await hostRequest(previewHost(slug), '/', { headers: { 'If-None-Match': String(html.headers.etag) } })).status
@@ -261,11 +270,11 @@ test('app hosts: preview / publish / rollback / --vN, served files, headers, cac
     // ── Rollback = publish an older version. ──────────────────────────────
     const rollback = await callTool(a.client, 'publish', { app_id: appId, version: 1 });
     expect(rollback.json).toMatchObject({ published_version: 1, previous_version: 2 });
-    expect((await hostRequest(prodHost(slug))).body).toBe(html.body);
+    expect((await hostRequest(prodHost(slug))).body).toBe(prodBody);
 
-    // ── --vN = exactly version N (noindex). ────────────────────────────────
+    // ── --vN = exactly version N (noindex); its preview script reports errors but never reloads or asks for screenshots. ──
     const v1Host = await hostRequest(versionHost(slug, 1));
-    expect(v1Host.body).toBe(html.body);
+    expect(v1Host.body).toBe(html.body.replace(/( data-version="1") data-reload data-errors(?: data-screenshots)?>/, '$1 data-errors>'));
     expectAppSecurityHeaders(v1Host, { noindex: true });
     expect((await hostRequest(versionHost(slug, 2))).body).toContain('<p id="marker">second</p>');
     expect((await hostRequest(versionHost(slug, 42))).status).toBe(404);
@@ -273,7 +282,7 @@ test('app hosts: preview / publish / rollback / --vN, served files, headers, cac
     // Unknown app / malformed app labels: an apps-side 404, never the dashboard.
     const unknown = await hostRequest(previewHost(`${slug}-nope`));
     expect(unknown.status).toBe(404);
-    expectAppSecurityHeaders(unknown, { noindex: true, csp: NO_APP_CSP });
+    expectAppSecurityHeaders(unknown, { noindex: true, csp: NO_APP_CSP.replace("connect-src 'self' https://esm.sh;", `connect-src 'self' https://esm.sh ${DASHBOARD_ORIGIN}/api/screenshots/;`) });
     if (APPS_URL_SCHEME === 'https') {
       // Behind Caddy a nested label matches no certificate (`*.<APPS_DOMAIN>`
       // covers one label): the handshake is refused before drobek sees it.
@@ -446,6 +455,8 @@ test('password gate: 401 form, wrong password, unlock sets a host-only cookie on
     const gated = await hostRequest(prodHost(slug), '/deep/link?x=1');
     expect(gated.status).toBe(401);
     expect(gated.body).toContain('This app is password protected');
+    expect(gated.body).toContain('data-drobek-page="password"');
+    expect(gated.body).not.toMatch(/<script/i);
     expect(gated.body).toContain('value="/deep/link?x=1"');
     expect(gated.body).not.toContain('src="/main.js"');
     expectAppSecurityHeaders(gated, { noindex: false });

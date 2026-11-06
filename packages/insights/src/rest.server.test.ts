@@ -1,5 +1,5 @@
 /**
- * The beacon HTTP contract (PHY-123 → apps origin, M1-07) over the
+ * The beacon HTTP contract (apps origin) over the
  * framework-free handler: size cap BEFORE parsing (declared and counted),
  * same-origin only, POST only, JSON only, and the recorder is handed the app
  * the host resolved — never an app named by the client. The process-level
@@ -32,7 +32,7 @@ function recorder() {
   const calls: Parameters<BeaconRecorder>[0][] = [];
   const record: BeaconRecorder = async (input) => {
     calls.push(input);
-    return { stored: 1 };
+    return { stored: 1, loadCounted: false };
   };
   return { calls, record };
 }
@@ -54,7 +54,15 @@ describe('handleBeacon', () => {
     expect((calls[0].batch as { events: unknown[] }).events).toHaveLength(1);
   });
 
-  it('no resolved client IP → the recorder gets ip: null, never a shared "unknown" (NSO-328)', async () => {
+  it('passes the version the host serves on, for a page that does not say its own (default: none)', async () => {
+    const { calls, record } = recorder();
+    const origin = { origin: 'http://shop--preview.apps.localhost:3041' };
+    await handleBeacon(beaconReq(EVENT, origin), 'app_1', { record, servedVersion: 7 });
+    await handleBeacon(beaconReq(EVENT, origin), 'app_1', { record });
+    expect(calls.map((c) => c.servedVersion)).toEqual([7, null]);
+  });
+
+  it('no resolved client IP → the recorder gets ip: null, never a shared "unknown"', async () => {
     const { calls, record } = recorder();
     const req = { ...beaconReq(EVENT, { origin: 'http://shop--preview.apps.localhost:3041' }), clientIp: null };
     expect((await handleBeacon(req, 'app_1', { record })).status).toBe(204);

@@ -1,5 +1,5 @@
 /**
- * NSO-366 in the dashboard, on a real PGlite database (the session and the
+ * Publish approval in the dashboard, on a real PGlite database (the session and the
  * workspace role gate are stubbed — they have their own tests):
  *  - /admin/publishing: only a super-admin reads it or acts (403 otherwise);
  *    the waiting requests are listed; Approve / Revoke / Block / Unblock
@@ -166,7 +166,7 @@ describe('/admin/publishing', () => {
 
   it('block shows the operator\'s notice to the owner, records no request; unblock takes it back; ?workspace= shows one', async () => {
     who.user = { id: bossId, email: 'boss@example.com' };
-    // NSO-371: Block goes through a confirm step. The panel only reads.
+    // Block goes through a confirm step. The panel only reads.
     const panel = result(await adminLoad('?workspace=acme&confirm=block'));
     expect(panel.data.blockConfirm).toMatchObject({ workspaceId: who.ws.id, slug: 'acme', name: 'Acme', liveApps: 0, back: '/admin/publishing?workspace=acme' });
     expect(panel.data.blockConfirmError).toBeNull();
@@ -215,5 +215,18 @@ describe('/admin/publishing', () => {
     });
     const actions = (await db.select().from(auditLog).where(eq(auditLog.actorUserId, bossId))).map((r) => r.action);
     expect(actions).toEqual(['workspace.publish_approve', 'workspace.publish_revoke', 'workspace.publish_block', 'workspace.publish_unblock']);
+  });
+
+  it('?q= searches on the server; the counts and the URL state come with the page', async () => {
+    who.user = { id: bossId, email: 'boss@example.com' };
+    const hit = result(await adminLoad('?state=all&q=OWNER@example&sort=name'));
+    expect((hit.data.workspaces as Record<string, unknown>[]).map((r) => r.slug)).toEqual(['acme']);
+    expect(hit.data.list).toMatchObject({ matching: 1, filtered: true, page: 1, pageSize: 50, params: { state: 'all', q: 'OWNER@example', sort: 'name', workspace: '', page: '' } });
+    expect((hit.data.list as { total: number }).total).toBeGreaterThanOrEqual(1);
+    expect((hit.data.workspaces as { created: { ago: string; at: string } }[])[0].created.at).toMatch(/ UTC$/);
+    const miss = result(await adminLoad('?state=all&q=nobody-here'));
+    expect(miss.data.workspaces).toEqual([]);
+    expect(miss.data.list).toMatchObject({ matching: 0 });
+    expect(miss.data.listError).toBe(false);
   });
 });

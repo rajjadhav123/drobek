@@ -104,6 +104,10 @@
       "types": "./src/pending-banner.server.ts",
       "default": "./dist/pending-banner.server.js"
     },
+    "./body-limits": {
+      "types": "./src/body-limits.ts",
+      "default": "./dist/body-limits.js"
+    },
     "./routes/workspaces.$slug.apps.$appSlug.domains": {
       "types": "./src/routes/workspaces.$slug.apps.$appSlug.domains.tsx",
       "default": "./dist/routes/workspaces.$slug.apps.$appSlug.domains.js"
@@ -144,6 +148,30 @@
       "types": "./src/routes/workspaces.$slug.apps.$appSlug.uploads.$fileId.server.ts",
       "default": "./dist/routes/workspaces.$slug.apps.$appSlug.uploads.$fileId.server.js"
     },
+    "./routes/workspaces.$slug.apps.$appSlug.feedback": {
+      "types": "./src/routes/workspaces.$slug.apps.$appSlug.feedback.tsx",
+      "default": "./dist/routes/workspaces.$slug.apps.$appSlug.feedback.js"
+    },
+    "./routes/workspaces.$slug.apps.$appSlug.feedback.server": {
+      "types": "./src/routes/workspaces.$slug.apps.$appSlug.feedback.server.ts",
+      "default": "./dist/routes/workspaces.$slug.apps.$appSlug.feedback.server.js"
+    },
+    "./routes/workspaces.$slug.apps.$appSlug.feedback.$id.screenshot.server": {
+      "types": "./src/routes/workspaces.$slug.apps.$appSlug.feedback.$id.screenshot.server.ts",
+      "default": "./dist/routes/workspaces.$slug.apps.$appSlug.feedback.$id.screenshot.server.js"
+    },
+    "./routes/workspaces.$slug.apps.$appSlug.feedback.screenshots.$id.server": {
+      "types": "./src/routes/workspaces.$slug.apps.$appSlug.feedback.screenshots.$id.server.ts",
+      "default": "./dist/routes/workspaces.$slug.apps.$appSlug.feedback.screenshots.$id.server.js"
+    },
+    "./routes/feedback.new": {
+      "types": "./src/routes/feedback.new.tsx",
+      "default": "./dist/routes/feedback.new.js"
+    },
+    "./routes/feedback.new.server": {
+      "types": "./src/routes/feedback.new.server.ts",
+      "default": "./dist/routes/feedback.new.server.js"
+    },
     "./routes/workspaces.$slug.apps.$appSlug.logs": {
       "types": "./src/routes/workspaces.$slug.apps.$appSlug.logs.tsx",
       "default": "./dist/routes/workspaces.$slug.apps.$appSlug.logs.js"
@@ -151,6 +179,14 @@
     "./routes/workspaces.$slug.apps.$appSlug.logs.server": {
       "types": "./src/routes/workspaces.$slug.apps.$appSlug.logs.server.ts",
       "default": "./dist/routes/workspaces.$slug.apps.$appSlug.logs.server.js"
+    },
+    "./routes/workspaces.$slug.apps.$appSlug.analytics": {
+      "types": "./src/routes/workspaces.$slug.apps.$appSlug.analytics.tsx",
+      "default": "./dist/routes/workspaces.$slug.apps.$appSlug.analytics.js"
+    },
+    "./routes/workspaces.$slug.apps.$appSlug.analytics.server": {
+      "types": "./src/routes/workspaces.$slug.apps.$appSlug.analytics.server.ts",
+      "default": "./dist/routes/workspaces.$slug.apps.$appSlug.analytics.server.js"
     },
     "./routes/workspaces.$slug.activity": {
       "types": "./src/routes/workspaces.$slug.activity.tsx",
@@ -204,6 +240,22 @@
       "types": "./src/routes/me.connections.server.ts",
       "default": "./dist/routes/me.connections.server.js"
     },
+    "./routes/me.delete": {
+      "types": "./src/routes/me.delete.tsx",
+      "default": "./dist/routes/me.delete.js"
+    },
+    "./routes/me.delete.server": {
+      "types": "./src/routes/me.delete.server.ts",
+      "default": "./dist/routes/me.delete.server.js"
+    },
+    "./routes/workspaces.$slug.delete": {
+      "types": "./src/routes/workspaces.$slug.delete.tsx",
+      "default": "./dist/routes/workspaces.$slug.delete.js"
+    },
+    "./routes/workspaces.$slug.delete.server": {
+      "types": "./src/routes/workspaces.$slug.delete.server.ts",
+      "default": "./dist/routes/workspaces.$slug.delete.server.js"
+    },
     "./footer": {
       "types": "./src/footer.tsx",
       "default": "./dist/footer.js"
@@ -256,6 +308,10 @@
       "types": "./src/routes/duplicate.$slug.server.ts",
       "default": "./dist/routes/duplicate.$slug.server.js"
     },
+    "./routes/site-files.server": {
+      "types": "./src/routes/site-files.server.ts",
+      "default": "./dist/routes/site-files.server.js"
+    },
     "./routes/api.public.gallery.server": {
       "types": "./src/routes/api.public.gallery.server.ts",
       "default": "./dist/routes/api.public.gallery.server.js"
@@ -267,6 +323,22 @@
     "./locked-notice": {
       "types": "./src/locked-notice.tsx",
       "default": "./dist/locked-notice.js"
+    },
+    "./whats-new-banner": {
+      "types": "./src/whats-new-banner.tsx",
+      "default": "./dist/whats-new-banner.js"
+    },
+    "./whats-new.server": {
+      "types": "./src/whats-new.server.ts",
+      "default": "./dist/whats-new.server.js"
+    },
+    "./routes/whats-new.server": {
+      "types": "./src/routes/whats-new.server.ts",
+      "default": "./dist/routes/whats-new.server.js"
+    },
+    "./routes/whats-new.dismiss.server": {
+      "types": "./src/routes/whats-new.dismiss.server.ts",
+      "default": "./dist/routes/whats-new.dismiss.server.js"
     }
   },
   "scripts": {
@@ -280,6 +352,7 @@
     "@drobek/apps": "workspace:*",
     "@drobek/audit": "workspace:*",
     "@drobek/auth": "workspace:*",
+    "@drobek/compile": "workspace:*",
     "@drobek/core": "workspace:*",
     "@drobek/db": "workspace:*",
     "@drobek/domains": "workspace:*",

@@ -1,15 +1,16 @@
 /**
- * Keeps the app hosts' cache honest (M0-06): every `drobek:app-changed` event —
+ * Keeps the app hosts' cache honest: every `drobek:app-changed` event —
  * a new version (write_files, create_app, restore_version) or a publish (MCP or
  * dashboard) — busts what the serve cache knows about that app's hosts.
  *
  * Two feeds: the in-process emitter (this process's own changes, synchronous —
  * the first request after a publish already sees the new version) and a
  * dedicated Redis subscriber connection (changes made by any other process).
- * Busting twice is harmless. A `domain` event (M3-01) also drops every cached
+ * Busting twice is harmless. A `domain` event also drops every cached
  * custom-host resolution (and every cached custom-host miss). A `create` event
- * (NSO-315, from createApp) busts the slug like any other — which forgets a
- * cached "no such slug", so the new app is served at once.
+ * (from createApp) busts the slug like any other — which forgets a
+ * cached "no such slug", so the new app is served at once. A `screenshot`
+ * event (an agent's request reaching the preview streams) busts nothing.
  */
 import type { Redis } from 'ioredis';
 import {
@@ -36,8 +37,10 @@ export function subscribeServeCache(
   opts: { redis?: Redis | null; log?: Logger } = {}
 ): ServeCacheSubscription {
   const offLocal = onLocalAppChanged((e) => {
+    // A screenshot request changes nothing the app hosts serve.
+    if (e.kind === 'screenshot') return;
     store.bust(e.slug);
-    // M3-01: a domain change can move ANY custom hostname (added / verified / removed).
+    // A domain change can move ANY custom hostname (added / verified / removed).
     if (e.kind === 'domain') store.bustCustomHosts();
   });
 

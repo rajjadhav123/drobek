@@ -1,6 +1,6 @@
 /**
- * The module-config half of duplicating a gallery app (NSO-340; the files
- * half is @drobek/apps `duplicateAppFiles`). The source app's SAVED configs
+ * The module-config half of duplicating a gallery app (the files half is
+ * @drobek/apps `duplicateAppFiles`). The source app's SAVED configs
  * (never its pending changes) are proposed to the copy through the normal
  * `configure` path: a change the module wants confirmed waits on the copy's
  * Modules page like any other. Before that the copy drops what belongs to the
@@ -14,8 +14,8 @@ import { getDb, moduleConfigs } from '@drobek/db';
 import { isModuleError } from './errors.js';
 import type { ModuleRuntime } from './runtime.js';
 
-/** Modules whose config is never copied: it points at records of the source workspace. */
-export const NOT_COPIED_MODULES: readonly string[] = ['proxy'];
+/** Modules whose config is never copied: it points at records of the source workspace (proxy), or would start calling an external API from the copy (sync). */
+export const NOT_COPIED_MODULES: readonly string[] = ['proxy', 'sync'];
 
 const EMAIL_RE = /[^\s@<>"',;]+@[^\s@<>"',;]+\.[^\s@<>"',;]+/;
 

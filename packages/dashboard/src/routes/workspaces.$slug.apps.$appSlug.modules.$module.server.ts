@@ -1,6 +1,6 @@
 /**
- * GET/POST /workspaces/:slug/apps/:appSlug/modules/:module — server half
- * (M2-02, NSO-291). This is the `confirm_url` configure_module hands the
+ * GET/POST /workspaces/:slug/apps/:appSlug/modules/:module — server half.
+ * This is the `confirm_url` configure_module hands the
  * agent (`confirmUrl()` in @drobek/modules).
  *
  * GET (viewer+): the module's config as a form generated from its JSON
@@ -8,12 +8,17 @@
  * own confirmRequired strings + a plain-language risk note each), the
  * declared secrets (`hasSecret` + when set — NEVER a value), the module's
  * facts ("About this module": version, source, contract range, requires,
- * slots, contributions, its own error codes — NSO-347), and a dedicated
+ * slots, contributions, its own error codes), and a dedicated
  * editor for a module that declares one in `dashboard.editor` — the
  * collections + rules editor (`collections`) or the per-app upstream
  * assignments (`upstreams`). The editor follows the declared capability,
  * never the module's name: a replacement module with the same capability
  * gets the same editor. A viewer gets the same page without any control.
+ * The fields a module annotates `x-drobek-choices` get their choices
+ * (module-choices.server.ts): the workspace's upstreams, the app's
+ * collections and forms, the intervals the workspace's limit allows; a
+ * field annotated `x-drobek-default-limit` the workspace's value of that
+ * limit.
  *
  * POST (editor+, `requireWorkspaceRole('editor')` BEFORE anything is read
  * from the form: a viewer → 403, a non-member → 404, anonymous → /login):
@@ -22,8 +27,8 @@
  *    `save-upstream`, `unassign-upstream` → a merge patch through the SAME
  *    configure path configure_module uses (the module's configSchema,
  *    confirmRequired, audit — actor `user`): a relaxation becomes a pending
- *    change rather than applying directly. Invalid → 400 with the errors at
- *    their fields;
+ *    change rather than applying directly, or joins the one that already
+ *    waits (`done=merged`). Invalid → 400 with the errors at their fields;
  *  - `confirm` / `reject` → the pending decision (audit module.confirm /
  *    module.reject, actor `user`);
  *  - `set-secret` (set or rotate) / `remove-secret` → the encrypted module
@@ -32,11 +37,18 @@
  *    or rendered: a success redirects (PRG), a failure answers a message
  *    without it.
  *
- * A taken-down app (NSO-293, `apps.locked_reason`) refuses every change with
+ * A taken-down app (`apps.locked_reason`) refuses every change with
  * 423 `app_locked_by_admin` (like configure_module and the module-confirm
  * API); `reject` and `remove-secret` stay allowed (they only take away).
  *
- * NSO-346: an opt-in module that is not enabled for the workspace shows
+ * The module that declares `sync` (by capability, not by name)
+ * also shows its sources (last / next run, the latest runs) with
+ * `sync-run` (Run now — the run's audit names the person), `sync-pause` /
+ * `sync-resume` (the source's `paused` key through the configure path; resume
+ * also clears a pause after failed runs, audited `<module>.resume`), and the
+ * "a scheduled import stopped" banner.
+ *
+ * An opt-in module that is not enabled for the workspace shows
  * "not enabled for this workspace" instead of the forms, and refuses every
  * change with 404 `module_not_enabled` (again except `reject` and
  * `remove-secret`).
@@ -53,6 +65,8 @@ import {
   moduleNotEnabled,
   moduleRuntime,
   setModuleSecret,
+  type BoundSync,
+  type BoundWebhooks,
   type ModuleDashboardEditor,
   type ModuleRuntime,
 } from '@drobek/modules';
@@ -60,8 +74,10 @@ import { requireWorkspaceRole } from '@drobek/tenancy';
 import { appHeaderData } from '../app-page.server.js';
 import { loadAppForView } from '../apps.server.js';
 import {
+  choiceRequests,
   configDiff,
   confirmRoleOf,
+  defaultLimitNames,
   fieldErrors,
   fieldStates,
   fieldValues,
@@ -74,7 +90,11 @@ import {
   type FieldValue,
   type Issue,
 } from '../module-config.js';
+import { loadChoices, loadFieldLimits } from '../module-choices.server.js';
 import { loadPendingBanner } from '../pending-banner.server.js';
+import { loadSyncBanner } from '../sync-banner.server.js';
+import type { SyncPanelData } from '../module-ui/sync-sources.js';
+import type { WebhooksPanelData } from '../module-ui/webhook-endpoints.js';
 import { canPublish } from '../view.js';
 
 /**
@@ -121,7 +141,7 @@ async function context(request: Request, params: LoaderFunctionArgs['params'], m
   if (!app) notFound();
   const runtime = await moduleRuntime();
   const name = String(params.module ?? '');
-  if (!runtime.get(name)) notFound();
+  if (!runtime.appFacing.some((m) => m.name === name)) notFound();
   const hookApp = { id: app.id, slug: app.slug, workspaceId: access.workspace.id };
   return { access, app, runtime, name, hookApp };
 }
@@ -188,6 +208,31 @@ function upstreamsOf(config: unknown, info: Record<string, unknown> | undefined)
   return [...out.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** The runs the sources panel lists. */
+const SYNC_PANEL_RUNS = 20;
+
+async function syncPanel(sync: BoundSync): Promise<SyncPanelData> {
+  try {
+    const [sources, runs] = await Promise.all([sync.sources(), sync.runs({ limit: SYNC_PANEL_RUNS })]);
+    return { sources, runs };
+  } catch {
+    return { sources: null, runs: [] };
+  }
+}
+
+/** The deliveries the webhooks panel lists. */
+const WEBHOOKS_PANEL_DELIVERIES = 20;
+
+async function webhooksPanel(hooks: BoundWebhooks, secrets: { name: string; hasSecret: boolean }[]): Promise<WebhooksPanelData> {
+  try {
+    const [endpoints, deliveries] = await Promise.all([hooks.endpoints(), hooks.deliveries({ limit: WEBHOOKS_PANEL_DELIVERIES })]);
+    const set = new Set(secrets.filter((s) => s.hasSecret).map((s) => s.name));
+    return { endpoints: endpoints.map((e) => ({ ...e, hasSecret: set.has(e.secret) })), deliveries };
+  } catch {
+    return { endpoints: null, deliveries: [] };
+  }
+}
+
 export async function loader({ request, params }: LoaderFunctionArgs) {
   const { access, app, runtime, name, hookApp } = await context(request, params, 'viewer');
   const view = await runtime.moduleView(hookApp, name);
@@ -208,13 +253,22 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     : null;
 
   const done = new URL(request.url).searchParams.get('done');
+  const sync = view.enabled ? await runtime.sync(hookApp) : null;
+  const hooks = view.enabled ? await runtime.webhooks(hookApp) : null;
   return {
     workspace: { slug: access.workspace.slug, name: access.workspace.name },
     app: { slug: app.slug },
-    /** NSO-342: the app header + tabs (and the "taken down" banner, NSO-293). */
+    /** The app header + tabs (and the "taken down" banner). */
     header: await appHeaderData({ access, app }),
-    module: { name: view.name, version: view.version, useWhen: view.use_when, confirms: view.confirms },
-    /** NSO-347: "About this module" — never a path on disk, never a secret. */
+    module: {
+      name: view.name,
+      version: view.version,
+      useWhen: view.use_when,
+      title: view.title,
+      description: view.description,
+      confirms: view.confirms,
+    },
+    /** "About this module" — never a path on disk, never a secret. */
     about: {
       version: view.version,
       source: view.source,
@@ -228,9 +282,13 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     errors: view.errors,
     /** The workspace Modules page (the same facts for every module of the server). */
     modulesHref: `/workspaces/${encodeURIComponent(access.workspace.slug)}/modules#module-${encodeURIComponent(view.name)}`,
-    /** NSO-346: an opt-in module off for this workspace — the page shows a notice instead of the forms. */
+    /** An opt-in module off for this workspace — the page shows a notice instead of the forms. */
     enabled: view.enabled,
     fields,
+    /** The choices of the fields annotated `x-drobek-choices` (by choiceKey). */
+    choices: view.enabled ? await loadChoices({ runtime, app: hookApp, workspaceSlug: access.workspace.slug, appSlug: app.slug }, choiceRequests(fields)) : {},
+    /** The workspace's values of the limits an empty field stands for (`x-drobek-default-limit`). */
+    limits: view.enabled ? await loadFieldLimits({ runtime, app: hookApp }, defaultLimitNames(fields)) : {},
     values: fieldValues(fields, view.config),
     /** Per field: the module's default or saved for this app, and its value once the pending change is confirmed. */
     states: fieldStates(fields, { stored: view.stored, config: view.config, pendingAfter: view.pending?.after }),
@@ -241,6 +299,11 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     collections: editor?.kind === 'collections' ? collectionsOf(view.config, ops) : [],
     upstreams: editor?.kind === 'upstreams' ? upstreamsOf(view.config, view.info) : [],
     banner: await loadPendingBanner(app, access.workspace.slug, app.slug),
+    /** The scheduled-import module's sources (null on every other module's page). */
+    sync: sync && sync.module === name ? await syncPanel(sync) : null,
+    syncBanner: await loadSyncBanner(hookApp, access.workspace.slug),
+    /** The webhooks module's endpoints and deliveries (null on every other module's page). */
+    webhooks: hooks && hooks.module === name ? await webhooksPanel(hooks, view.secrets) : null,
     canEdit: canPublish(access.effectiveRole),
     done: done && /^[a-z-]{1,32}$/.test(done) ? done : null,
   };
@@ -262,11 +325,11 @@ export async function action({ request, params }: ActionFunctionArgs) {
   const ws = access.workspace.slug;
   const back = (done: string, anchor = '') => redirect(pageUrl(ws, app.slug, name, done, anchor));
 
-  // NSO-293: a taken-down app's module setup cannot change (reject / remove-secret only take away).
+  // A taken-down app's module setup cannot change (reject / remove-secret only take away).
   if (app.lockedReason && intent !== 'reject' && intent !== 'remove-secret') {
     return failure(423, { intent, fields: {}, general: [lockedByAdminError(app.lockedReason).message] });
   }
-  // NSO-346: an opt-in module off for the workspace takes no change (reject / remove-secret only take away).
+  // An opt-in module off for the workspace takes no change (reject / remove-secret only take away).
   if (intent !== 'reject' && intent !== 'remove-secret' && !(await runtime.isEnabled(hookApp.workspaceId, name))) {
     return failure(404, { intent, fields: {}, general: [moduleNotEnabled(name).message] });
   }
@@ -291,6 +354,11 @@ export async function action({ request, params }: ActionFunctionArgs) {
     return secretAction(runtime, { intent, form, name, hookApp, userId: access.user.id, back });
   }
 
+  // ── scheduled imports ──
+  if (intent === 'sync-run' || intent === 'sync-pause' || intent === 'sync-resume') {
+    return syncAction(runtime, { intent, form, name, hookApp: { ...hookApp, workspaceSlug: ws }, userId: access.user.id, back });
+  }
+
   // ── config (through the configure path) ──
   const view = await runtime.moduleView(hookApp, name);
   const config = asObject(view.config);
@@ -308,7 +376,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
         actorUserId: access.user.id,
         surface: 'web',
       });
-      return back(out.unchanged ? 'unchanged' : out.applied ? 'applied' : 'pending', out.applied ? err.anchor : '#pending');
+      return back(out.unchanged ? 'unchanged' : out.applied ? 'applied' : out.merged_with_pending ? 'merged' : 'pending', out.applied ? err.anchor : '#pending');
     } catch (e) {
       if (!isModuleError(e)) throw e;
       const issues = asObject(e.details).issues;
@@ -424,8 +492,8 @@ async function secretAction(
 ) {
   const { intent, form, name, hookApp } = input;
   const secret = String(form.get('secret') ?? '');
-  const declared = runtime.get(name)?.secrets ?? [];
-  if (!declared.some((s) => s.name === secret)) {
+  const view = await runtime.moduleView(hookApp, name);
+  if (!view.secrets.some((s) => s.name === secret)) {
     return failure(400, { intent, target: secret, fields: {}, general: ['This module declares no such secret.'] });
   }
   const audit = (action: string, meta: Record<string, unknown>) =>
@@ -450,7 +518,6 @@ async function secretAction(
   if (value.trim() === '') {
     return failure(400, { intent, target: secret, fields: {}, general: ['Enter the secret value.'] });
   }
-  const view = await runtime.moduleView(hookApp, name);
   const rotated = view.secrets.some((s) => s.name === secret && s.hasSecret);
   try {
     await setModuleSecret({ appId: hookApp.id, module: name, name: secret, value });
@@ -461,4 +528,45 @@ async function secretAction(
   }
   await audit('module.secret_set', { rotated });
   return input.back(rotated ? 'secret-rotated' : 'secret-set', '#secrets');
+}
+
+async function syncAction(
+  runtime: ModuleRuntime,
+  input: {
+    intent: 'sync-run' | 'sync-pause' | 'sync-resume';
+    form: FormData;
+    name: string;
+    hookApp: { id: string; slug: string; workspaceId: string; workspaceSlug: string };
+    userId: string;
+    back: (done: string, anchor?: string) => Response;
+  }
+) {
+  const { intent, form, name, hookApp } = input;
+  const sync = await runtime.sync(hookApp);
+  if (!sync || sync.module !== name) return failure(400, { intent, fields: {}, general: ['This module imports nothing on a schedule.'] });
+  const source = String(form.get('source') ?? '').trim();
+  if (!source) return failure(400, { intent, fields: {}, general: ['Pick a source.'] });
+  const actor = { userId: input.userId, surface: 'web' as const };
+  const sources = asObject(asObject((await runtime.moduleView(hookApp, name)).config).sources);
+  if (!Object.prototype.hasOwnProperty.call(sources, source)) {
+    return failure(404, { intent, fields: {}, general: [`This app has no source "${source}" any more — reload the page.`] });
+  }
+  const setPaused = (paused: true | null) =>
+    runtime.configure({ app: hookApp, module: name, patch: { sources: { [source]: { paused } } }, actorUserId: input.userId, surface: 'web' });
+  try {
+    if (intent === 'sync-run') {
+      const run = await sync.runNow(source, actor);
+      return input.back(run.status === 'ok' ? 'sync-ran' : 'sync-failed', '#sync');
+    }
+    if (intent === 'sync-pause') {
+      await setPaused(true);
+      return input.back('sync-paused', '#sync');
+    }
+    if (asObject(sources[source]).paused === true) await setPaused(null);
+    await sync.resume(source, actor);
+    return input.back('sync-resumed', '#sync');
+  } catch (err) {
+    if (!isModuleError(err)) throw err;
+    return failure(err.status, { intent, target: source, fields: {}, general: [err.message] });
+  }
 }

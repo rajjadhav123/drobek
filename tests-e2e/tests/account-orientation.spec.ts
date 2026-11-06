@@ -3,7 +3,7 @@ import { loginViaEmail, logout, skipUnlessLocal, uniqueEmail } from './helpers/a
 import { publishVersion, seedApp, seedVersion, workspaceIdBySlug } from './helpers/seed';
 
 /**
- * Workspace orientation and the account onboarding (NSO-371 review): two
+ * Workspace orientation and the account onboarding: two
  * workspaces named "Personal" are told apart by slug and owner, the access
  * badge says where access comes from (a membership or the super-admin
  * override), the header's switcher reaches the account and your own
@@ -53,8 +53,7 @@ test('a super-admin in another user’s personal workspace sees slug, owner and 
   await expect(page.getByTestId('my-role')).toHaveText('workspace-admin');
 
   // The all-workspaces list names the owner and the source of access.
-  await page.goto('/workspaces');
-  await page.getByTestId('all-workspaces-filter').fill(janaSlug);
+  await page.goto(`/workspaces?q=${janaSlug}`);
   const row = page.locator(`[data-testid="all-workspace-item"][data-slug="${janaSlug}"]`);
   await expect(row.getByTestId('workspace-owner')).toContainText(jana);
   await expect(row.getByTestId('all-workspace-access')).toHaveText('Superadmin access — not a member');
@@ -65,7 +64,6 @@ test('a super-admin in another user’s personal workspace sees slug, owner and 
   await publishVersion(live.id, (await seedVersion({ appId: live.id })).id);
   await seedApp({ workspaceId: janaWorkspaceId });
   await page.reload();
-  await page.getByTestId('all-workspaces-filter').fill(janaSlug);
   await expect(row.getByTestId('workspace-app-count')).toHaveText('2 apps · 1 published');
 });
 

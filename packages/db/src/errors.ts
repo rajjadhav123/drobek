@@ -1,5 +1,5 @@
 /**
- * Database errors, read the one safe way (NSO-333).
+ * Database errors, read the one safe way.
  *
  * The shape of a failed query depends on the driver and the drizzle version:
  * postgres.js throws a `PostgresError` (`code`, `constraint_name`,
@@ -69,6 +69,21 @@ export function pgErrorCode(err: unknown): string | undefined {
 /** A unique / primary-key violation (SQLSTATE 23505). */
 export function isUniqueViolation(err: unknown): boolean {
   return pgErrorCode(err) === '23505';
+}
+
+/**
+ * A query the database cut off: it ran past `statement_timeout` (57014
+ * query_canceled, also an operator's `pg_cancel_backend`) or waited past
+ * `lock_timeout` for a row, table or advisory lock (55P03 lock_not_available).
+ */
+export function isQueryTimeout(err: unknown): boolean {
+  const code = pgErrorCode(err);
+  return code === '57014' || code === '55P03';
+}
+
+/** A foreign-key violation (SQLSTATE 23503): a row another row still references, or a reference to a missing row. */
+export function isForeignKeyViolation(err: unknown): boolean {
+  return pgErrorCode(err) === '23503';
 }
 
 /** The SQLSTATE (or driver code), constraint and table of a DB error; null when `err` is not one. */

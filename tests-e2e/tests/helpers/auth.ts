@@ -9,7 +9,7 @@ import { Redis } from 'ioredis';
 import { TEST_ENV } from '../../playwright.config';
 
 /**
- * Shared helpers for the auth specs (U2 auth-flow + U3 auth-google) — mailpit
+ * Shared helpers for the auth specs (auth-flow, auth-google) — mailpit
  * polling, unique test addresses, @local gating. Not a spec file: Playwright's
  * testMatch never collects it.
  */
@@ -49,6 +49,13 @@ export async function mailpitMessagesFor(
   );
 }
 
+/** The HTML part of one Mailpit message. */
+export async function mailpitHtml(request: APIRequestContext, id: string): Promise<string> {
+  const res = await request.get(`${MAILPIT_URL}/api/v1/message/${id}`);
+  expect(res.ok(), 'mailpit message must be readable').toBeTruthy();
+  return ((await res.json()) as { HTML?: string }).HTML ?? '';
+}
+
 export async function pollLoginCode(
   request: APIRequestContext,
   email: string,
@@ -83,7 +90,7 @@ const LOCAL_REDIS_HOSTS = ['localhost', '127.0.0.1', 'redis'];
  * Caddy sets X-Real-IP from the TCP peer, so every request of the run comes
  * from ONE real client IP and would trip the low per-IP limits (DCR, forms,
  * abuse reports) mid-suite. On the plain-HTTP dev stack a request without an
- * X-Real-IP has no per-IP bucket at all (NSO-309/NSO-328) — there the resets
+ * X-Real-IP has no per-IP bucket at all — there the resets
  * find nothing to drop. The OTP verify limit needs no reset: the compose files
  * relax OTP_VERIFY_IP_LIMIT.
  */
@@ -102,7 +109,7 @@ export async function resetRateLimitBucket(bucket: string): Promise<void> {
 }
 
 /**
- * /oauth/register allows 10 registrations per IP per hour (PHY-76 #7) and the
+ * /oauth/register allows 10 registrations per IP per hour and the
  * suite registers far more — behind Caddy all from the runner's one IP: drop
  * that bucket before each registration.
  */
@@ -112,7 +119,7 @@ export async function resetDcrIpRateLimit(): Promise<void> {
 
 /**
  * Headers giving a spec a client IP of its own, for a test that counts a
- * per-IP limit up to its 429 (NSO-328). On the plain-HTTP dev stack
+ * per-IP limit up to its 429. On the plain-HTTP dev stack
  * (TRUST_PROXY unset) drobek honours a client-sent X-Real-IP, and a request
  * without one has NO per-IP bucket — the limit would never trip. A random
  * address from the IPv6 documentation prefix is shared with nobody, so no
@@ -122,6 +129,16 @@ export async function resetDcrIpRateLimit(): Promise<void> {
  */
 export function ownClientIpHeaders(): Record<string, string> {
   return { 'X-Real-IP': `2001:db8::${randomInt(1, 0xffff).toString(16)}:${randomInt(1, 0xffff).toString(16)}` };
+}
+
+/**
+ * The dashboard's per-IP OTP send windows (OTP_IP_SHORT_LIMIT /
+ * OTP_IP_DAILY_LIMIT): behind Caddy every sign-in of the run comes from one IP,
+ * and the suite signs in more often than the relaxed daily limit allows.
+ */
+async function resetOtpIpLimits(): Promise<void> {
+  await resetRateLimitBucket('otp-ip-15m');
+  await resetRateLimitBucket('otp-ip-24h');
 }
 
 /**
@@ -138,6 +155,7 @@ export async function loginViaEmail(
   const deadline = Date.now() + 30_000;
   let code: string | null = null;
   while (code === null) {
+    await resetOtpIpLimits();
     await page.goto('/login');
     await page.getByLabel('Email').fill(email);
     await page.getByRole('button', { name: 'Send code' }).click();

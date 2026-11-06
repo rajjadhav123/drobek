@@ -1,5 +1,5 @@
 /**
- * create-drobek-module (NSO-349) — scaffold an external drobek platform
+ * create-drobek-module — scaffold an external drobek platform
  * module from `template/`:
  *
  *   npm create drobek-module@latest erp            → drobek-module-erp/, module "erp"
@@ -23,9 +23,9 @@ export const TEMPLATE_DIR = fileURLToPath(new URL('../template', import.meta.url
 
 /** `defineModule({ name })`: also the URL segment, config key, skill name and table prefix. */
 const MODULE_NAME_RE = /^[a-z][a-z0-9]{1,30}$/;
-const RESERVED = ['sdk', 'v1', 'drobek', 'internal'];
+const RESERVED = ['sdk', 'v1', 'drobek', 'internal', 'errors'];
 /** The modules drobek ships: a new module needs its own name (replacing one is an operator decision, docs/MODULES.md). */
-const BUILT_IN = ['auth', 'email', 'forms', 'data', 'proxy', 'files'];
+const BUILT_IN = ['auth', 'email', 'forms', 'data', 'proxy', 'files', 'sync', 'oidc', 'webhooks'];
 const PACKAGE_RE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 
 export interface ScaffoldTarget {

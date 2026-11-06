@@ -1,5 +1,5 @@
 /**
- * drobek-module-proxy — the BUILT-IN platform module `proxy` (M1-06, §5.6):
+ * drobek-module-proxy — the BUILT-IN platform module `proxy`:
  * an app calls an external API without ever holding its secret.
  *
  *   DROBEK_MODULES=…,proxy  → this package (`modules/proxy` in the drobek repo,
@@ -14,7 +14,8 @@
  * one to the app (the owner confirms it) and names who may call it; the
  * gateway core (SSRF guard, port allow-list 80/443, secret injection) is
  * `@drobek/proxy`. get_app / configure_module show each upstream with
- * `hasSecret`, never the value.
+ * `hasSecret`, never the value. Contract 1.2: the `upstreams` authority lets a
+ * module job (e.g. `sync`) call an assigned upstream the same guarded way.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +30,7 @@ import {
   type ProxyConfig,
 } from './config.js';
 import { proxyAppInfo } from './info.js';
+import { upstreamsAuthority } from './job-fetch.js';
 import { registerRoutes, type ProxyRouteOptions } from './routes.js';
 
 export {
@@ -48,6 +50,7 @@ export {
   type UpstreamAssignment,
 } from './config.js';
 export { proxyAppInfo, type UpstreamInfo } from './info.js';
+export { upstreamsAuthority } from './job-fetch.js';
 export { PROXY_MAX_BODY_BYTES, proxyHandler, registerRoutes, toModuleError, type ProxyRouteOptions } from './routes.js';
 
 const here = (rel: string) => fileURLToPath(new URL(rel, import.meta.url));
@@ -63,7 +66,12 @@ export interface Api {
    * secret; never put a key in the app. Resolves with the standard Response
    * (any status — check res.ok): drobek refusals are JSON { error, message }
    * with 401/403 (rules), 404 (not registered), 405/403 (method/path not
-   * allowed), 429 (rate limited), 502 (upstream unreachable).
+   * allowed), 429 (rate limited, or too many calls in flight), 502
+   * (upstream unreachable, or a redirect drobek does not follow:
+   * upstream_redirect). A redirect within the upstream's origin and allowed
+   * prefixes is followed on the server. A text/event-stream answer of an
+   * upstream with streaming allowed (list_upstreams allow_streaming) streams:
+   * read res.body.getReader(); pass init.signal (AbortController) to stop it.
    */
   fetch(upstream: string, path?: string, init?: RequestInit): Promise<Response>;
 }
@@ -83,13 +91,18 @@ const PROXY_ERRORS: ModuleErrorDoc[] = [
   },
   {
     code: 'upstream_error',
-    meaning: "HTTP 502. The upstream could not be reached, timed out (20 s), answered more than 5 MiB (measured after undoing a gzip / deflate / br encoding) or used an encoding drobek cannot decode.",
-    fix: "Show \"try again later\" in the app; ask for smaller responses (pagination, limits). Never retry in a tight loop.",
+    meaning: "HTTP 502. The upstream could not be reached, sent no answer within 120 s (PROXY_RESPONSE_TIMEOUT_MS), answered more than 5 MiB (measured after undoing a gzip / deflate / br encoding) or used an encoding drobek cannot decode. A streamed (text/event-stream) answer that was cut — 60 s without a chunk from the upstream, more than 5 minutes or 32 MiB — ends with an SSE event `event: error` whose data is { error: \"upstream_error\", message, details: { reason: \"stream_idle\" | \"stream_too_long\" | \"stream_too_large\" } }.",
+    fix: "Show \"try again later\" in the app; ask for smaller responses (pagination, limits) or stream long LLM answers (stream: true, on an upstream a workspace admin allowed streaming for). On the stream's error event, keep what arrived and offer a retry. Never retry in a tight loop.",
+  },
+  {
+    code: 'upstream_redirect',
+    meaning: "HTTP 502. The upstream answered a redirect drobek does not follow: to another host, scheme or port, to a path outside the upstream's base URL or allowed path prefixes, to a method the upstream does not allow, more than 3 hops or a loop. `details.location_path` is the target's path (never its host). A redirect within the upstream's origin and prefixes is followed and never reaches the app.",
+    fix: "Call the final path directly (e.g. with the trailing slash the upstream redirects to). If the path is outside the prefixes, ask the workspace admin to allow that path prefix on the upstream; if the target is another host, the admin registers that host as its own upstream and the app calls it by that name.",
   },
   {
     code: 'proxy_busy',
-    meaning: "HTTP 429 with Retry-After. Too many upstream calls are in flight — from this app (PROXY_MAX_CONCURRENT_PER_APP, default 8) or on the whole server (PROXY_MAX_CONCURRENT, default 32). Nothing was sent to the upstream.",
-    fix: "Retry after `Retry-After` seconds; do not fire many proxy calls in parallel from one page (queue them, or batch in one upstream request).",
+    meaning: "HTTP 429 with Retry-After. Too many upstream calls are in flight — from this visitor (PROXY_MAX_CONCURRENT_PER_CALLER, default 2: a signed-in user, or one IP when anonymous; an open stream counts until it ends), from this app (PROXY_MAX_CONCURRENT_PER_APP, default 8) or on the whole server (PROXY_MAX_CONCURRENT, default 32). Nothing was sent to the upstream.",
+    fix: "Retry after `Retry-After` seconds; do not fire many proxy calls in parallel from one page (queue them, or batch in one upstream request); stop (abort) a stream the user no longer reads before starting the next.",
   },
   {
     code: 'config_error',
@@ -129,6 +142,7 @@ export function createProxyModule(opts: ProxyRouteOptions = {}): DrobekModule<Pr
       },
     ],
     routes: registerRoutes(opts),
+    upstreams: upstreamsAuthority(opts),
     appInfo: proxyAppInfo,
     sdk: { entry: sdkEntry, types: SDK_TYPES },
   });

@@ -104,6 +104,10 @@ describe('drobek-module-forms — shape and config', () => {
     const c = formsConfigSchema.parse({ forms: { contact: { notify: { emails: [' Sales@Example.com '] } } } });
     expect(c.forms.contact).toEqual({ rules: { submit: 'public' }, notify: { emails: ['sales@example.com'], owners: true } });
     expect(formsConfigSchema.safeParse({ forms: { 'Bad Name': {} } }).success).toBe(false);
+    // The dashboard labels an entry's name by the record's key schema.
+    expect(z.toJSONSchema(formsConfigSchema, { io: 'input' })).toMatchObject({ properties: { forms: { propertyNames: { title: 'Form name' } } } });
+    // A new entry's name is suggested from the app's forms (those with submissions).
+    expect(z.toJSONSchema(formsConfigSchema, { io: 'input' })).toMatchObject({ properties: { forms: { propertyNames: { 'x-drobek-choices': 'forms' } } } });
     expect(formsConfigSchema.safeParse({ forms: { contact: { notify: { emails: ['nope'] } } } }).success).toBe(false);
     expect(formsConfigSchema.safeParse({ forms: { contact: { to: 'x@y.cz' } } }).success).toBe(false);
     expect(formsConfigSchema.safeParse({ forms: { contact: { rules: { submit: 'admin' } } } }).success).toBe(false);
@@ -418,7 +422,7 @@ describe('reading submissions (admins only)', () => {
   });
 });
 
-describe("the owner's view (submissions authority, M2-03)", () => {
+describe("the owner's view (submissions authority)", () => {
   const view = (app = appId) => ({
     app: { id: app, slug: 'shop', workspaceId },
     config: formsConfigSchema.parse({ forms: { contact: {}, quiet: {} } }),

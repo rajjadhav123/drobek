@@ -1,5 +1,8 @@
+import { createHash } from 'node:crypto';
 import { expect, test } from '@playwright/test';
+import { Redis } from 'ioredis';
 import {
+  mailpitHtml,
   mailpitMessagesFor,
   pollLoginCode,
   skipUnlessLocal,
@@ -7,12 +10,24 @@ import {
 } from './helpers/auth';
 
 /**
- * U2 acceptance (PHY-53): email magic-code auth end-to-end against the local
- * compose stack — request → mailpit (REST API) → code → session → /me;
- * 5 wrong attempts invalidate the code; the cooldown dedups resends;
- * anonymous /me bounces to /login. (Shared mailpit helpers live in
- * helpers/auth.ts since U3 reuses them.)
+ * E-mail magic-code auth end to end against the local compose stack —
+ * request → mailpit (REST API) → code → session → /me; 5 wrong attempts
+ * invalidate the code; the cooldown dedups resends; anonymous /me bounces to
+ * /login; a full rate-limit counter left without an expiry (a crash between
+ * the count and its expiry) gets its window back on the next attempt instead
+ * of refusing the address for good.
  */
+
+/** Run `fn` against the dev stack's Redis. */
+async function withRedis<T>(fn: (redis: Redis) => Promise<T>): Promise<T> {
+  const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6391', { maxRetriesPerRequest: 2, lazyConnect: true });
+  await redis.connect();
+  try {
+    return await fn(redis);
+  } finally {
+    redis.disconnect();
+  }
+}
 
 function wrongCodeFor(code: string): string {
   return code === '000000' ? '111111' : '000000';
@@ -26,17 +41,23 @@ test('full flow: request code → mailpit → verify → /me shows email → log
   const email = uniqueEmail('flow');
 
   await page.goto('/login');
+  await expect(page.locator('main[data-drobek-page="login"]')).toBeVisible();
   await page.getByLabel('Email').fill(email);
   await page.getByRole('button', { name: 'Send code' }).click();
   await page.waitForURL(/\/login\/verify/);
+  await expect(page.locator('main[data-drobek-page="login-verify"]')).toBeVisible();
 
   const code = await pollLoginCode(request, email);
   expect(code).toMatch(/^\d{6}$/);
+  const [codeMail] = await mailpitMessagesFor(request, email);
+  const codeHtml = await mailpitHtml(request, codeMail.ID);
+  expect(codeHtml, 'the sign-in e-mail has the platform header and footer').toContain('data-drobek-email="header"');
+  expect(codeHtml).toContain('data-drobek-email="footer"');
 
   await page.getByLabel('Code').fill(code);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await page.waitForURL(/\/me$/);
-  await expect(page.getByText(email)).toBeVisible();
+  await expect(page.getByTestId('me-account-email')).toHaveText(email);
   await expect(page.getByTestId('me-start')).toContainText('Start building');
   await expect(page.getByTestId('me-mcp-url')).toHaveText(/^https?:\/\/.+\/mcp$/);
 
@@ -94,6 +115,29 @@ test('immediate resend within the cooldown does not produce a second mailpit mes
   await new Promise((r) => setTimeout(r, 1500));
   const msgs = await mailpitMessagesFor(request, email);
   expect(msgs.length).toBe(1);
+});
+
+test('a full per-address counter without an expiry gets its hour back on the next attempt @local', async ({ request }) => {
+  skipUnlessLocal();
+  const email = uniqueEmail('stuck');
+  const key = `drobek:rl:otp-email-1h:${createHash('sha256').update(email.toLowerCase()).digest('hex')}`;
+  await withRedis((r) => r.set(key, '1000000'));
+  try {
+    expect(await withRedis((r) => r.pttl(key))).toBe(-1);
+
+    // Over the hourly share: the generic redirect, nothing sent…
+    const res = await request.post('/login', { form: { email } });
+    expect(res.url()).toContain('/login/verify');
+
+    // …and the counter now ends with its hour instead of never.
+    const ttl = await withRedis((r) => r.pttl(key));
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(60 * 60_000);
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(await mailpitMessagesFor(request, email)).toEqual([]);
+  } finally {
+    await withRedis((r) => r.del(key));
+  }
 });
 
 test('anonymous /me redirects to /login @local', async ({ page }) => {

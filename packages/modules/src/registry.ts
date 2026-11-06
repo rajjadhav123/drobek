@@ -1,12 +1,12 @@
 /**
- * Loading the active modules (M1-01): `DROBEK_MODULES` is a comma-separated
+ * Loading the active modules: `DROBEK_MODULES` is a comma-separated
  * list the operator sets. Each entry resolves to a package:
  *
  *   - a short name `x` → the npm package `drobek-module-x`;
  *   - a full package name (`drobek-module-x`, `@scope/pkg`, anything with a
  *     `/`) → exactly that package.
  *
- * Each entry is looked up in two places, in this order (NSO-345):
+ * Each entry is looked up in two places, in this order:
  *
  *   1. `DROBEK_MODULES_DIR` (default `/data/modules`): a module the operator
  *      installed into `<dir>/<name>/node_modules/<package>` — checked against
@@ -30,51 +30,64 @@
  *
  * Anything off — unknown package, not a module, invalid name/schema/defaults,
  * a `contract` range this server does not satisfy, two modules with one name,
- * a missing sdk.entry, a module whose `requires` is not active, a clashing
+ * a missing sdk.entry, a module whose `requires` is not active (or is
+ * opt-in while the module itself is not, or forms a cycle), a clashing
  * limit or error code, a contribution to an unknown slot or one that fails
  * the slot's schema, a slot host's `compose` that throws or returns an
- * invalid config, an invalid `DROBEK_MODULE_<NAME>_DEFAULTS` — stops the
- * server at start with a message that names the module. Nothing is skipped
- * silently.
+ * invalid config, an invalid `DROBEK_MODULE_<NAME>_DEFAULTS`, a job without
+ * a valid name, interval or `run`, a module without a skill that reaches apps
+ * (appSurfaceOf, or a contribution to a slot that is not `operatorOnly`) —
+ * stops the server at start with a message that names the module. Nothing is
+ * skipped silently.
  */
 import { createRequire } from 'node:module';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import semver from 'semver';
+import { z } from 'zod';
 import { createConsoleLogger, type Logger } from '@drobek/core';
 import {
+  JOB_MAX_INTERVAL_MS,
+  JOB_MIN_INTERVAL_MS,
+  JOB_NAME_RE,
   MODULE_CONTRACT_VERSION,
   MODULE_ERROR_CODE_RE,
   MODULE_NAME_RE,
   SLOT_NAME_RE,
   isDefinedModule,
+  parseJobInterval,
   type AnyModule,
+  type DrobekModule,
+  type ModuleSlot,
 } from './contract.js';
 import { checkDirModule, findDirModule, modulesDirState, packageEntryFile, verifyDirModule, type ModulesDirState } from './dir-modules.js';
-import { CORE_ERROR_CODES, issuePaths } from './errors.js';
+import { CORE_SLOTS } from './error-reporter-slot.js';
+import { CORE_ERROR_CODES, ModuleLoadError, issuePaths } from './errors.js';
 import { CORE_LIMITS } from './limits.js';
 import { mergePatch } from './merge-patch.js';
 import { registerHostPeers } from './peers.js';
 import { SECRET_NAME_RE } from './secrets.server.js';
 import { toPath } from './sdk-build.js';
 
-/** Names a module may not take (they are path segments of `/__drobek/…`). */
-export const RESERVED_MODULE_NAMES = new Set(['sdk', 'v1', 'drobek', 'internal']);
+/** Names a module may not take (path segments of `/__drobek/…`, and `errors`, the prefix of a slot core hosts). */
+export const RESERVED_MODULE_NAMES = new Set(['sdk', 'v1', 'drobek', 'internal', 'errors']);
 
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const ENV_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
 const CORE_CODES = new Set(CORE_ERROR_CODES);
 const AVAILABILITY = new Set<string>(['default', 'opt-in']);
 const DASHBOARD_EDITORS = new Set<string>(['collections', 'upstreams']);
+const DASHBOARD_TITLE_MAX = 60;
+const DASHBOARD_DESCRIPTION_MAX = 200;
 const HOOKS = ['onAppCreate', 'onPublish', 'onAppDelete'] as const;
+const OWNER_AUTHORITIES = ['endUsers', 'mail', 'records', 'submissions', 'files', 'upstreams', 'sync', 'webhooks'] as const;
+const CONFIG_HOOKS = ['salvageConfig', 'confirmRequired', 'onConfirmed'] as const;
 const DEFAULTS_ENV_RE = /^DROBEK_MODULE_([A-Z0-9]+)_DEFAULTS$/;
 
-export class ModuleLoadError extends Error {
-  constructor(message: string) {
-    super(`drobek refuses to start: ${message}`);
-    this.name = 'ModuleLoadError';
-  }
+/** A non-empty, trimmed string of at most `max` characters without a line break or control character. */
+function oneLine(value: unknown, max: number): boolean {
+  return typeof value === 'string' && value.length > 0 && value.length <= max && value.trim() === value && !/[\u0000-\u001f\u007f\u2028\u2029]/.test(value);
 }
 
 /** `DROBEK_MODULES` → trimmed, de-duplicated entries (order kept). */
@@ -218,8 +231,10 @@ export function validateModule(m: AnyModule): void {
       );
     }
   }
-  if (!m.skill || typeof m.skill.useWhen !== 'string' || !m.skill.useWhen.trim()) fail('skill.useWhen is required');
-  if (typeof m.skill.markdown !== 'string' || !m.skill.markdown.trim()) fail('skill.markdown is required');
+  if (isAppFacing(m)) {
+    if (!isPlainObject(m.skill) || typeof m.skill.useWhen !== 'string' || !m.skill.useWhen.trim()) fail('skill.useWhen is required');
+    if (typeof m.skill.markdown !== 'string' || !m.skill.markdown.trim()) fail('skill.markdown is required');
+  }
   if (!m.configSchema || typeof (m.configSchema as { safeParse?: unknown }).safeParse !== 'function') {
     fail('configSchema must be a zod schema');
   }
@@ -228,6 +243,7 @@ export function validateModule(m: AnyModule): void {
   for (const s of m.secrets ?? []) {
     if (!SECRET_NAME_RE.test(s.name)) fail(`secret name "${s.name}" must be UPPER_SNAKE`);
   }
+  if (m.secretsFor !== undefined && typeof m.secretsFor !== 'function') fail('secretsFor must be a function of the app config');
   for (const l of m.limits ?? []) {
     if (!ENV_NAME_RE.test(l.env)) fail(`limit "${l.env}" must be an UPPER_SNAKE env name`);
     if (!Number.isInteger(l.default) || l.default <= 0) fail(`limit "${l.env}" needs a positive integer default`);
@@ -255,7 +271,7 @@ export function validateModule(m: AnyModule): void {
     for (const fn of ['collections', 'query', 'get', 'remove', 'csv'] as const) {
       if (typeof m.records?.[fn] !== 'function') fail(`records.${fn} must be a function`);
     }
-    for (const fn of ['update', 'importCsv', 'dropCollection'] as const) {
+    for (const fn of ['update', 'importCsv', 'dropCollection', 'importRecords'] as const) {
       if (m.records?.[fn] !== undefined && typeof m.records[fn] !== 'function') fail(`records.${fn} must be a function`);
     }
   }
@@ -272,6 +288,12 @@ export function validateModule(m: AnyModule): void {
   if (m.files !== undefined) {
     for (const fn of ['list', 'open', 'remove'] as const) {
       if (typeof m.files?.[fn] !== 'function') fail(`files.${fn} must be a function`);
+    }
+  }
+  if (m.upstreams !== undefined && typeof m.upstreams?.fetch !== 'function') fail('upstreams.fetch must be a function');
+  if (m.sync !== undefined) {
+    for (const fn of ['sources', 'runs', 'runNow', 'resume'] as const) {
+      if (typeof m.sync?.[fn] !== 'function') fail(`sync.${fn} must be a function`);
     }
   }
   if (m.requires !== undefined) {
@@ -305,6 +327,7 @@ export function validateModule(m: AnyModule): void {
       if (typeof (slot?.schema as { safeParse?: unknown } | undefined)?.safeParse !== 'function') fail(`slot "${name}": schema must be a zod schema`);
       if (slot.unique !== undefined && (typeof slot.unique !== 'string' || !slot.unique)) fail(`slot "${name}": unique must name a key of the contribution`);
       if (typeof slot.description !== 'string' || !slot.description.trim()) fail(`slot "${name}" needs a description`);
+      if (slot.operatorOnly !== undefined && typeof slot.operatorOnly !== 'boolean') fail(`slot "${name}": operatorOnly must be true or false`);
     }
   }
   if (m.compose !== undefined) {
@@ -318,10 +341,108 @@ export function validateModule(m: AnyModule): void {
     }
   }
   if (m.availability !== undefined && !AVAILABILITY.has(m.availability)) fail(`availability must be 'default' or 'opt-in'`);
+  if (m.jobs !== undefined) validateJobs(m.jobs, fail);
   if (m.dashboard !== undefined) {
     if (!isPlainObject(m.dashboard)) fail('dashboard must be an object');
-    const editor: unknown = (m.dashboard as { editor?: unknown }).editor;
+    const { editor, title, description } = m.dashboard as { editor?: unknown; title?: unknown; description?: unknown };
     if (editor !== undefined && !DASHBOARD_EDITORS.has(String(editor))) fail(`dashboard.editor must be one of ${[...DASHBOARD_EDITORS].join(', ')}`);
+    if (title !== undefined && !oneLine(title, DASHBOARD_TITLE_MAX)) fail(`dashboard.title must be one line of 1–${DASHBOARD_TITLE_MAX} characters`);
+    if (description !== undefined && !oneLine(description, DASHBOARD_DESCRIPTION_MAX)) {
+      fail(`dashboard.description must be one line of 1–${DASHBOARD_DESCRIPTION_MAX} characters`);
+    }
+  }
+  if (!isAppFacing(m)) {
+    const surface = appSurfaceOf(m);
+    if (surface.length > 0) {
+      fail(
+        `skill is required: the module reaches apps through ${surface.join(', ')} — add skill: { useWhen, markdown } (what skill_info serves agents). Only an operator-only module (contributions to operator slots such as errors.reporter or email.transport, server jobs, hooks, limits, migrations) goes without one`
+      );
+    }
+  }
+}
+
+/** A module with a skill: what agents (skill_info, the briefing) and app owners (the app's Modules tab, configure_module) see. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type AppFacingModule = DrobekModule<any>;
+
+/** Does `m` declare a skill? Without one it is operator-only — validateModule allows that only for a module without an app surface. */
+export function isAppFacing(m: AnyModule): m is AppFacingModule {
+  return m.skill !== undefined && m.skill !== null;
+}
+
+/** Does `schema` describe nothing but an empty object (`z.object({})`)? */
+function isEmptyConfigSchema(schema: unknown): boolean {
+  let json: Record<string, unknown>;
+  try {
+    json = z.toJSONSchema(schema as z.ZodType, { unrepresentable: 'any' }) as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  const properties = json.properties;
+  return (
+    json.type === 'object' &&
+    (properties === undefined || (isPlainObject(properties) && Object.keys(properties).length === 0)) &&
+    json.additionalProperties === false &&
+    json.patternProperties === undefined &&
+    json.propertyNames === undefined
+  );
+}
+
+/**
+ * The parts of `m` that reach apps, their agents or their owners (field
+ * names; [] when none) — each one needs a skill: routes, an SDK, an app
+ * config (a configSchema with any field, salvageConfig, confirmRequired,
+ * onConfirmed), per-app secrets, rules, its own error codes, an owner
+ * authority, appInfo, opt-in availability, a dashboard editor, a
+ * `scope: 'app'` job, a slot that is not `operatorOnly`, compose. Name,
+ * version, contract, limits, migrations, hooks, requires, server jobs,
+ * dashboard.title/description and operator slots do not. Contributions are
+ * checked against their slots in collectContributions.
+ */
+export function appSurfaceOf(m: AnyModule): string[] {
+  const out: string[] = [];
+  if (m.routes !== undefined) out.push('routes');
+  if (m.sdk !== undefined) out.push('sdk');
+  if (!isEmptyConfigSchema(m.configSchema)) out.push('configSchema (an app config)');
+  for (const k of CONFIG_HOOKS) if (m[k] !== undefined) out.push(k);
+  if ((m.secrets ?? []).length > 0) out.push('secrets');
+  if (m.secretsFor !== undefined) out.push('secretsFor');
+  if (m.rules !== undefined) out.push('rules');
+  if ((m.errors ?? []).length > 0) out.push('errors');
+  for (const k of OWNER_AUTHORITIES) if (m[k] !== undefined) out.push(k);
+  if (m.appInfo !== undefined) out.push('appInfo');
+  if (m.availability === 'opt-in') out.push("availability 'opt-in'");
+  if (m.dashboard?.editor !== undefined) out.push('dashboard.editor');
+  if ((m.jobs ?? []).some((j) => j.scope === 'app')) out.push("a scope: 'app' job");
+  for (const [name, slot] of Object.entries(m.slots ?? {})) {
+    if (slot.operatorOnly !== true) out.push(`the slot "${name}"`);
+  }
+  if (m.compose !== undefined) out.push('compose');
+  return out;
+}
+
+/** The rules of `jobs` (contract 1.2): unique names, a scope, a fixed interval in range or (per-app) a function, a `run`. */
+function validateJobs(jobs: unknown, fail: (msg: string) => never): void {
+  if (!Array.isArray(jobs)) fail('jobs must be an array of { name, every, run }');
+  const seen = new Set<string>();
+  const range = `between ${JOB_MIN_INTERVAL_MS / 60_000} minute and ${JOB_MAX_INTERVAL_MS / 86_400_000} days`;
+  for (const j of jobs as Record<string, unknown>[]) {
+    if (!isPlainObject(j)) fail('every job must be an object { name, every, run }');
+    const name = j.name;
+    if (typeof name !== 'string' || !JOB_NAME_RE.test(name)) fail(`job name ${JSON.stringify(name)} must match ${JOB_NAME_RE}`);
+    const who = `job "${String(name)}"`;
+    if (seen.has(String(name))) fail(`${who} is declared twice`);
+    seen.add(String(name));
+    if (j.scope !== undefined && j.scope !== 'server' && j.scope !== 'app') fail(`${who}: scope must be 'server' or 'app'`);
+    if (typeof j.run !== 'function') fail(`${who}: run must be a function`);
+    if (j.description !== undefined && (typeof j.description !== 'string' || !j.description.trim())) fail(`${who}: description must be a non-empty string`);
+    if (typeof j.every === 'function') {
+      if (j.scope !== 'app') fail(`${who}: only a scope: 'app' job may read its interval from the app's config (every as a function)`);
+      continue;
+    }
+    const ms = parseJobInterval(j.every);
+    if (ms === null) fail(`${who}: every must be milliseconds or a count with a unit ('30s', '5m', '1h', '1d'), got ${JSON.stringify(j.every)}`);
+    if (ms! < JOB_MIN_INTERVAL_MS || ms! > JOB_MAX_INTERVAL_MS) fail(`${who}: every must be ${range}, got ${JSON.stringify(j.every)}`);
   }
 }
 
@@ -339,16 +460,21 @@ export interface SlotContribution {
 /**
  * Every `contributes` of the active modules, checked against the slots they
  * target and grouped by slot (each list in module order; every declared slot
- * present, [] without contributions). Refuses the start on a contribution to
- * a slot no active module declares, one that fails the slot's schema, and two
+ * and every slot core hosts present, [] without contributions). Refuses the
+ * start on a contribution to a slot neither core nor an active module
+ * declares, one that fails the slot's schema, and two
  * contributions with the same value of the slot's `unique` key.
  */
 export function collectContributions(modules: AnyModule[]): Map<string, SlotContribution[]> {
-  const hosts = new Map<string, AnyModule>();
+  const hosts = new Map<string, { name: string | null; slot: ModuleSlot }>();
   const out = new Map<string, SlotContribution[]>();
+  for (const [name, slot] of Object.entries(CORE_SLOTS)) {
+    hosts.set(name, { name: null, slot });
+    out.set(name, []);
+  }
   for (const m of modules) {
-    for (const name of Object.keys(m.slots ?? {})) {
-      hosts.set(name, m);
+    for (const [name, slot] of Object.entries(m.slots ?? {})) {
+      hosts.set(name, { name: m.name, slot });
       out.set(name, []);
     }
   }
@@ -363,12 +489,18 @@ export function collectContributions(modules: AnyModule[]): Map<string, SlotCont
           : `the module "${owner}" is not in DROBEK_MODULES`;
         throw new ModuleLoadError(`module "${c.name}" contributes to the slot "${name}", but ${why}`);
       }
-      const slot = host.slots![name];
+      const slot = host.slot;
+      const where = host.name === null ? 'hosted by core' : `module "${host.name}"`;
+      if (!isAppFacing(c) && slot.operatorOnly !== true) {
+        throw new ModuleLoadError(
+          `module "${c.name}" has no skill, but contributes to the slot "${name}" (${where}), which reaches apps — add skill: { useWhen, markdown }; only contributions to operator slots (errors.reporter, email.transport) go without one`
+        );
+      }
       const r = slot.schema.safeParse(value);
       if (!r.success) {
         const issues = issuePaths(r.error.issues).map((i) => `${i.path}: ${i.message}`).join('; ');
         throw new ModuleLoadError(
-          `module "${c.name}": its contribution to the slot "${name}" (module "${host.name}") does not pass the slot's schema — ${issues}`
+          `module "${c.name}": its contribution to the slot "${name}" (${where}) does not pass the slot's schema — ${issues}`
         );
       }
       if (slot.unique !== undefined) {
@@ -495,6 +627,9 @@ export function checkModuleSet(modules: AnyModule[], env: NodeJS.ProcessEnv = pr
   recordsAuthorityOf(modules);
   submissionsAuthorityOf(modules);
   filesAuthorityOf(modules);
+  upstreamsAuthorityOf(modules);
+  syncAuthorityOf(modules);
+  webhooksAuthorityOf(modules);
   checkRequires(modules);
   const limitNames = new Map<string, string>();
   for (const m of modules) {
@@ -566,9 +701,42 @@ export function filesAuthorityOf(modules: AnyModule[]): AnyModule | null {
   return owners[0] ?? null;
 }
 
-/** Every module's `requires` must be active too (a clear start error names what to add). */
+/** The one active module that owns the app's upstream calls (`upstreams`), or null (two refuse the start). */
+export function upstreamsAuthorityOf(modules: AnyModule[]): AnyModule | null {
+  const owners = modules.filter((m) => m.upstreams !== undefined);
+  if (owners.length > 1) {
+    throw new ModuleLoadError(`only one module may own upstream calls (upstreams); active: ${owners.map((m) => m.name).join(', ')}`);
+  }
+  return owners[0] ?? null;
+}
+
+/** The one active module that imports data on a schedule (`sync`), or null (two refuse the start). */
+export function syncAuthorityOf(modules: AnyModule[]): AnyModule | null {
+  const owners = modules.filter((m) => m.sync !== undefined);
+  if (owners.length > 1) {
+    throw new ModuleLoadError(`only one module may run scheduled imports (sync); active: ${owners.map((m) => m.name).join(', ')}`);
+  }
+  return owners[0] ?? null;
+}
+
+/** The one active module that receives webhooks (`webhooks`), or null (two refuse the start). */
+export function webhooksAuthorityOf(modules: AnyModule[]): AnyModule | null {
+  const owners = modules.filter((m) => m.webhooks !== undefined);
+  if (owners.length > 1) {
+    throw new ModuleLoadError(`only one module may receive webhooks (webhooks); active: ${owners.map((m) => m.name).join(', ')}`);
+  }
+  return owners[0] ?? null;
+}
+
+/**
+ * Every module's `requires` must be active too (a clear start error names
+ * what to add). A default module may not require an opt-in one (it is on in
+ * every workspace, its dependency is not), and `requires` may not form a
+ * cycle (no module of it could be switched on first in a workspace).
+ */
 export function checkRequires(modules: AnyModule[]): void {
   const active = new Set(modules.map((m) => m.name));
+  const byName = new Map(modules.map((m) => [m.name, m]));
   for (const m of modules) {
     const missing = (m.requires ?? []).filter((r) => !active.has(r));
     if (missing.length > 0) {
@@ -576,7 +744,24 @@ export function checkRequires(modules: AnyModule[]): void {
         `module "${m.name}" requires the module${missing.length > 1 ? 's' : ''} ${missing.map((x) => `"${x}"`).join(', ')}: add ${missing.length > 1 ? 'them' : 'it'} to DROBEK_MODULES (e.g. DROBEK_MODULES=${[...active, ...missing].join(',')})`
       );
     }
+    if (m.availability !== 'opt-in') {
+      const optIn = (m.requires ?? []).filter((r) => byName.get(r)?.availability === 'opt-in');
+      if (optIn.length > 0) {
+        throw new ModuleLoadError(
+          `module "${m.name}" is on in every workspace but requires the opt-in module${optIn.length > 1 ? 's' : ''} ${optIn.map((x) => `"${x}"`).join(', ')}: declare "${m.name}" availability: 'opt-in' too, or drop the requirement`
+        );
+      }
+    }
   }
+  const done = new Set<string>();
+  const visit = (name: string, path: string[]): void => {
+    if (done.has(name)) return;
+    const at = path.indexOf(name);
+    if (at >= 0) throw new ModuleLoadError(`the modules' requires form a cycle: ${[...path.slice(at), name].join(' → ')}`);
+    for (const r of byName.get(name)?.requires ?? []) visit(r, [...path, name]);
+    done.add(name);
+  };
+  for (const m of modules) visit(m.name, []);
 }
 
 /**
@@ -632,6 +817,12 @@ export async function loadModuleSet(env: NodeJS.ProcessEnv = process.env, opts: 
     if (m.contract === undefined) {
       const range = `^${semver.major(MODULE_CONTRACT_VERSION)}.${semver.minor(MODULE_CONTRACT_VERSION)}`;
       log.warn(`module "${m.name}" declares no contract range — add contract: '${range}' to its defineModule()`, {
+        module: m.name,
+        contract: MODULE_CONTRACT_VERSION,
+      });
+    }
+    if ((m.jobs?.length ?? 0) > 0 && typeof m.contract === 'string' && semver.intersects(m.contract, '<1.2.0')) {
+      log.warn(`module "${m.name}" declares jobs, which need module contract 1.2, but its contract range ${m.contract} also admits older servers that ignore them — declare contract: '^1.2'`, {
         module: m.name,
         contract: MODULE_CONTRACT_VERSION,
       });

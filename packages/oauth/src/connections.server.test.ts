@@ -4,6 +4,7 @@ import { oauthAccessTokens, oauthAuthorizationCodes, oauthRefreshTokens, users }
 import { createClient } from './clients.server.js';
 import { issueAuthCode } from './codes.server.js';
 import { listConnections, revokeConnection } from './connections.server.js';
+import { REFRESH_RETRY_GRACE_MS } from './constants.js';
 import { createDbOAuthStore, type OAuthStore } from './store.server.js';
 import { issueAccessAndRefresh, rotateRefreshToken, validateAccessToken } from './tokens.server.js';
 import { freshDb, type TestDb } from './test/db.js';
@@ -28,7 +29,7 @@ async function user(email: string): Promise<string> {
   return u.id;
 }
 
-describe('OAuth connections (M2-04)', () => {
+describe('OAuth connections', () => {
   it('lists the clients holding a live grant for the user, with name, source, scope and last use', async () => {
     const alice = await user('alice-conn@example.test');
     const bob = await user('bob-conn@example.test');
@@ -162,7 +163,7 @@ describe('OAuth connections (M2-04)', () => {
     );
     const rot = await rotateRefreshToken(first.refreshToken, store);
     expect(rot.ok).toBe(true);
-    const reuse = await rotateRefreshToken(first.refreshToken, store);
+    const reuse = await rotateRefreshToken(first.refreshToken, store, Date.now() + REFRESH_RETRY_GRACE_MS + 1);
     expect(reuse).toMatchObject({ ok: false, error: 'invalid_grant', reuse: true });
     const successor = (rot as { refreshToken: string }).refreshToken;
     expect(await rotateRefreshToken(successor, store)).toMatchObject({ ok: false });

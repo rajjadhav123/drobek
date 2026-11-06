@@ -1,12 +1,13 @@
 /**
  * Abuse reports, takedown / restore and the publish heuristic against a real
- * (PGlite) database with the core migrations applied (NSO-293).
+ * (PGlite) database with the core migrations applied.
  */
-import { eq } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { abuseReports, apps, auditLog, domains, users, workspaces } from '@drobek/db';
 import {
   AppsError,
+  abuseReportsRetentionDays,
   appLockState,
   createAbuseReport,
   createApp,
@@ -15,6 +16,7 @@ import {
   listAbuseReports,
   listLockedApps,
   onLocalAppChanged,
+  pruneResolvedAbuseReports,
   publish,
   resolveAbuseReport,
   restore,
@@ -27,6 +29,7 @@ import {
 import { freshDb, type TestDb } from './test/db.js';
 
 const HOSTS = { appsDomain: 'apps.example', dashboardHost: 'drobek.example' };
+const DAY = 86_400_000;
 
 let db: TestDb;
 let close: () => Promise<void>;
@@ -127,17 +130,17 @@ describe('abuse reports', () => {
 
     const orphan = await createAbuseReport({ host: 'gone.apps.example', reason: 'spam' }, { hosts: HOSTS });
     expect(orphan.app).toBeNull();
-    const open = await listAbuseReports();
+    const { reports: open } = await listAbuseReports();
     expect(open.map((x) => x.id)).toEqual(expect.arrayContaining([r.id, orphan.id]));
     expect(open.find((x) => x.id === r.id)?.app?.workspaceSlug).toBe('owner');
 
     expect(await resolveAbuseReport(orphan.id, adminId)).toBe(true);
     expect(await resolveAbuseReport(orphan.id, adminId)).toBe(false);
-    const resolved = await listAbuseReports({ status: 'resolved' });
+    const { reports: resolved } = await listAbuseReports({ status: 'resolved' });
     expect(resolved.find((x) => x.id === orphan.id)?.resolvedByEmail).toBe('root@example.test');
   });
 
-  it('a VERIFIED custom domain resolves to its app (M3-01); an unverified claim does not', async () => {
+  it('a VERIFIED custom domain resolves to its app; an unverified claim does not', async () => {
     const a = await appWithVersion('custom-reported', CALC_INDEX);
     const b = await appWithVersion('custom-squatter', CALC_INDEX);
     await db.insert(domains).values([
@@ -151,6 +154,77 @@ describe('abuse reports', () => {
     expect(r.app?.id).toBe(a.id);
     const [row] = await db.select().from(abuseReports).where(eq(abuseReports.id, r.id));
     expect(row).toMatchObject({ appId: a.id, host: 'shop.firma.cz' });
+  });
+
+  it('ABUSE_REPORTS_RETENTION_DAYS: a positive number of days, else 365', () => {
+    expect(abuseReportsRetentionDays({})).toBe(365);
+    expect(abuseReportsRetentionDays({ ABUSE_REPORTS_RETENTION_DAYS: ' 90 ' })).toBe(90);
+    expect(abuseReportsRetentionDays({ ABUSE_REPORTS_RETENTION_DAYS: '1.5' })).toBe(1);
+    for (const bad of ['', '0', '-5', '0.5', 'year']) {
+      expect(abuseReportsRetentionDays({ ABUSE_REPORTS_RETENTION_DAYS: bad })).toBe(365);
+    }
+  });
+
+  it('the retention prune deletes reports resolved longer ago than the retention; open ones stay', async () => {
+    const now = new Date();
+    const ago = (days: number) => new Date(now.getTime() - days * DAY);
+    const rows = await db
+      .insert(abuseReports)
+      .values([
+        { host: 'old-resolved.apps.example', reason: 'spam', status: 'resolved', createdAt: ago(100), resolvedAt: ago(40) },
+        { host: 'recent-resolved.apps.example', reason: 'spam', status: 'resolved', createdAt: ago(100), resolvedAt: ago(20) },
+        { host: 'old-open.apps.example', reason: 'spam', status: 'open', createdAt: ago(400) },
+      ])
+      .returning({ id: abuseReports.id });
+    const hostsLeft = async () =>
+      (await db.select({ host: abuseReports.host }).from(abuseReports).where(inArray(abuseReports.id, rows.map((r) => r.id))))
+        .map((r) => r.host)
+        .sort();
+
+    expect(await pruneResolvedAbuseReports({ now, env: { ABUSE_REPORTS_RETENTION_DAYS: '30' } })).toEqual({ deleted: 1 });
+    expect(await hostsLeft()).toEqual(['old-open.apps.example', 'recent-resolved.apps.example']);
+
+    // The default keeps a resolved report for a year.
+    expect(await pruneResolvedAbuseReports({ now: new Date(now.getTime() + 340 * DAY), env: {} })).toEqual({ deleted: 0 });
+    expect(await pruneResolvedAbuseReports({ now: new Date(now.getTime() + 350 * DAY), env: {} })).toEqual({ deleted: 1 });
+    expect(await hostsLeft()).toEqual(['old-open.apps.example']);
+  });
+});
+
+describe('the queue list: search, filter, sort and pages', () => {
+  it('searches host, app slug, reporter, reason and details; filters by app; sorts; pages with the counts', async () => {
+    const a = await appWithVersion('qlist-shop', CALC_INDEX);
+    const at = (n: number) => new Date(Date.UTC(2026, 0, n));
+    await db.insert(abuseReports).values([
+      { host: 'qlist-shop.apps.example', appId: a.id, reason: 'phishing', details: 'asks for a PIN', reporterEmail: 'ann@qlist.test', createdAt: at(1) },
+      { host: 'qlist-zz.apps.example', reason: 'spam', details: 'qlist ads 100%', createdAt: at(2) },
+      { host: 'qlist-aa.apps.example', reason: 'malware', details: '', reporterEmail: 'bob@qlist.test', createdAt: at(3) },
+      { host: 'qlist-done.apps.example', reason: 'spam', status: 'resolved', resolvedAt: at(5), resolvedBy: adminId, createdAt: at(4) },
+    ]);
+    const hosts = async (opts: Parameters<typeof listAbuseReports>[0]) => (await listAbuseReports(opts)).reports.map((r) => r.host);
+
+    const all = await listAbuseReports({ q: 'qlist' });
+    expect(all.matching).toBe(3);
+    expect(all.total).toBeGreaterThanOrEqual(3);
+    expect(all.reports.map((r) => r.host)).toEqual(['qlist-aa.apps.example', 'qlist-zz.apps.example', 'qlist-shop.apps.example']);
+    expect(await hosts({ q: 'QLIST-SHOP' })).toEqual(['qlist-shop.apps.example']);
+    expect(await hosts({ q: 'bob@qlist' })).toEqual(['qlist-aa.apps.example']);
+    expect(await hosts({ q: 'PIN' })).toEqual(['qlist-shop.apps.example']);
+    expect(await hosts({ q: 'malware' })).toEqual(['qlist-aa.apps.example']);
+    expect(await hosts({ q: '100%' })).toEqual(['qlist-zz.apps.example']);
+    expect(await hosts({ q: 'qlist', app: 'present' })).toEqual(['qlist-shop.apps.example']);
+    expect(await hosts({ q: 'qlist', app: 'unknown-host' })).toEqual(['qlist-aa.apps.example', 'qlist-zz.apps.example']);
+    expect(await hosts({ q: 'qlist', sort: 'oldest' })).toEqual(['qlist-shop.apps.example', 'qlist-zz.apps.example', 'qlist-aa.apps.example']);
+    expect(await hosts({ q: 'qlist', sort: 'host' })).toEqual(['qlist-aa.apps.example', 'qlist-shop.apps.example', 'qlist-zz.apps.example']);
+
+    const page2 = await listAbuseReports({ q: 'qlist', sort: 'oldest', pageSize: 2, page: 2 });
+    expect(page2.reports.map((r) => r.host)).toEqual(['qlist-aa.apps.example']);
+    expect(page2.matching).toBe(3);
+
+    const resolved = await listAbuseReports({ status: 'resolved', q: 'qlist' });
+    expect(resolved.reports).toHaveLength(1);
+    expect(resolved.reports[0]).toMatchObject({ host: 'qlist-done.apps.example', resolvedByEmail: 'root@example.test', app: null });
+    expect(resolved.matching).toBe(1);
   });
 });
 

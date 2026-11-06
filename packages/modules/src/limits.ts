@@ -1,5 +1,5 @@
 /**
- * Limits per workspace (§5.7) — `ctx.limits()` for module handlers.
+ * Limits per workspace — `ctx.limits()` for module handlers.
  *
  * Default: every limit is its env var (`FORMS_PER_APP_PER_DAY=…`) or the
  * default the declaring module ships. A SaaS operator plugs plans in with
@@ -12,20 +12,34 @@
  * and expects `{ "limits": { "<ENV_NAME>": <positive integer>, … } }`. Known
  * names override the env defaults; unknown names and bad values are ignored.
  * The catalogue is CORE_LIMITS (enforced by core: apps per workspace, custom
- * domains per app, asset size and quota per app) plus every active module's `limits`. A limit marked
+ * domains per app, asset size and quota per app, proxy upstreams per workspace,
+ * new versions per app and per person per hour, the versions an app keeps and
+ * the bytes a workspace's versions store) plus every active module's `limits`. A limit marked
  * `allowZero` (DOMAINS_MAX_PER_APP) also takes 0 = the feature is off.
- * NSO-346: every `availability: 'opt-in'` module adds the pseudo-limit
+ * Every `availability: 'opt-in'` module adds the pseudo-limit
  * `MODULE_ENABLED_<NAME>` (0/1, env default 0): a plan answering 1 enables the
  * module for the workspace, 0 disables it even where a super-admin enabled
  * it (`fromPlan` tells an explicit plan value from the env default).
  * Answers are cached in Redis for 60 s (`drobek:limits:<workspace_id>`). When
  * the provider is down, slow (> 2 s) or answers garbage, the env defaults
  * apply and a warning is logged — a provider outage never takes apps down.
+ * `settled` answers null instead, for a job that deletes by a limit (the
+ * history retention) and must not act on the fallback.
  */
 import { createHmac } from 'node:crypto';
-import { DEFAULT_APPS_MAX_PER_WORKSPACE, DEFAULT_APP_ASSETS_QUOTA, DEFAULT_APP_ASSET_MAX_BYTES } from '@drobek/apps';
+import {
+  DEFAULT_APPS_MAX_PER_WORKSPACE,
+  DEFAULT_APP_ASSETS_QUOTA,
+  DEFAULT_APP_ASSET_MAX_BYTES,
+  DEFAULT_APP_VERSIONS_KEEP,
+  DEFAULT_APP_VERSIONS_KEPT_MAX,
+  DEFAULT_VERSIONS_PER_APP_HOUR,
+  DEFAULT_VERSIONS_PER_USER_HOUR,
+  DEFAULT_WORKSPACE_SOURCE_QUOTA,
+} from '@drobek/apps';
 import type { Logger } from '@drobek/core';
 import { dbErrorForLog } from '@drobek/db';
+import { DEFAULT_UPSTREAMS_MAX_PER_WORKSPACE } from '@drobek/proxy';
 import type { Limits, ModuleLimit } from './contract.js';
 
 export const LIMITS_CACHE_TTL_SEC = 60;
@@ -43,12 +57,12 @@ export const LIMITS_TIMESTAMP_HEADER = 'X-Drobek-Timestamp';
  */
 export type CatalogueLimit = ModuleLimit & { allowZero?: boolean; max?: number };
 
-/** NSO-346: the pseudo-limit that enables an opt-in module for a workspace. */
+/** The pseudo-limit that enables an opt-in module for a workspace. */
 export function moduleEnabledLimitName(module: string): string {
   return `MODULE_ENABLED_${module.toUpperCase()}`;
 }
 
-/** NSO-346: the catalogue entry of an opt-in module's `MODULE_ENABLED_<NAME>`. */
+/** The catalogue entry of an opt-in module's `MODULE_ENABLED_<NAME>`. */
 export function moduleEnabledLimit(module: string): CatalogueLimit {
   return {
     env: moduleEnabledLimitName(module),
@@ -60,7 +74,7 @@ export function moduleEnabledLimit(module: string): CatalogueLimit {
 }
 
 /**
- * The limits core enforces itself (NSO-329) — same env / provider mechanics
+ * The limits core enforces itself — same env / provider mechanics
  * as module limits, so a plan can set them per workspace. The SaaS limits
  * provider mirrors this list (docs/MODULES.md "Limits"). DOMAINS_MAX_PER_APP's
  * default must equal @drobek/domains DEFAULT_DOMAINS_MAX_PER_APP (guarded by
@@ -79,6 +93,11 @@ export const CORE_LIMITS: readonly CatalogueLimit[] = Object.freeze([
     allowZero: true,
   },
   {
+    env: 'UPSTREAMS_MAX_PER_WORKSPACE',
+    default: DEFAULT_UPSTREAMS_MAX_PER_WORKSPACE,
+    meaning: 'Proxy upstreams one workspace may hold; register_upstream and the Upstreams page beyond it answer limit_exceeded.',
+  },
+  {
     env: 'APP_ASSET_MAX_BYTES',
     default: DEFAULT_APP_ASSET_MAX_BYTES,
     meaning: 'Bytes of one app asset (video, audio, image, font served at /<path>); a bigger upload answers asset_too_large.',
@@ -88,6 +107,31 @@ export const CORE_LIMITS: readonly CatalogueLimit[] = Object.freeze([
     default: DEFAULT_APP_ASSETS_QUOTA,
     meaning: 'Bytes of all assets of one app; an upload past it answers asset_quota_exceeded.',
   },
+  {
+    env: 'VERSIONS_PER_APP_HOUR',
+    default: DEFAULT_VERSIONS_PER_APP_HOUR,
+    meaning: 'New versions of one app within the last hour (write_files, create_app, restores, gallery copies); past it rate_limited with retry_after_seconds.',
+  },
+  {
+    env: 'VERSIONS_PER_USER_HOUR',
+    default: DEFAULT_VERSIONS_PER_USER_HOUR,
+    meaning: 'New versions one person makes within the last hour, in every app and workspace; past it rate_limited with retry_after_seconds.',
+  },
+  {
+    env: 'APP_VERSIONS_KEEP',
+    default: DEFAULT_APP_VERSIONS_KEEP,
+    meaning: 'The newest versions of each app the hourly history retention keeps; older ones are deleted, except the published one, the one the preview serves, the kept ones, those kept for a rollback and the last hour\'s.',
+  },
+  {
+    env: 'APP_VERSIONS_KEPT_MAX',
+    default: DEFAULT_APP_VERSIONS_KEPT_MAX,
+    meaning: 'Versions of one app its members may keep (the retention and a clean-up leave them alone); keeping one more answers limit_exceeded. A lower value leaves the versions already kept alone.',
+  },
+  {
+    env: 'WORKSPACE_SOURCE_QUOTA',
+    default: DEFAULT_WORKSPACE_SOURCE_QUOTA,
+    meaning: 'Bytes of the unique files (sources and build output) the versions of a workspace\'s live apps may store; a version past it answers limit_exceeded and nothing is stored.',
+  },
 ]);
 
 export interface LimitsProvider {
@@ -95,11 +139,17 @@ export interface LimitsProvider {
   /** The env-level values (no workspace): what skill_info documents. */
   defaults(): Limits;
   /**
-   * NSO-346: only the values the limits provider's plan sets for the workspace
+   * Only the values the limits provider's plan sets for the workspace
    * (validated, known names only) — null without a provider, or while it is
    * unavailable. Tells an explicit plan value from the env default.
    */
   fromPlan?(workspaceId: string): Promise<Limits | null>;
+  /**
+   * The effective limits, or null while a configured provider does not
+   * answer (failure, backoff) — never the env fallback. Without a provider:
+   * the env values.
+   */
+  settled?(workspaceId: string): Promise<Limits | null>;
 }
 
 type RedisLike = {
@@ -241,6 +291,11 @@ export function createLimitsProvider(opts: LimitsProviderOptions): LimitsProvide
     async fromPlan(workspaceId) {
       const remote = await remoteFor(workspaceId);
       return remote ? Object.freeze(planValues(remote)) : null;
+    },
+    async settled(workspaceId) {
+      if (!base) return defaults;
+      const remote = await remoteFor(workspaceId);
+      return remote ? merge(remote) : null;
     },
   };
 }

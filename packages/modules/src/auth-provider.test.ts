@@ -1,5 +1,5 @@
 /**
- * The sign-in provider contract (NSO-348): the `auth.provider` /
+ * The sign-in provider contract: the `auth.provider` /
  * `auth.signedIn` slot schemas, `compose` (a slot host deriving its config,
  * confirm rules and secrets from contributions) and the method a session
  * signed in with.
@@ -10,10 +10,12 @@ import { z } from 'zod';
 import { authIdentitySchema, authProviderSchema, authSignedInObserverSchema, defineAuthProvider } from './auth-provider.js';
 import { defineModule } from './contract.js';
 import { createEndUserSession, loadEndUserSession, parseEndUserSession } from './principal.js';
-import { ModuleLoadError, checkModuleSet, composeModule, validateModule } from './registry.js';
+import { checkModuleSet, composeModule, validateModule } from './registry.js';
+import { ModuleLoadError } from './errors.js';
 import { createModuleTestContext } from './testing.js';
 
 const provider = defineAuthProvider({
+  apiVersion: 2,
   id: 'oidc',
   label: 'Company SSO',
   configSchema: z.strictObject({ issuer: z.url(), clientId: z.string() }),
@@ -51,6 +53,9 @@ describe('authProviderSchema', () => {
     [{ secrets: [{ name: 'OIDC_X', description: 'x' }, { name: 'OIDC_X', description: 'y' }] }, /declared twice/],
     [{ configDefaults: { issuer: 'not a url' } }, /configDefaults/],
     [{ begin: 'nope' }, /begin must be a function/],
+    [{ apiVersion: undefined }, /missing — the provider was written for auth provider API 1, whose identities may lack `issuer`; this server requires API 2: .*declare `apiVersion: 2`/],
+    [{ apiVersion: 1 }, /1 is not an auth provider API this server implements \(2\)/],
+    [{ apiVersion: '2' }, /"2" is not an auth provider API/],
   ])('refuses %j', (patch, message) => {
     expect(issuesOf({ ...provider, ...patch }).join(' | ')).toMatch(message);
   });
@@ -65,7 +70,7 @@ describe('authProviderSchema', () => {
     expect(authIdentitySchema.safeParse({ issuer: iss, subject: 'x'.repeat(256), email: 'a@b.cz', emailVerified: true }).success).toBe(false);
     expect(authIdentitySchema.safeParse({ issuer: iss, subject: 's', email: 'a@b.cz', emailVerified: 'yes' }).success).toBe(false);
     expect(authIdentitySchema.safeParse({ issuer: iss, subject: 's', email: 'nope', emailVerified: true }).success).toBe(false);
-    // the issuer is part of the identity (NSO-360): required, one trimmed line
+    // the issuer is part of the identity: required, one trimmed line
     for (const issuer of [undefined, '', ' https://idp.example', 'https://a\nb', 'x'.repeat(2049)]) {
       expect(authIdentitySchema.safeParse({ issuer, subject: 's', email: 'a@b.cz', emailVerified: true }).success, String(issuer)).toBe(false);
     }

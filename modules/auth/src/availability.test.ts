@@ -1,5 +1,5 @@
 /**
- * NSO-360 (review R3): an opt-in sign-in provider module follows the
+ * An opt-in sign-in provider module follows the
  * workspace switch through the REAL module runtime — provider discovery,
  * begin, the dashboard-host callback, complete, the `auth.signedIn` observer
  * and the sessions it made. Two workspaces, the provider module enabled for
@@ -55,6 +55,7 @@ const calls: string[] = [];
 const events: AuthSignInEvent[] = [];
 
 const provider = defineAuthProvider({
+  apiVersion: 2,
   id: 'ssotest',
   label: 'Firm SSO',
   configSchema: z.strictObject({ issuer: z.url() }),
@@ -133,7 +134,7 @@ async function begin(app: PlatformApp) {
   const res = await call(app, 'POST', '/begin', { body: { provider: 'ssotest', return_to: '/' } });
   if (res.status !== 200) return { res, state: '', flow: '' };
   const state = new URL((res.json as { url: string }).url).searchParams.get('state')!;
-  return { res, state, flow: res.headers['Set-Cookie'].split(';')[0] };
+  return { res, state, flow: [res.headers['Set-Cookie']].flat()[0].split(';')[0] };
 }
 
 function callback(state: string): Promise<EndUserCallbackResult> {
@@ -149,7 +150,7 @@ async function signIn(app: PlatformApp): Promise<string> {
   const b = await begin(app);
   const done = await call(app, 'GET', '/complete', { query: `code=${codeOf(await callback(b.state))}`, cookie: b.flow });
   expect(done.status, done.text).toBe(302);
-  return done.headers['Set-Cookie'].split(';')[0];
+  return [done.headers['Set-Cookie']].flat()[0].split(';')[0];
 }
 
 beforeAll(async () => {
@@ -203,7 +204,7 @@ beforeEach(async () => {
   for (const [k, v] of Object.entries(ENV)) vi.stubEnv(k, v);
 });
 
-describe('an opt-in sign-in provider follows the workspace switch (NSO-360)', () => {
+describe('an opt-in sign-in provider follows the workspace switch', () => {
   it('provider discovery: listed for the enabled workspace only', async () => {
     expect((await call(appA, 'GET', '/providers')).json).toEqual({ providers: [{ id: 'emailCode', label: 'E-mail code' }, { id: 'ssotest', label: 'Firm SSO' }] });
     expect((await call(appB, 'GET', '/providers')).json).toEqual({ providers: [{ id: 'emailCode', label: 'E-mail code' }] });

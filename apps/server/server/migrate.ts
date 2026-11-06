@@ -1,6 +1,6 @@
 /**
  * `node dist/server/migrate.js` — apply every pending migration and exit
- * (M4-03, the upgrade step of docs/SELF-HOSTING.md):
+ * (the upgrade step of docs/SELF-HOSTING.md):
  *
  *   docker compose … run --rm --no-deps drobek node dist/server/migrate.js
  *
@@ -9,16 +9,20 @@
  * (`__drizzle_migrations_mod_<name>`) — without listening. Running it twice is
  * the upgrade's idempotency proof: drizzle records every applied migration in
  * its journal inside the migration transaction, so the second run finds
- * nothing to apply. The config checks of the server entry run first, so an
- * image that would refuse to start never touches the database.
+ * nothing to apply. The config checks of the server entry run first, and so
+ * does its check of the stored secrets' keys (a secret that neither
+ * DROBEK_MASTER_KEY nor DROBEK_MASTER_KEY_PREVIOUS opens stops a production
+ * start), so an image that would refuse to start never touches the database.
+ * Like the server, it holds the migration lock and refuses a database that is
+ * ahead of this image.
  */
 import { docsUrlConfigError } from '@drobek/agent-dx';
 import { appsOriginConfigError, publishApprovalConfigError } from '@drobek/apps';
 import { trustProxyConfigError } from '@drobek/auth';
-import { createConsoleLogger, secretsConfigError } from '@drobek/core';
-import { dbErrorForLog, runCoreMigrations } from '@drobek/db';
+import { createConsoleLogger, reportError, secretsConfigError } from '@drobek/core';
+import { dbConfigError, dbErrorForLog, runCoreMigrations } from '@drobek/db';
 import { domainsConfigError } from '@drobek/domains';
-import { limitsProviderConfigError, loadModuleRuntime } from '@drobek/modules';
+import { limitsProviderConfigError, loadModuleRuntime, previousMasterKeyConfigError, storedSecretKeysCheck } from '@drobek/modules';
 import { frameSrcConfigError, galleryFrameAncestorsConfigError, tlsAskConfigError } from '@drobek/serving';
 import postgres from 'postgres';
 
@@ -26,6 +30,7 @@ const log = createConsoleLogger('migrate');
 
 const configError =
   secretsConfigError(process.env) ??
+  previousMasterKeyConfigError(process.env) ??
   appsOriginConfigError(process.env) ??
   trustProxyConfigError(process.env) ??
   tlsAskConfigError(process.env) ??
@@ -34,7 +39,8 @@ const configError =
   frameSrcConfigError(process.env) ??
   galleryFrameAncestorsConfigError(process.env) ??
   publishApprovalConfigError(process.env) ??
-  docsUrlConfigError(process.env);
+  docsUrlConfigError(process.env) ??
+  dbConfigError(process.env);
 if (configError) {
   console.error(configError);
   process.exit(1);
@@ -61,8 +67,15 @@ async function journalCounts(): Promise<Record<string, number>> {
 
 try {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
+  // A database without the secret tables (a first start) has nothing to check.
+  const secretKeys = await storedSecretKeysCheck(process.env).catch(() => null);
+  if (secretKeys?.level === 'fatal') {
+    console.error(secretKeys.message);
+    process.exit(1);
+  }
+  if (secretKeys?.level === 'warn') log.warn(secretKeys.message);
   const before = await journalCounts();
-  await runCoreMigrations();
+  await runCoreMigrations({ log });
   // Loads DROBEK_MODULES exactly like the server and applies their migrations
   // (a module that cannot be loaded fails here, before the upgrade goes on).
   await loadModuleRuntime({ env: { ...process.env, DROBEK_MIGRATE_ON_START: '1' }, log: createConsoleLogger('modules') });
@@ -77,5 +90,6 @@ try {
   process.exit(0);
 } catch (err) {
   console.error('migrate: failed —', dbErrorForLog(err));
+  await reportError({ level: 'fatal', message: 'the migrations failed', error: err, context: { kind: 'startup' } });
   process.exit(1);
 }

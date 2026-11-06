@@ -1,5 +1,5 @@
 /**
- * Abuse and moderation vocabulary (M4-02, NSO-293). Pure — no I/O — so the
+ * Abuse and moderation vocabulary. Pure — no I/O — so the
  * dashboard form, the queue, @drobek/serving's 451 page and the MCP refusal
  * all speak the same categories.
  *
@@ -53,6 +53,19 @@ export function lockedMessage(lockedReason: string | null | undefined): string {
 
 /** Max characters of a report's free-text details. */
 export const REPORT_DETAILS_MAX = 2000;
+
+export const DEFAULT_ABUSE_REPORTS_RETENTION_DAYS = 365;
+
+/**
+ * ABUSE_REPORTS_RETENTION_DAYS: how many days a resolved report stays after
+ * it was resolved (the production default when unset or not a positive number).
+ */
+export function abuseReportsRetentionDays(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = (env.ABUSE_REPORTS_RETENTION_DAYS ?? '').trim();
+  if (!raw) return DEFAULT_ABUSE_REPORTS_RETENTION_DAYS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_ABUSE_REPORTS_RETENTION_DAYS;
+}
 
 /** The path of the well-known report pointer on every app host. */
 export const REPORT_WELL_KNOWN_PATH = '/.well-known/drobek-report';

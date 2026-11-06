@@ -6,7 +6,7 @@ import { callTool, mcpClient, type McpClient } from './helpers/mcp';
 import { withDb } from './helpers/seed';
 
 /**
- * M1-01 (NSO-287): platform modules end to end against the stack running the
+ * Platform modules end to end against the stack running the
  * example module `hello` (DROBEK_MODULES=hello, loaded from the EXTERNAL
  * package drobek-module-hello; HELLO_WAVES_PER_MINUTE=5 in both composes).
  *
@@ -98,7 +98,7 @@ async function auditRows(slug: string): Promise<{ action: string; actor_kind: st
 
 test.describe.configure({ mode: 'serial' });
 
-test.describe('platform modules — the hello example (M1-01) @local', () => {
+test.describe('platform modules — the hello example @local', () => {
   let mcp: McpClient;
   let app: Created & { sdkUrl: string };
   /** The owner's signed-in dashboard session (captured once: re-signing in the same e-mail races the OTP mail). */
@@ -187,7 +187,7 @@ test.describe('platform modules — the hello example (M1-01) @local', () => {
     const wrong = await hostRequest(host, '/__drobek/v1/hello/wave');
     expect(wrong.status).toBe(405);
     expect(wrong.headers.allow).toBe('POST');
-    // The slot hello.greeter (NSO-344): no module contributes a greeter on the dev stack.
+    // The slot hello.greeter: no module contributes a greeter on the dev stack.
     const greet = await hostRequest(host, '/__drobek/v1/hello/greet?name=Ada');
     expect(JSON.parse(greet.body)).toEqual({ text: 'Hello, Ada', greeter: null });
     const robot = await hostRequest(host, '/__drobek/v1/hello/greet?name=Ada&greeter=robot');
@@ -196,11 +196,11 @@ test.describe('platform modules — the hello example (M1-01) @local', () => {
 
     const nope = await hostRequest(host, '/__drobek/v1/nope');
     expect(nope.status).toBe(404);
-    expect(JSON.parse(nope.body)).toMatchObject({ error: 'not_found', details: { available: ['hello', 'auth', 'email', 'forms', 'data', 'proxy', 'files'] } });
+    expect(JSON.parse(nope.body)).toMatchObject({ error: 'not_found', details: { available: ['hello', 'auth', 'email', 'forms', 'data', 'proxy', 'files', 'sync', 'oidc', 'webhooks', 'acmecrm'] } });
 
     // HELLO_WAVES_PER_MINUTE=5 per visitor IP (behind Caddy the browser test
     // already waved once from the same IP). A client IP of its own: on the
-    // dev stack a request without one has no per-IP bucket (NSO-328).
+    // dev stack a request without one has no per-IP bucket.
     const ipHeaders = ownClientIpHeaders();
     const statuses: number[] = [];
     let limited: Awaited<ReturnType<typeof hostRequest>> | null = null;
@@ -324,10 +324,11 @@ test.describe('platform modules — the hello example (M1-01) @local', () => {
     skipUnlessLocal();
     const list = await callTool(mcp.client, 'skill_info', {});
     expect(list.isError).toBe(false);
-    const skills = list.json.skills as { name: string; use_when: string }[];
+    const skills = list.json.skills as { name: string; use_when: string; availability?: string }[];
     expect(skills.map((s) => s.name)).toContain('hello');
     expect(skills.map((s) => s.name)).not.toContain('drobek');
-    expect(app.skills).toEqual(skills);
+    // create_app leaves out the opt-in modules not enabled for the workspace (acmecrm).
+    expect(app.skills).toEqual(skills.filter((s) => s.availability !== 'opt-in'));
 
     const one = await callTool(mcp.client, 'skill_info', { name: 'hello' });
     expect(one.json).toMatchObject({
@@ -337,7 +338,7 @@ test.describe('platform modules — the hello example (M1-01) @local', () => {
       config: { defaults: { greeting: 'Hello', excited: false } },
       limits: [{ name: 'HELLO_WAVES_PER_MINUTE', value: 5 }],
       secrets: [{ name: 'HELLO_SIGNATURE', required: false }],
-      // Module contract 1.1 (NSO-344): the module's own error codes + its availability.
+      // Module contract 1.1: the module's own error codes + its availability.
       errors: [{ code: 'unknown_greeter' }],
       availability: 'default',
     });
@@ -354,7 +355,7 @@ test.describe('platform modules — the hello example (M1-01) @local', () => {
     });
     const err = (fb.json.compile as { errors: { code: string; hint?: string }[] }).errors[0];
     expect(err.code).toBe('unresolved_import');
-    // The data module is active (M1-03) → the hint names its skill.
+    // The data module is active → the hint names its skill.
     expect(err.hint).toBe("skill_info('data')");
   });
 
@@ -370,14 +371,19 @@ test.describe('platform modules — the hello example (M1-01) @local', () => {
         [appId, MARKER, 'AAAAAAAAAAAAAAAA', 'AAAAAAAAAAAAAAAAAAAAAA==', MARKER]
       )
     );
-    const info = await callTool(mcp.client, 'skill_info', { name: 'hello' });
-    const got = await callTool(mcp.client, 'get_app', { app_id: appId });
-    for (const r of [info, got]) {
-      expect(r.text).not.toContain(MARKER);
-      expect(JSON.stringify(r.json)).not.toContain(MARKER);
+    try {
+      const info = await callTool(mcp.client, 'skill_info', { name: 'hello' });
+      const got = await callTool(mcp.client, 'get_app', { app_id: appId });
+      for (const r of [info, got]) {
+        expect(r.text).not.toContain(MARKER);
+        expect(JSON.stringify(r.json)).not.toContain(MARKER);
+      }
+      expect((got.json.modules as Record<string, { secrets: unknown }>).hello.secrets).toEqual([
+        { name: 'HELLO_SIGNATURE', hasSecret: true },
+      ]);
+    } finally {
+      // The row is under no real key: left behind, it would stop a production start.
+      await withDb((c) => c.query(`DELETE FROM module_secrets WHERE app_id = $1`, [appId]));
     }
-    expect((got.json.modules as Record<string, { secrets: unknown }>).hello.secrets).toEqual([
-      { name: 'HELLO_SIGNATURE', hasSecret: true },
-    ]);
   });
 });

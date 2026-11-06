@@ -1,16 +1,17 @@
 /**
- * get_logs storage (NSO-327): `get_logs('requests')` flushes its whole window
+ * get_logs storage: `get_logs('requests')` flushes its whole window
  * (up to 31 days) in ONE Redis round trip and one statement per table, reads
- * never delete, and the periodic prune keeps every table inside its
+ * never delete, a flush never lowers a stored day, and the periodic prune keeps every table inside its
  * retention for every app. PGlite + a pipelined in-memory Redis.
  */
 import type { PGlite } from '@electric-sql/pglite';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { appCompiles, appDailyStats, appErrors, apps, moduleRequestStats, workspaces } from '@drobek/db';
+import { appCompiles, appDailyStats, appErrors, apps, appVersionLoads, moduleRequestStats, workspaces } from '@drobek/db';
 import { eq } from 'drizzle-orm';
 import { LOGS_RETENTION_DAYS } from './limits.js';
 import { queryRequestLog, type RequestLogPipeline, type RequestLogRedis } from './logs.server.js';
 import { DEFAULT_LOGS_PRUNE_INTERVAL_MS, logsPruneIntervalFromEnv, pruneLogs, startLogsPrune } from './prune.server.js';
+import { upsertDailyStats } from './signals.server.js';
 import { freshDb, type TestDb } from './test/db.js';
 
 const DAY_MS = 86_400_000;
@@ -36,7 +37,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const t of [appErrors, appCompiles, appDailyStats, moduleRequestStats]) await db.delete(t);
+  for (const t of [appErrors, appCompiles, appDailyStats, moduleRequestStats, appVersionLoads]) await db.delete(t);
 });
 
 afterEach(() => {
@@ -96,7 +97,7 @@ describe("get_logs('requests') flush", () => {
     const entries = await queryRequestLog(appA, null, { now: NOW, redis: () => redis });
 
     expect(stats.execs).toBe(1);
-    // Per day: req, 5xx, 404 paths, module counters + the 4xx / 5xx failing paths (NSO-380).
+    // Per day: req, 5xx, 404 paths, module counters + the 4xx / 5xx failing paths.
     expect(stats.commands).toBe((LOGS_RETENTION_DAYS + 1) * 6);
     // Two upserts (app_daily_stats, module_request_stats) + the two reads — no per-day statement, no delete.
     expect(sqlCalls.count()).toBe(4);
@@ -128,6 +129,32 @@ describe("get_logs('requests') flush", () => {
     expect(again[0]).toMatchObject({ day: today, requests: 7, modules: { data: { '2xx': 50 } } });
     // The 60-day-old row is outside the window but still stored: only the prune deletes.
     expect(await db.select().from(appDailyStats).where(eq(appDailyStats.day, dayOf(60)))).toHaveLength(1);
+  });
+
+  it('never lowers a stored day: counters that restarted after a Redis flush keep the larger values', async () => {
+    const today = dayOf(0);
+    await upsertDailyStats([
+      { appId: appA, day: today, requestCount: 120, count5xx: 4, path404Counts: { '/gone': 9, '/old': 2, __other__: 5 } },
+      { appId: appB, day: today, requestCount: 3, count5xx: 0, path404Counts: {} },
+    ]);
+    // Redis lost its counters: the next flush brings smaller totals and a new path.
+    await upsertDailyStats([
+      { appId: appA, day: today, requestCount: 7, count5xx: 1, path404Counts: { '/gone': 1, '/new': 3 } },
+      { appId: appB, day: today, requestCount: 8, count5xx: 2, path404Counts: { '/x': 1 } },
+    ]);
+    const row = async (appId: string) =>
+      (await db.select().from(appDailyStats).where(eq(appDailyStats.appId, appId)))[0];
+    expect(await row(appA)).toMatchObject({
+      requestCount: 120,
+      count5xx: 4,
+      path404Counts: { '/gone': 9, '/old': 2, '/new': 3, __other__: 5 },
+    });
+    // Larger totals still win.
+    expect(await row(appB)).toMatchObject({ requestCount: 8, count5xx: 2, path404Counts: { '/x': 1 } });
+
+    const { redis } = pipelineRedis(new Map([[`drobek:signals:req:${appA}:${today}`, '9']]), new Map());
+    const entries = await queryRequestLog(appA, null, { now: NOW, redis: () => redis });
+    expect(entries[0]).toMatchObject({ day: today, requests: 120, count_5xx: 4, count_404: 19 });
   });
 
   it('a Redis failure skips the flush and still answers from Postgres', async () => {
@@ -169,8 +196,14 @@ describe('the periodic logs prune', () => {
       { appId: appB, module: 'data', statusClass: '2xx', day: dayOf(3), count: 1 },
     ]);
 
+    // Page loads of a version nobody opened for over 30 days go; a version loaded yesterday stays.
+    await db.insert(appVersionLoads).values([
+      { appId: appA, versionNumber: 1, pageLoads: 4, updatedAt: at(31) },
+      { appId: appA, versionNumber: 2, pageLoads: 9, updatedAt: at(1) },
+    ]);
+
     const result = await pruneLogs({ now: NOW, env: {} });
-    expect(result).toEqual({ errors: 3 + 10, compiles: 2, dailyStats: 2, moduleStats: 1 });
+    expect(result).toEqual({ errors: 3 + 10, compiles: 2, dailyStats: 2, moduleStats: 1, pageLoads: 1 });
 
     const errorsA = await db.select().from(appErrors).where(eq(appErrors.appId, appA));
     expect(errorsA).toHaveLength(500);
@@ -181,8 +214,9 @@ describe('the periodic logs prune', () => {
     expect((await db.select().from(appCompiles)).map((c) => c.appId)).toEqual([appA]);
     expect((await db.select().from(appDailyStats)).map((d) => d.day)).toEqual([dayOf(30)]);
     expect((await db.select().from(moduleRequestStats)).map((m) => m.day)).toEqual([dayOf(3)]);
+    expect((await db.select().from(appVersionLoads)).map((l) => [l.versionNumber, l.pageLoads])).toEqual([[2, 9]]);
     // A second pass has nothing left to do.
-    expect(await pruneLogs({ now: NOW, env: {} })).toEqual({ errors: 0, compiles: 0, dailyStats: 0, moduleStats: 0 });
+    expect(await pruneLogs({ now: NOW, env: {} })).toEqual({ errors: 0, compiles: 0, dailyStats: 0, moduleStats: 0, pageLoads: 0 });
   });
 
   it('honours BEACON_RETENTION_DAYS / BEACON_MAX_EVENTS_PER_APP for the error buffer', async () => {

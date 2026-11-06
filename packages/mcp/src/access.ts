@@ -1,5 +1,5 @@
 /**
- * Per-call authorization (NSO-282 model, M0-05 tools): a grant names a USER;
+ * Per-call authorization: a grant names a USER;
  * every call resolves that user's role in the TARGET app's workspace:
  *   - unknown app, soft-deleted app, unknown workspace, non-member → the SAME
  *     `not_found` (anti-enumeration);
@@ -51,7 +51,7 @@ export async function authorizeWorkspace(
   principal: ToolPrincipal,
   workspaceSlug: string,
   min: WorkspaceRole
-): Promise<{ id: string; slug: string; role: WorkspaceRole }> {
+): Promise<{ id: string; slug: string; kind: 'personal' | 'team'; role: WorkspaceRole }> {
   const access = await resolveWorkspaceAccess({
     userId: principal.userId,
     superAdmin: principal.superAdmin,
@@ -59,5 +59,5 @@ export async function authorizeWorkspace(
   });
   if (!access) throw notFound('workspace');
   checkFloor(access.effectiveRole, min);
-  return { id: access.workspace.id, slug: access.workspace.slug, role: access.effectiveRole };
+  return { id: access.workspace.id, slug: access.workspace.slug, kind: access.workspace.kind, role: access.effectiveRole };
 }

@@ -1,23 +1,30 @@
 #!/usr/bin/env bash
-# Self-host rehearsal (M4-03) — the docs/SELF-HOSTING.md quickstart and the
+# Self-host rehearsal — the docs/SELF-HOSTING.md quickstart and the
 # backup → restore round trip, end to end, on throwaway stacks. `task
-# selfhost:rehearsal`; NOT part of `task check` or CI (it builds the image and
-# runs two full stacks). Every step is what an operator types:
+# selfhost:rehearsal`; NOT part of `task check` (it builds the image and runs
+# two full stacks). CI runs it on release tags only, against the pushed image
+# (selfhost-rehearsal.yml). Every step is what an operator types:
 #
 #   machine A (a fresh copy of the self-host files, like a clean clone)
 #     1. task selfhost:init (tls internal, localhost, SMTP → a throwaway Mailpit)
 #        + a second run proving it is idempotent; docker compose config: no warnings
-#     2. docker compose … up -d --wait → /healthz + /api/version through Caddy
+#     2. docker compose … up -d --wait → /healthz + /api/version through Caddy;
+#        every container log rotates (json-file, max-size 20m, max-file 5)
 #     3. a dashboard user via the e-mail code flow (POST /login → Mailpit →
 #        POST /login/verify → GET /me)
 #     4. a drk_ API key with the container CLI → MCP: create_app → write_files
 #        → publish → the production host serves it; an end user uploads a file
 #    4b. task selfhost:module:add -- <a packed module (the guestbook fixture)>
 #        → task selfhost:module:list → DROBEK_MODULES → drobek restarts and
-#        /api/version lists it with source "dir" (NSO-350)
-#     5. task backup → docker compose down -v (every volume gone)
+#        /api/version lists it with source "dir"
+#     5. task backup without room (BACKUP_MIN_FREE_MB) is refused and writes
+#        and deletes nothing; task backup BACKUP_KEEP=2 next to three older
+#        archives keeps the newest two and a file of another name →
+#        docker compose down -v (every volume gone)
 #   machine B (another fresh copy + A's .env.production, nothing else)
-#     6. task selfhost:init (renders the Caddyfile, keeps every secret)
+#     6. task backup:verify of the copied archive (no stack running) passes, a
+#        damaged copy fails; task selfhost:init (renders the Caddyfile, keeps
+#        every secret)
 #     7. task restore BACKUP=… → the app serves on its host, the file downloads,
 #        the same API key works, Caddy's restored local CA still validates, the
 #        server starts with the same modules.lock.json and loads the module
@@ -39,7 +46,17 @@ cd "$ROOT"
 for tool in docker task node npm curl openssl; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool is required for the rehearsal"
 done
-[ -d "$ROOT/tests-e2e/node_modules/@modelcontextprotocol/sdk" ] || die "run pnpm install first (tests-e2e needs @modelcontextprotocol/sdk)"
+[ -d "$ROOT/tests-e2e/node_modules/@modelcontextprotocol/client" ] || die "run pnpm install first (tests-e2e needs @modelcontextprotocol/client)"
+
+# `task` exports the checkout's dev .env (Taskfile dotenv); the machines of
+# the rehearsal are configured by their own .env.production only.
+if [ -f "$ROOT/.env" ]; then
+  while IFS='=' read -r key _; do
+    case "$key" in
+      [A-Za-z_]*) [ -z "${key//[A-Za-z0-9_]/}" ] && unset "$key" ;;
+    esac
+  done < "$ROOT/.env"
+fi
 
 RID="${REHEARSAL_ID:-$(openssl rand -hex 3)}"
 PROJECT_A="selfhost-$RID-a"
@@ -128,7 +145,7 @@ for s in POSTGRES_PASSWORD DROBEK_MASTER_KEY TLS_ASK_TOKEN; do
   v="$(ENV_FILE="$A/.env.production" env_get "$s")"
   [ "${#v}" = 64 ] || die "$s was not generated (64 hex chars)"
 done
-[ "$(stat -f %Lp "$A/.env.production" 2>/dev/null || stat -c %a "$A/.env.production")" = 600 ] || die ".env.production is not mode 600"
+[ "$(stat -c %a "$A/.env.production" 2>/dev/null || stat -f %Lp "$A/.env.production")" = 600 ] || die ".env.production is not mode 600"
 ok "three secrets generated (64 hex chars), .env.production mode 600"
 before_env="$(sha256_of "$A/.env.production")"
 before_caddy="$(sha256_of "$A/deployments/Caddyfile")"
@@ -159,6 +176,13 @@ version="$(curl -sf --cacert "$CA" "$BASE/api/version")"
 case "$version" in *'"version":'*) ok "/api/version → $version" ;; *) die "/api/version: $version" ;; esac
 [ "$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CA" "$BASE/api/internal/tls/ask?domain=x")" = 404 ] || die "/api/internal/* must be 404 on the public site"
 ok "/api/internal/* is refused on the public site"
+containers="$(on "$A" "$PROJECT_A" ps -q)"
+[ "$(printf '%s\n' "$containers" | grep -c .)" = 4 ] || die "expected 4 containers, got: $containers"
+for c in $containers; do
+  logcfg="$(docker inspect --format '{{.Name}} {{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "max-size"}} {{index .HostConfig.LogConfig.Config "max-file"}}' "$c")"
+  case "$logcfg" in *' json-file 20m 5') ;; *) die "a container log does not rotate: $logcfg" ;; esac
+done
+ok "every container log rotates (json-file, max-size 20m, max-file 5)"
 
 step "3. dashboard sign-in over the e-mail code flow"
 login="$(curl -s --cacert "$CA" -o /dev/null -w '%{http_code} %{redirect_url}' -X POST --data-urlencode "email=$OWNER" "$BASE/login")"
@@ -203,7 +227,7 @@ tgz="$SCRATCH/drobek-module-guestbook-1.0.0.tgz"
 [ -f "$tgz" ] || die "npm pack of the guestbook fixture wrote no $tgz"
 (cd "$A" && COMPOSE_PROJECT_NAME="$PROJECT_A" task selfhost:module:add -- "$tgz") >"$SCRATCH/module-add.log" 2>&1 \
   || { cat "$SCRATCH/module-add.log" >&2; die "task selfhost:module:add failed"; }
-grep -q 'DROBEK_MODULES=auth,email,forms,data,proxy,files,guestbook' "$SCRATCH/module-add.log" \
+grep -q 'DROBEK_MODULES=auth,email,forms,data,proxy,files,sync,oidc,webhooks,guestbook' "$SCRATCH/module-add.log" \
   || { cat "$SCRATCH/module-add.log" >&2; die "selfhost:module:add did not print the DROBEK_MODULES line"; }
 ok "installed into ${PROJECT_A}_modules_data, the next-step DROBEK_MODULES line printed"
 listed="$(cd "$A" && COMPOSE_PROJECT_NAME="$PROJECT_A" task selfhost:module:list 2>/dev/null)"
@@ -211,7 +235,7 @@ printf '%s\n' "$listed" | grep -Eq '^guestbook +drobek-module-guestbook +1\.0\.0
   || { printf '%s\n' "$listed" >&2; die "selfhost:module:list does not show guestbook as ok"; }
 ok "task selfhost:module:list: guestbook 1.0.0 ok"
 # guestbook contributes to the slot of the example module `hello` (in the image).
-ENV_FILE="$A/.env.production" env_set DROBEK_MODULES auth,email,forms,data,proxy,files,hello,guestbook
+ENV_FILE="$A/.env.production" env_set DROBEK_MODULES auth,email,forms,data,proxy,files,sync,oidc,webhooks,hello,guestbook
 on "$A" "$PROJECT_A" up -d --wait --wait-timeout 300 drobek </dev/null >/dev/null 2>&1 || die "drobek did not come back with the module"
 version="$(curl -sf --cacert "$CA" "$BASE/api/version")"
 case "$version" in
@@ -223,13 +247,31 @@ case "$LOCK_A" in *'"guestbook"'*) ;; *) die "modules.lock.json on machine A doe
 # machine B gets this .env.production (with DROBEK_MODULES) — the new baseline.
 before_env="$(sha256_of "$A/.env.production")"
 
-step "5. task backup → docker compose down -v (machine A)"
+step "5. task backup: refused without room, BACKUP_KEEP → docker compose down -v (machine A)"
+mkdir -p "$A/backups"
+for ts in 20200101T000000Z 20200102T000000Z 20200103T000000Z; do
+  printf 'an older archive\n' > "$A/backups/drobek-$ts.tar.gz"
+done
+printf 'kept by hand\n' > "$A/backups/drobek-before-upgrade.tar.gz"
+before_backups="$(cd "$A/backups" && ls -A | LC_ALL=C sort | tr '\n' ' ')"
+if (cd "$A" && COMPOSE_PROJECT_NAME="$PROJECT_A" task backup BACKUP_MIN_FREE_MB=999999999 >"$SCRATCH/nospace.log" 2>&1); then
+  die "task backup ran although the disk cannot keep BACKUP_MIN_FREE_MB free"
+fi
+grep -q 'not enough free space' "$SCRATCH/nospace.log" || { cat "$SCRATCH/nospace.log" >&2; die "the refusal did not name the free space"; }
+[ "$(cd "$A/backups" && ls -A | LC_ALL=C sort | tr '\n' ' ')" = "$before_backups" ] \
+  || { ls -lA "$A/backups" >&2; die "the refused backup wrote or deleted something in backups/"; }
+ok "a disk without room: refused with the sizes, nothing written, nothing deleted"
 TB=$(now)
-archive="$(cd "$A" && COMPOSE_PROJECT_NAME="$PROJECT_A" task backup 2>"$SCRATCH/backup.log" | tail -n 1)" \
+archive="$(cd "$A" && COMPOSE_PROJECT_NAME="$PROJECT_A" task backup BACKUP_KEEP=2 2>"$SCRATCH/backup.log" | tail -n 1)" \
   || { cat "$SCRATCH/backup.log" >&2; die "task backup failed"; }
 sed 's/^/    /' "$SCRATCH/backup.log" | grep -v '^    task:' >&2 || true
 [ -f "$A/$archive" ] || die "task backup did not produce an archive ($archive)"
 BACKUP_S=$(( $(now) - TB ))
+grep -q 'every size and sha256 matches manifest.json' "$SCRATCH/backup.log" || die "task backup did not verify its archive"
+kept="$(cd "$A/backups" && ls -A | LC_ALL=C sort | tr '\n' ' ')"
+[ "$kept" = "drobek-20200103T000000Z.tar.gz $(basename "$archive") drobek-before-upgrade.tar.gz " ] \
+  || die "BACKUP_KEEP=2 left: $kept"
+ok "verified, then BACKUP_KEEP=2 deleted the two oldest archives (a file of another name stays)"
 tar -tzf "$A/$archive" | sort | tr '\n' ' ' | sed 's/^/  archive: /' >&2; printf '\n' >&2
 docker network disconnect "${PROJECT_A}_default" "$MAILPIT"
 on "$A" "$PROJECT_A" down -v --remove-orphans </dev/null >/dev/null 2>&1
@@ -238,13 +280,24 @@ left="$(docker volume ls -q --filter "name=${PROJECT_A}_" | wc -l | tr -d ' ')"
 ok "machine A is gone (containers + all five volumes)"
 
 # ── machine B ────────────────────────────────────────────────────────────────
-step "6. machine B: fresh checkout + A's .env.production → task selfhost:init"
-TR=$(now)
+step "6. machine B: fresh checkout + A's .env.production + the archive → task backup:verify → task selfhost:init"
 checkout "$B"
 ACTIVE="$B|$PROJECT_B"
 (umask 077 && cp "$A/.env.production" "$B/.env.production")
 mkdir -p "$B/backups"
 cp "$A/$archive" "$B/backups/"
+(cd "$B" && task backup:verify >"$SCRATCH/verify.log" 2>&1) || { cat "$SCRATCH/verify.log" >&2; die "task backup:verify refused the copied archive"; }
+grep -q "$(basename "$archive") is intact" "$SCRATCH/verify.log" || { cat "$SCRATCH/verify.log" >&2; die "task backup:verify did not check the newest archive"; }
+grep -q 'made under DROBEK_MASTER_KEY of' "$SCRATCH/verify.log" || { cat "$SCRATCH/verify.log" >&2; die "task backup:verify did not match the archive's key"; }
+ok "task backup:verify (the newest archive in backups/, no stack running): intact, made under this DROBEK_MASTER_KEY"
+cp "$B/backups/$(basename "$archive")" "$SCRATCH/damaged.tar.gz"
+printf 'damaged!' | dd of="$SCRATCH/damaged.tar.gz" bs=1 seek=$(( $(bytes_of "$SCRATCH/damaged.tar.gz") / 2 )) conv=notrunc 2>/dev/null
+if (cd "$B" && task backup:verify BACKUP="$SCRATCH/damaged.tar.gz" >"$SCRATCH/damaged.log" 2>&1); then
+  die "task backup:verify passed an archive with 8 bytes overwritten"
+fi
+grep -q '^✗ .*damaged' "$SCRATCH/damaged.log" || { cat "$SCRATCH/damaged.log" >&2; die "task backup:verify failed without naming the damage"; }
+ok "a copy with 8 bytes overwritten in the middle is refused"
+TR=$(now)
 (cd "$B" && COMPOSE_PROJECT_NAME="$PROJECT_B" task selfhost:init >/dev/null 2>&1)
 [ "$(sha256_of "$B/.env.production")" = "$before_env" ] || die "selfhost:init on machine B changed the copied .env.production"
 ok "secrets kept, Caddyfile rendered"

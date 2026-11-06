@@ -24,7 +24,7 @@ import {
   revokeEndUserSessions,
   type OwnerView,
 } from '@drobek/modules';
-import { createModuleTestContext, type ModuleTestContext } from '@drobek/modules/testing';
+import { createModuleTestContext, type MailGuard, type ModuleTestContext } from '@drobek/modules/testing';
 import { noopLogger } from '@drobek/core';
 
 let fake: FakeRedis;
@@ -229,7 +229,7 @@ describe('drobek-module-auth — sign-in', () => {
     expect(await fake.get(`drobek:otp:eu:${appId}:cd:${emailHash('eva@firma.cz')}`)).toBeNull();
   });
 
-  it('retries while sign-in mail is paused cost nothing: 15 minutes later the same user and IP get a code (NSO-327)', async () => {
+  it('retries while sign-in mail is paused cost nothing: 15 minutes later the same user and IP get a code', async () => {
     let now = Date.now();
     // G = 4: sign-in codes 2 — used up by two other apps, so sign-in mail pauses.
     const guard = memoryMailGuard({ hourlyMax: 4, pauseMinutes: 15, appSharePercent: 100 }, noopLogger, () => now);
@@ -260,7 +260,38 @@ describe('drobek-module-auth — sign-in', () => {
     expect(await fake.get(`drobek:rl:eu:${appId}:otp-email-1h:${emailHash('ana@example.com')}`)).toBe('1');
   });
 
-  it("the app's hourly code cap is clamped to its share of the server's sign-in budget (NSO-322 H2)", async () => {
+  it('a mail outage costs the address nothing: after more failed sends than its hourly share, the next attempt delivers a code that signs in', async () => {
+    let down = 4;
+    const outage: MailGuard = {
+      assertOpen: async () => {},
+      admit: async () => {
+        if (down > 0) {
+          down -= 1;
+          throw new Error('connect ETIMEDOUT');
+        }
+      },
+    };
+    const t = createModuleTestContext(auth, { db, app: APP(), config: CONFIG, origin: `http://${HOST}`, mailGuard: outage });
+    const send = () => t.request('POST', '/send-code', { body: { email: 'ana@example.com' }, headers: { host: HOST }, clientIp: '198.51.100.8' });
+    // More failures than AUTH_CODES_PER_EMAIL_HOUR (3): each one an error, never a silent "sent".
+    for (let i = 0; i < 4; i++) {
+      const res = await send();
+      expect(res.status, JSON.stringify(res.body)).toBe(503);
+      expect(res.body).toMatchObject({ error: 'unavailable', message: 'The sign-in e-mail could not be sent. Try again in a moment.' });
+    }
+    expect(t.emails).toEqual([]);
+    expect(await fake.get(`drobek:rl:eu:${appId}:otp-email-1h:${emailHash('ana@example.com')}`)).toBeNull();
+    expect(await fake.get(`drobek:rl:eu:${appId}:otp-global-1h:all`)).toBeNull();
+
+    const ok = await send();
+    expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+    expect(t.emails).toHaveLength(1);
+    const code = /\b(\d{6})\b/.exec(t.emails[0].subject)![1];
+    const res = await t.request('POST', '/verify', { body: { email: 'ana@example.com', code } });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
+  it("the app's hourly code cap is clamped to its share of the server's sign-in budget", async () => {
     expect(appHourlyCodeCap(100, 25)).toBe(25);
     expect(appHourlyCodeCap(10, 25)).toBe(10);
     expect(appHourlyCodeCap(100, undefined)).toBe(100);
@@ -331,7 +362,7 @@ describe('drobek-module-auth — sign-in', () => {
     expect(await resolve({ app: { ...APP(), id: 'another-app' }, cookieHeader: cookie })).toEqual({ kind: 'anon' });
   });
 
-  it('the 6th wrong code (and even the right one after) → too_many_attempts; a concurrent flood is capped (PHY-76 #1)', async () => {
+  it('the 6th wrong code (and even the right one after) → too_many_attempts; a concurrent flood is capped', async () => {
     const t = ctx();
     await t.request('POST', '/send-code', { body: { email: 'ana@example.com' } });
     const code = /\b(\d{6})\b/.exec(t.emails[0].subject)![1];
@@ -506,7 +537,7 @@ describe('drobek-module-auth — sign-in', () => {
   });
 });
 
-describe("drobek-module-auth — the owner's view (M2-03)", () => {
+describe("drobek-module-auth — the owner's view", () => {
   type Config = ReturnType<typeof authConfigSchema.parse>;
   const view = (config: Config): OwnerView<Config> => ({ app: APP(), config, db, log: noopLogger, limits: async () => ({}) });
   const owner = auth.endUsers!;

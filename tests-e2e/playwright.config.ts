@@ -1,4 +1,7 @@
-import { defineConfig } from '@playwright/test';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { defineConfig, type ReporterDescription } from '@playwright/test';
 
 /**
  * One suite, two targets, env-parameterized (ROADMAP §4):
@@ -17,15 +20,31 @@ import { defineConfig } from '@playwright/test';
  * - E2E_IGNORE_HTTPS_ERRORS=1 — the browser + APIRequestContext accept the
  *                   target's local CA (Caddy `tls internal`); Node's own
  *                   clients trust it through NODE_EXTRA_CA_CERTS instead.
+ * - E2E_DROBEK_URL — drobek's own plain-http port behind the TLS proxy (the
+ *                   image flow publishes it on loopback); default BASE_URL_WEB.
+ * - PLAYWRIGHT_JSON_OUTPUT_FILE — also write a JSON report there (the image
+ *                   flow's per-phase reports for scripts/e2e-skip-guard.mjs).
+ *
+ * Two projects, one per MCP protocol era drobek serves on `/mcp`: `legacy`
+ * runs every spec with the 2025 client (`initialize`), `modern` runs again
+ * the specs that talk MCP through the official client (they import
+ * tests/helpers/mcp.ts or the client itself) pinned to 2026-07-28. The era
+ * reaches the helper as the project's `metadata.era`.
  */
 export const BASE_URL_WEB =
   process.env.BASE_URL_WEB ?? 'http://localhost:3041';
 export const BASE_URL_MCP =
   process.env.BASE_URL_MCP ?? BASE_URL_WEB;
 export const TEST_ENV = process.env.TEST_ENV ?? '';
+/**
+ * Where the TLS proxy sends its requests: drobek itself over plain http.
+ * Specs reach it directly to send what only the proxy sends (Caddy's TLS ask,
+ * an X-Real-IP of their choosing). The dev stack serves on it directly.
+ */
+export const DROBEK_URL = process.env.E2E_DROBEK_URL || BASE_URL_WEB;
 export const TARGET_PRODUCTION = process.env.E2E_TARGET_PRODUCTION === '1';
 /**
- * The apps origin the stack hands out (M0-05) — mirrors the server's default:
+ * The apps origin the stack hands out — mirrors the server's default:
  * docker-compose sets APPS_DOMAIN=apps.localhost:3041; the scheme is http for
  * localhost / *.localhost unless APPS_URL_SCHEME overrides it.
  */
@@ -34,12 +53,21 @@ export const APPS_URL_SCHEME =
   process.env.APPS_URL_SCHEME ||
   (/(^|\.)localhost(:\d+)?$/.test(APPS_DOMAIN) ? 'http' : 'https');
 
+const TEST_DIR = fileURLToPath(new URL('./tests', import.meta.url));
+const MCP_SPECS = readdirSync(TEST_DIR)
+  .filter((f) => f.endsWith('.spec.ts'))
+  .filter((f) => /from '(\.\/helpers\/mcp|@modelcontextprotocol\/client)'/.test(readFileSync(join(TEST_DIR, f), 'utf8')))
+  .map((f) => `**/tests/${f}`);
+
 export default defineConfig({
   testDir: './tests',
+  projects: [
+    { name: 'legacy', metadata: { era: 'legacy' } },
+    { name: 'modern', metadata: { era: 'modern' }, testMatch: MCP_SPECS },
+  ],
   globalSetup: './global-setup.ts',
   forbidOnly: Boolean(process.env.CI),
-  // CI runs on a cold, shared runner (first sign-in after a fresh boot, NSO-314):
-  // one retry there; a retried pass is still reported as flaky. Never locally.
+  // One retry on CI's cold, shared runner (a retried pass is still reported as flaky).
   retries: process.env.CI ? 1 : 0,
   timeout: 60_000,
   expect: {
@@ -51,6 +79,10 @@ export default defineConfig({
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
-  reporter: [['list'], ['html', { open: 'never' }]],
+  reporter: [
+    ['list'],
+    ['html', { open: 'never' }],
+    ...(process.env.PLAYWRIGHT_JSON_OUTPUT_FILE ? ([['json']] satisfies ReporterDescription[]) : []),
+  ],
   workers: 1,
 });
